@@ -23,7 +23,7 @@
 
 ## Commits
 
-Every commit carries `Signed-off-by:` (the DCO, `CONTRIBUTING.md`). 🛑 An AI agent never signs off for itself: the sign-off is the submitting person's, and the agent is named in a `Co-Authored-By:` trailer.
+Every commit carries `Signed-off-by:` (the DCO, `CONTRIBUTING.md`). 🛑 An AI agent never signs off for itself: the sign-off is the submitting person's, and the agent is named in a `Co-Authored-By:` trailer. On a pull request the DCO app checks every commit, and `main` requires its check. 🛑 A direct push by an org admin bypasses that rule and nothing checks it: the sign-off there is on whoever pushes.
 
 ## Invariants — they hold from the first line of code
 
