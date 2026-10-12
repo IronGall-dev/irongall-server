@@ -42,7 +42,9 @@ The other store is three DynamoDB tables and an S3 Express One Zone directory bu
 
 Every commit is signed off under the Developer Certificate of Origin: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-## Licence
+## License
+
+AGPL-3.0-or-later (`LICENSE`): the GNU Affero General Public License, version 3 or any later version.
 
 Copyright (C) 2026 Drew Streib
 
