@@ -239,10 +239,14 @@ out=$(gocli "$W3" recv 2>&1); [ $? -eq 0 ] && [ "$(grep -c ': certificate_revoke
 # A list that names the box's CURRENT certificate: the server takes no pass of the box and no mail for it, until it renews.
 [ "$(put "$work/two.json" "$W2A")" = 200 ] || bad "the second list: $(cat "$work/put.json")"
 out=$(recipe "$W2" "ig_recv" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 401 unauthorized" <<< "$out" && ok "a box whose current certificate is listed has no pass the server takes" || bad "a listed box's recv: $out"
-out=$(gocli "$W3" send "$W2L" < "$work/body8" 2>&1); [ $? -ne 0 ] && grep -q "prekey_expired" <<< "$out" && ls "$W3"/outbox/*.P > /dev/null 2>&1 \
-  && ok "a send to it is 409 prekey_expired, and the message waits in the outbox" || bad "a send to a listed box: $out"
+# A sender asks what the server holds about a box before it posts to it (PROTOCOL.md §4.1): shown the list, it refuses the box's statement itself.
+out=$(gocli "$W3" send "$W2L" < "$work/body8" 2>&1); [ $? -ne 0 ] && grep -q "under a certificate its identity has revoked" <<< "$out" && ! grep -q "prekey_expired" <<< "$out" && ls "$W3"/outbox/*.P > /dev/null 2>&1 \
+  && kept "$W3/peers/$W2A/revoked-certs.json" | cmp -s - "$work/two.list" && ! ls "$W3"/outbox/*.json > /dev/null 2>&1 \
+  && ok "a sender asks before it posts: shown the list, it keeps it, seals nothing to a statement under a listed certificate, and the message waits in the outbox" || bad "a send to a listed box: $out"
 recipe "$W2" "ig_rekey $(nopq_arg)" 2> "$work/err" && gocli "$W3" flush > /dev/null 2>> "$work/err" && out=$(recipe "$W2" "ig_recv" 2>&1) && grep -q 'under the first certificate' <<< "$out" \
   && ok "one renewal, under a new certificate, cures both: the box polls again, and the waiting message is delivered" || bad "after the listed box renewed: $(cat "$work/err") $out"
+out=$(gocli "$W3" revoked --ask "$W2L" 2> /dev/null) && [ "$out" = "certificates of $W2A revoked, list version 2" ] && out=$(gocli "$W1" revoked --ask "$W3L" 2> "$work/err") && [ "$out" = "no revocation of $W3A shown" ] && grep -q "the server's word" "$work/err" \
+  && ok "asked at any time, the server shows a box's list, or that it holds nothing, which the client says as the server's word" || bad "revoked --ask: $out $(cat "$work/err")"
 
 echo "interop: $pass PASS, $fail FAIL"
 [ "$fail" -eq 0 ]
