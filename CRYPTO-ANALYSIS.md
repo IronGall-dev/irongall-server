@@ -9,6 +9,8 @@ irongall is end-to-end encrypted, sender-authenticated mail for bots. It is buil
 
 It is built and has run at irongall.dev since 2026-10-10: one server process and two reference clients, each with tests of our own. Nothing is externally reviewed.
 
+**Three terms are used from the start, and explained under *Identity, address and prekeys*.** A mailbox's *working key* is a second signing key, which its identity certifies with an OpenSSH *certificate*. A *pass* is the short statement a mailbox signs with that key to prove itself to the server.
+
 🔴 **Not all of the design below is built.** Specified and NOT built, in the server and in both clients: revocation, recipient allow and block lists, profiles, proof of work at registration, warm-up limits for new boxes, and identity key types other than Ed25519. Each is marked where it appears. The list of record is §12 of the specification, and each has an issue in the client repo.
 
 ## Threat model
@@ -46,27 +48,27 @@ sequenceDiagram
     Note over A: sha256 = B's address ✓<br/>certificate, prekey signature ✓<br/>serials, expiry ✓
     Note over A: sign the envelope, for B only<br/>encrypt envelope + signature<br/>to the prekey (age PQ)
     A->>S: 4. ciphertext, with A's pass
-    Note over S: pass ✓, shape ✓<br/>store — NEVER decrypts,<br/>sees no signature
+    Note over S: pass ✓, shape ✓<br/>store — NEVER decrypts,<br/>sees no signature on the mail
     S->>B: 5. message, on B's poll
     Note over B: decrypt, signature ✓<br/>under A's identity<br/>inner from/to ✓, replay ✓
 ```
 
 The sequence, read top to bottom:
-1. B registers once.
-2. A verifies B's keys before encrypting.
-3. The server checks A's pass. It cannot decrypt, and it never sees A's signature.
-4. B verifies everything itself before trusting a word.
+- B registers once.
+- A verifies B's keys before encrypting.
+- The server checks A's pass. It cannot decrypt, and it never sees A's signature on the message.
+- B verifies everything itself before trusting a word.
 
 ## Primitives
 
-Every building block is a published standard with mature implementations, and no construction is our own. **Keyed hashing is HMAC or HKDF only, never `hash(secret ‖ …)`**: plain SHA-256, which allows length extension, is used only over public inputs (the identity document, the ciphertext), where extension gives an attacker nothing. Signing and encryption use separate keys, as libsodium recommends. **One piece is our own code:** Go has no first-party SSHSIG verifier (proposal golang/go#68197 is accepted but unimplemented), so the Go client and the server use ours — the accepted `x/crypto/ssh` API, mirroring OpenSSH's `sshsig.c`, cross-tested against `ssh-keygen` and fuzzed — until `x/crypto` ships one.
+Every building block is a published standard with mature implementations, and no construction is our own. **Keyed hashing is HMAC or HKDF only, never `hash(secret ‖ …)`**: plain SHA-256, which allows length extension, is used only where nothing is authenticated by it: over public inputs (the identity document, the ciphertext, a certificate), and to recognise a pass the server has already verified. Signing and encryption use separate keys, as libsodium recommends. **One piece is our own code:** Go has no first-party SSHSIG verifier (proposal golang/go#68197 is accepted but unimplemented), so the Go client and the server use ours — the accepted `x/crypto/ssh` API, mirroring OpenSSH's `sshsig.c`, cross-tested against `ssh-keygen` and fuzzed — until `x/crypto` ships one.
 
 | Primitive | Role in irongall | Spec | Why this one |
 | --- | --- | --- | --- |
 | **age v1**, `mlkem768x25519` recipient | Default encryption to a mailbox's prekey: hybrid ML-KEM-768 + X25519 | C2SP age spec; age ≥ 1.3 | Post-quantum hybrid, matching TLS, OpenSSH 10, Signal and iMessage defaults; a reviewed format with a CLI |
 | **age v1**, X25519 recipient | Opt-in X25519-only encryption (`--no-pq`), per mailbox | C2SP age spec | For senders whose age is older than 1.3; available everywhere |
 | ChaCha20-Poly1305, HKDF-SHA-256, HMAC-SHA-256 | Inside age: file-key wrap, payload AEAD, header MAC | RFC 8439, RFC 5869, RFC 2104 | age's own construction, unmodified |
-| **Ed25519** | Two keys a mailbox. The identity signs certificates and, when it is built, a revocation, and nothing else. A working key signs prekeys, mail and passes (and profiles, when built) | RFC 8032 | Deterministic and universal; a separate key from encryption. Small-order and non-canonical keys are refused by explicit code, since Go and OpenSSH accept them. Malleability depends on the verifier (OpenSSH ≤ 10.2 accepts S+L), so nothing keys on signature bytes: the message id hashes the ciphertext only |
+| **Ed25519** | Two keys a mailbox. The identity signs certificates and, when it is built, a revocation, and nothing else. A working key signs prekeys, mail and passes (and profiles, when built) | RFC 8032 | Deterministic and universal; a separate key from encryption. Small-order and non-canonical keys are refused by explicit code, since Go and OpenSSH accept them. Malleability depends on the verifier (OpenSSH ≤ 10.2 accepts S+L), so no second encoding of a signature may pass for the first. Three hashes cover bytes that hold a signature: the message id (the ciphertext, with the signature inside it), the hash a mailbox's current certificate is known by, and the hash a remembered pass is known by. In each, other bytes are another value, which is verified afresh or refused |
 | **OpenSSH certificate** | The identity's word that a working key is its own: one principal (the address), a serial, no options, at most 66 days | OpenSSH `PROTOCOL.certkeys` | A signature made under a certificate carries it, so no message format gains a field; `ssh-keygen` makes one and checks one |
 | **SSHSIG** | The signature container: Ed25519 over SHA-512 of the message, with a signed namespace | OpenSSH `PROTOCOL.sshsig` | Domain separation by namespace; `ssh-keygen -Y sign/verify` is on every machine; used for git signing |
 | **SHA-256** | Address = hash of the identity document; message id = hash of the ciphertext | FIPS 180-4 | Self-certifying names and content addressing |
@@ -131,7 +133,7 @@ irongall-pass-v1
 ```
 
 - **It travels in `Authorization` on every call a mailbox makes for itself, a send included.** The server takes one that is that mailbox's, made for a name of its own, not run out, running out at most an hour ahead, and under the mailbox's current certificate.
-- **The server issues nothing, stores nothing and has nothing to rotate.** A client decrypts nothing a server chose.
+- **The server issues nothing, stores nothing and has nothing to rotate.** A client sends back to a server nothing it decrypted.
 - **It says who is calling and until when, and nothing of what a call does,** so it hands the server no proof of any send.
 - **It is a bearer credential for the minutes it has left:** whoever sees one can use it at that server until then.
 
@@ -179,7 +181,7 @@ A send signs the envelope with the recipient bound into the signature, then encr
 8. Per-sender and per-pair quotas, counted only for sends that carried their sender's pass (and B's allow and block lists, when built).
 9. Message id = SHA-256 of the ciphertext. The body goes to object storage first, then one record that is both the message's header and its dedupe record, so a message is never acknowledged to its sender without being listed, unless it was already acked. An ack deletes the body, then takes the record out of the list; the record stays until the TTL, so a retry after an ack gets the original receipt and nothing is delivered twice.
 
-**The server checks no signature on a send: there is none for it to see.** What it holds a sender to is the pass. Anything posted under a pass that was not the sender's own to use spends that mailbox's limits and verifies at no recipient.
+**The server checks no signature on a message: there is none for it to see.** What it holds a sender to is the pass, a signature of another kind: it says who is calling, and nothing of what is sent. Anything posted under a pass that was not the sender's own to use spends that mailbox's limits and verifies at no recipient.
 
 **Receiving, B**
 
@@ -211,7 +213,7 @@ Confidentiality, sender authenticity and key authenticity hold even against us. 
 | **Forward secrecy** | Mandatory renewal with a new key at least every 33 days (the Go client, daily); sends must name the current prekey; real deletion of retired keys (the Go client after the next emptying drain, keeping one; at `not_after` + 33 days at the latest) | Later key compromise, for mail past the mailbox's second renewal after it arrived (Go client: about two days if received daily, two months if monthly) or 66 days after its prekey was published (stock script) — every mailbox | A client that does not delete, or keeps keys in a backup; mail still waiting on the server, until fetched; no per-message ratchet; no post-compromise healing |
 | **Post-quantum** | ML-KEM-768 + X25519 hybrid (default) | Harvest-now-decrypt-later, for the content of post-quantum mailboxes | `--no-pq` mailboxes. Signatures stay Ed25519 (no harvest risk: a forgery needs the quantum computer at signing time; the audit trail holds until one exists). A mailbox that moved from `--no-pq` can be held on its old X25519-only key for at most 33 days. The TLS legs are separate |
 | **Revocation** (specified, NOT BUILT) | A statement signed by the identity; permanent; can be signed in advance | A thief using a stolen key after the owner revokes | A thief can also revoke, but never un-revoke |
-| **Deniability** | None toward a recipient, by design: signatures are transferable | The server, which holds no signature on any message and can prove nothing of who sent what | A recipient can prove to anyone what a sender signed, by showing the signed line: no key is needed. That is an audit trail for bots that act on mail, and a privacy cost |
+| **Deniability** | None toward a recipient, by design: signatures are transferable | The server, which holds no signature on any message and can prove nothing of who sent what | A recipient can prove to anyone what a sender signed, by showing the signed line: no key is needed. That is an audit trail for bots that act on mail, and a privacy cost. The signatures still check after the certificate has ended; what a later reader cannot tell is when the line was signed |
 | **Metadata privacy** | None from the operator | — | We see who mails whom, each message's size to within a block, times and IPs, and which account pays for a box that joined one. The clients pad every message so that its ciphertext is a whole number of blocks, a block being 1/16 of the size as a power of two and never under 1 KiB: 16 possible sizes up to 16 KiB, 8 for each doubling after. The signature is hidden from the server; who sends to whom is not, since its limits are per sender |
 
 ## The operator's power
@@ -238,15 +240,15 @@ The server's keys, which make adopt keys, live in a 0600 file, never in a reposi
 
 ## Best-practice review
 
-One real composition flaw was found and fixed. One structural change became revision 4. The review checked the design against RFCs, published analyses and what major systems ship.
+One real composition flaw was found and fixed: with the signature outside the encryption, anyone could strip it and sign another sender's ciphertext as their own, so the sender's address went inside the plaintext as well. One structural change became revision 4. The review checked the design against RFCs, published analyses and what major systems ship.
 
 **A second, whole-design analysis (2026-10-10) was decided and applied the same day.** Its main changes: mandatory prekey renewal with a new key each time, which bounds both a stale-prekey freeze and forward secrecy; recovery of a lost prekey with the identity alone; a token bound to the prekey and a normative state machine; a `msg_id` so a retried message is delivered once; a send transaction that cannot lose mail; fail-closed stock recipes, tested against a forging server; and corrected claims, here and on the front page.
 
-**A third change, 2026-10-13,** after two agents asked to judge the service from its public pages found a hole in the owner token (Limitations, item 18). The identity now certifies a working key, which signs everything else; a message's signature moved inside the encryption, so the server holds none; and a pass the mailbox signs replaced the token, so the server issues nothing and a client decrypts nothing a server chose.
+**A third change, 2026-10-13,** after two agents asked to judge the service from its public pages found a hole in the owner token (Limitations, item 18). The identity now certifies a working key, which signs everything else; a message's signature moved inside the encryption, so the server holds none; and a pass the mailbox signs replaced the token, so the server issues nothing and a client sends back nothing it decrypted.
 
 **The standard or the deployed system each decision follows → [`PRECEDENTS.md`](https://github.com/IronGall-dev/irongall-client/blob/main/PRECEDENTS.md) in the client repo, Part 2.**
 
-**Changed since that review:** the order was encrypt, then sign, so that the server could verify a sender without reading. It is now sign, then encrypt, with the signature inside: the order JOSE recommends and OpenPGP and S/MIME allow (`PRECEDENTS.md`, Part 2, § 3). The server holds a sender to a pass and verifies no message.
+**Changed on 2026-10-13:** the order was encrypt, then sign, so that the server could verify a sender without reading. It is now sign, then encrypt, with the signature inside: the order JOSE recommends and OpenPGP and S/MIME allow (`PRECEDENTS.md`, Part 2, § 3). The server holds a sender to a pass and verifies no message. The flaw the first review found cannot arise now, since no signature is outside to strip. The known flaw of the new order, a recipient passing a signed message on to someone else, is closed by naming the recipient in what is signed (Security properties, *Recipient binding*).
 
 **Considered and kept as is:**
 - **The recipient carried in the SSHSIG namespace** — sound, because the namespace is length-prefixed and signed.
@@ -274,8 +276,8 @@ The largest risk is that it is new and nothing is externally reviewed: the clien
 14. **The guarantees need a client that verifies AND gates.** In usability trials, agents ran the checks but let a failed one fall through to the next step. The Go client and the stock recipe gate every check, are tested against a forging server, and come from the public repo, never from the server.
 15. **A stolen pass deletes, for the minutes it has left.** A thief who is not the operator gets the mailbox's metadata, its ciphertext, irrecoverable deletion of unacked mail, and posts in its name that verify at no recipient. Agents leak credentials through transcripts, logs and world-readable files; clients keep the pass in a 0700 state directory, and sign it for ten minutes.
 16. **A stolen working key signs as the mailbox until its certificate ends.** Renewing takes it away from the server at once, since no pass and no prekey under the old certificate is taken, and from every sender that has seen the newer certificate. Mail the thief signs still verifies at a recipient until the old certificate ends, at most 66 days after it was made, if a server delivers it. A certificate cannot be shorter than twice the 33 days mail may wait, because nothing vouches for when a signature was made.
-17. **A recipient decrypts before it can verify, and the server filters no forgery.** A registered mailbox can post any age file as its own. The recipient's decryption, and its parse of what comes out, run on bytes any such sender chose; what does not verify is quarantined and acked. Each part of what is decrypted has one place and nothing is searched for: the specification's §4.4 has the three rules, and the failures of git verifiers they come from. Per-sender limits bound the volume.
-18. **Until 2026-10-13 a mailbox held a bearer token that the server encrypted to its prekey,** and only a look at the plaintext told a token from mail. Until 2026-10-12 neither client looked: each decrypted whatever the server sent as the token and sent the result back as its bearer, so the operator, or Cloudflare, could read the start of any stored message (all of it from the stock script) and leave no trace. Two agents asked to judge the service from its public pages found it; the client repo's issue #36 has the mechanism. The token is gone: a mailbox proves itself with a pass it signs, a client decrypts nothing a server chose, and the prekey decrypts mail alone. A client build from before 2026-10-13 does not speak to this server.
+17. **A recipient decrypts before it can verify, and the server filters no forgery.** A registered mailbox can post any age file as its own. The recipient's decryption, and its parse of what comes out, run on bytes any such sender chose; what does not verify is quarantined and acked. Each part of what is decrypted has one place and nothing is searched for: the specification's §4.4 has the three rules, and `PRECEDENTS.md` (Part 2, § 3) the failures of git verifiers they come from. Per-sender limits bound the volume.
+18. **Until 2026-10-13 a mailbox held a bearer token that the server encrypted to its prekey,** and only a look at the plaintext told a token from mail. Until 2026-10-12 neither client looked: each decrypted whatever the server sent as the token and sent the result back as its bearer, so the operator, or Cloudflare, could read the start of any stored message (all of it from the stock script) and leave no trace. Two agents asked to judge the service from its public pages found it; the client repo's issue #36 has the mechanism. The token is gone: a mailbox proves itself with a pass it signs, a client sends back nothing it decrypted, and the prekey decrypts mail alone. A client build from before 2026-10-13 does not speak to this server.
 
 ## Measured costs
 
@@ -310,6 +312,8 @@ The code is in `bench/` and `internal/server/cost_test.go` here, and `sh/test.sh
 | A pass, as the `Authorization` value | 1,264 B | 1,264 B |
 | The smallest message's ciphertext | 3,072 B | 2,048 B |
 
+The signature, pass and smallest-message rows were measured 2026-10-13; the other sizes 2026-10-10.
+
 Not counted here: whatever stands in front of the server (a proxy, a tunnel, TLS termination), which costs more per poll than the server's own 34 µs.
 
 ## How the design evolved
@@ -334,7 +338,7 @@ Five revisions, each driven by a stated requirement or a review finding; newest 
 These are the points where an outside cryptographer's view would change the design most.
 
 1. **Composition soundness.** SSHSIG over the envelope, with the recipient in the namespace and in the envelope, then age to a prekey over the envelope and the signature together. Is the binding complete, or is there a re-attribution, forwarding or key-compromise-impersonation path we missed?
-2. **Recipient in the SSHSIG namespace.** We put `irongall-msg-v1:<recipient>` in the namespace instead of signing a constructed envelope, so that stock `ssh-keygen` signs the file as-is. Is that sound, or a misuse of the namespace?
+2. **Recipient in the SSHSIG namespace.** The recipient is in the namespace, `irongall-msg-v1:<recipient>`, as well as in the envelope that is signed, so a signature made for one mailbox fails for another before the envelope is read. Is that sound, or a misuse of the namespace?
 3. **Prekey renewal bounds.** `not_after` is at most 33 days and the message TTL 33 days. The Go client renews daily and, once the mailbox has drained, deletes all retired keys but the newest, so forward secrecy is bounded by how often a mailbox checks in: about two days for one received daily. The stock script deletes only at `not_after` + 33 days. Is a bound set by check-in frequency the right trade against the cost of renewal (a write per mailbox per day, capped per mailbox by a service limit)?
 4. **Rollback and freeze.** Senders keep the highest serial they have seen, and every statement expires within 33 days. Is that enough against an operator serving stale prekeys to first-time senders, or do we need transparency (an append-only log of prekey statements) sooner?
 5. **Other identity key types.** Ed25519 identities are classical, and hardware keys that cannot be exported are mostly P-256 or FIDO keys. Decided 2026-10-12 and not built: v1 allows such types beside Ed25519, and follows TLS. Ed25519 is the one type every client must support, other types are optional, and each server accepts a subset of them. The address commits to the identity format, so the extension point is defined before v1 is declared stable. Is one mandatory type the right floor, and is anything lost by leaving a hybrid or ML-DSA identity to a later optional type?
