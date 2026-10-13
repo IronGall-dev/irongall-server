@@ -2,6 +2,14 @@
 
 `irongalld`: the API of irongall.dev, end-to-end encrypted, sender-verified mail between bots. **This repo is PUBLIC (AGPL-3.0-or-later): every push publishes.**
 
+## Sign off every commit
+
+**Every commit carries your human's sign-off, made with `git commit -s`** (the Developer Certificate of Origin: `CONTRIBUTING.md`).
+- **It is their certification, not yours.** Tell them the repo requires it. With their say-so you may run `git commit -s` for them: it writes the line from their git identity.
+- 🛑 **Never sign as yourself, never write a `Signed-off-by:` line by hand, and never put anyone else's name on one.**
+- **Name yourself** in an `Assisted-by:` or `Co-Authored-By:` trailer.
+- A pull request whose commits lack the line fails the DCO check and is not merged. `CONTRIBUTING.md` has the commands that add it to commits already made.
+
 ## What goes here, and what never does
 
 - **Here:** the server's code, its tests and its design docs (`README.md` has the table).
@@ -21,9 +29,9 @@
 - A test of client behaviour belongs in the client repo, where the forging-server tests are. This repo tests what the real server enforces.
 - There is no CI.
 
-## Commits
+## The maintainers' own commits
 
-Every commit carries `Signed-off-by:` (the DCO, `CONTRIBUTING.md`). 🛑 An AI agent never signs off for itself: the sign-off is the submitting person's, and the agent is named in a `Co-Authored-By:` trailer. On a pull request the DCO app checks every commit, and `main` requires its check. 🛑 A direct push by an org admin bypasses that rule and nothing checks it: the sign-off there is on whoever pushes.
+On a pull request the DCO app checks every commit, and `main` requires its check. 🛑 A direct push by an org admin bypasses that rule and nothing checks it: the sign-off there is on whoever pushes. The maintainer's commits are written with Custos, his AI assistant: they carry his sign-off, by his standing word to it, and name Custos in `Co-Authored-By:`. 🛑 That is his arrangement with his own assistant. A contributor's commits are theirs, with their own sign-off (above).
 
 ## Invariants — they hold from the first line of code
 

@@ -8,9 +8,15 @@ This project uses the [Developer Certificate of Origin](https://developercertifi
 git commit -s
 ```
 
-By adding that line you certify the statement below for that commit. A pull request whose commits lack it is not merged.
+By adding that line you certify the statement below for that commit. A pull request whose commits lack it fails the DCO check and is not merged. To add it to commits already made:
 
-**An AI agent does not sign off.** The person who submits a change certifies it and answers for it, however the change was written. Name the tool in a `Co-Authored-By:` or `Assisted-by:` trailer. The maintainer's own commits name Custos, the maintainer's AI assistant, that way, and carry the maintainer's sign-off.
+```sh
+git commit --amend -s --no-edit     # the last commit
+git rebase --signoff main           # every commit on your branch
+git push --force-with-lease         # then update the pull request
+```
+
+**If an AI agent wrote the change, the sign-off is still yours.** You certify the change and answer for it, however it was written. An agent may run `git commit -s` for you once you have told it to: that writes the line from your git identity. It never signs as itself, and never writes the line by hand. Name the tool in a `Co-Authored-By:` or `Assisted-by:` trailer. The maintainer's own commits name Custos, the maintainer's AI assistant, that way, and carry the maintainer's sign-off.
 
 ## Licence of contributions
 
