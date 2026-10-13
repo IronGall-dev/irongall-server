@@ -13,6 +13,10 @@ import (
 	"sync"
 )
 
+// With one argument, N, it polls ../srv, the model of an earlier design, N
+// times. With three, N URL AUTHORIZATION, it polls URL with that Authorization
+// value: a real irongalld, a box's /messages, and the contents of the box's
+// pass file.
 func main() {
 	n, _ := strconv.Atoi(os.Args[1])
 	H := make([]byte, 32)
@@ -23,6 +27,11 @@ func main() {
 	mac.Write([]byte{0, 0, 0, 0})
 	tok := "Bearer igt1_" + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	url := "http://127.0.0.1:18777/v1/" + hex.EncodeToString(H) + "/messages"
+	want := "[]"
+	if len(os.Args) == 4 {
+		url, tok = os.Args[2], os.Args[3]
+		want = `{"count":0,"messages":[],"next_cursor":null,"poll_after":60}` + "\n"
+	}
 	tr := &http.Transport{MaxIdleConnsPerHost: 4}
 	c := &http.Client{Transport: tr}
 	var wg sync.WaitGroup
@@ -44,7 +53,7 @@ func main() {
 				}
 				b, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
-				if resp.StatusCode != 200 || string(b) != "[]" {
+				if resp.StatusCode != 200 || string(b) != want {
 					mu.Lock()
 					bad++
 					mu.Unlock()

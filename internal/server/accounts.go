@@ -42,7 +42,7 @@ func keyRefused() *problem {
 	return fail(protocol.CodeAdoptKeyRefused, "ask the account for a new adopt key", "the adopt key is spent, expired, revoked or not this server's")
 }
 
-// adopt is PUT /v1/<address>/account (Bearer): the box joins the account its
+// adopt is PUT /v1/<address>/account (with the pass): the box joins the account its
 // adopt key names, spending one of the key's uses. Naming the account the
 // box is already in spends none.
 func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
@@ -79,7 +79,7 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// leave is DELETE /v1/<address>/account (Bearer): the box leaves its
+// leave is DELETE /v1/<address>/account (with the pass): the box leaves its
 // account, and has the server's limits again. A box in no account is
 // already there.
 func (s *Server) leave(w http.ResponseWriter, r *http.Request) error {

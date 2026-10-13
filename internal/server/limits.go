@@ -23,7 +23,6 @@ type Limits struct {
 	RetiredKept    int           // retired prekeys a box record keeps for the new-key rule, newest first (decided: 10), so a record stays small
 
 	RegistrationsPerHour int // per IPv4 address or IPv6 /64 [tunable]
-	TokensPerMinute      int // POST …/token per IP [tunable]
 	SendsPerMinutePerIP  int // the pre-auth send rate per IP [tunable]
 	MissesPerMinute      int // reads of the boxes table that find no box, per IP (decided: 10 for now)
 }

@@ -39,8 +39,14 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	case err != nil:
 		return fail(protocol.CodeBadKey, "make a new identity: irongall init in a new box", "%v", err)
 	}
-	p, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
+	p, cert, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
 	if err != nil {
+		return err
+	}
+	// The pass, under the certificate the statement is signed under: the
+	// certificate shows the identity chose this working key, and a pass
+	// minutes old that its holder is here now.
+	if err := s.checkPass(r, h, identityKey(id), certHash(cert), nil); err != nil {
 		return err
 	}
 	if ok, wait := s.regs.take(ipKey(s.clientIP(r)), s.now()); !ok {
@@ -48,17 +54,20 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	b := &Box{
-		Addr:      h,
-		Identity:  req.Identity,
-		State:     Pending,
-		Statement: req.Prekey,
-		Signature: req.PrekeySignature,
-		Prekey:    p,
-		Created:   s.now(),
+		Addr:       h,
+		Identity:   req.Identity,
+		State:      Active,
+		Statement:  req.Prekey,
+		Signature:  req.PrekeySignature,
+		Prekey:     p,
+		CertSerial: cert.Serial(),
+		Cert:       certHash(cert),
+		Created:    s.now(),
 	}
 	err = s.store.CreateBox(r.Context(), b)
 	if err == nil {
-		return s.writeToken(w, http.StatusCreated, b)
+		writeJSON(w, http.StatusCreated, struct{}{})
+		return nil
 	}
 	if !errors.Is(err, ErrExists) {
 		return err
@@ -78,26 +87,31 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	case cur.State == Closed:
 		return fail(protocol.CodeConflict, "closed: reopen it with a new prekey, irongall rekey", "this box is closed")
 	case bytes.Equal(cur.Identity, req.Identity) && bytes.Equal(cur.Statement, req.Prekey) && bytes.Equal(cur.Signature, req.PrekeySignature):
-		return s.writeToken(w, http.StatusOK, cur) // an identical retry
+		writeJSON(w, http.StatusOK, struct{}{}) // an identical retry
+		return nil
 	}
 	return fail(protocol.CodeConflict, "registered: to replace its prekey, irongall rekey", "this address is registered with another prekey")
 }
 
-// checkPrekey verifies a prekey statement against the identity, and that it
-// could be published now: not expired, valid for at most 33 days.
-func (s *Server) checkPrekey(id *protocol.Identity, statement, sig []byte) (*protocol.Prekey, error) {
-	p, err := protocol.VerifyPrekey(id, statement, sig)
+// checkPrekey verifies a prekey statement: signed by a working key under a
+// certificate of the identity that is valid now, and one that could be
+// published now, not expired and valid for at most 33 days. It returns the
+// certificate too.
+func (s *Server) checkPrekey(id *protocol.Identity, statement, sig []byte) (*protocol.Prekey, *protocol.Certificate, error) {
+	p, cert, err := protocol.VerifyPrekey(id, statement, sig, s.now())
 	if err != nil {
-		return nil, fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "%v", err)
+		return nil, nil, fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "%v", err)
 	}
 	if err := p.CheckLifetime(s.now()); err != nil {
-		return nil, fail(protocol.CodeBadKey, "a prekey is valid for at most 33 days: irongall rekey", "%v", err)
+		return nil, nil, fail(protocol.CodeBadKey, "a prekey is valid for at most 33 days: irongall rekey", "%v", err)
 	}
-	return p, nil
+	return p, cert, nil
 }
 
-// prekey is PUT /v1/<address>/prekey (PROTOCOL.md §6.4). The authority is the
-// identity's signature on a higher serial; no token is needed.
+// prekey is PUT /v1/<address>/prekey (PROTOCOL.md §6.4). The authority is a
+// statement with a higher serial, signed under a certificate of the identity,
+// with a pass under that same certificate: no pass under the box's current
+// one is needed, which is how a box that lost its working key comes back.
 func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	h, err := pathAddr(r)
 	if err != nil {
@@ -123,15 +137,25 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	p, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
+	p, cert, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
 	if err != nil {
 		return err
 	}
+	under := certHash(cert)
+	if err := s.checkPass(r, h, identityKey(id), under, nil); err != nil {
+		return err
+	}
 	if bytes.Equal(req.Prekey, b.Statement) && bytes.Equal(req.PrekeySignature, b.Signature) {
-		return s.writeToken(w, http.StatusOK, b) // an identical retry
+		writeJSON(w, http.StatusOK, struct{}{}) // an identical retry: nothing changes
+		return nil
 	}
 	if p.Serial <= b.Prekey.Serial {
 		return fail(protocol.CodeConflict, "a newer prekey is already published: irongall rekey takes the next serial", "the serial must be above %d", b.Prekey.Serial)
+	}
+	// The box moves to a later certificate or stays under its current one:
+	// never back to an older one, and never to another of the same serial.
+	if cert.Serial() < b.CertSerial || (cert.Serial() == b.CertSerial && under != b.Cert) {
+		return fail(protocol.CodeBadKey, "certify a new working key at a higher serial: irongall rekey", "the certificate's serial must be above %d, or the certificate be the box's current one", b.CertSerial)
 	}
 	now := s.now()
 	if ok, wait := s.renewals.add(h, now, s.limits.RenewalsPerDay, false); !ok {
@@ -150,10 +174,8 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	}
 	b.Retired = retired
 	b.Statement, b.Signature, b.Prekey = req.Prekey, req.PrekeySignature, p
-	b.Epoch++
-	if b.State == Closed {
-		b.State = Pending // reopened
-	}
+	b.CertSerial, b.Cert = cert.Serial(), under
+	b.State = Active // a closed box reopens
 	if err := s.store.UpdateBox(r.Context(), b); err != nil {
 		if errors.Is(err, ErrStale) {
 			return fail(protocol.CodeConflict, "retry: irongall rekey", "the box changed during the request")
@@ -161,30 +183,8 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	s.renewals.add(h, now, s.limits.RenewalsPerDay, true)
-	return s.writeToken(w, http.StatusOK, b)
-}
-
-// token is POST /v1/<address>/token: the CURRENT token, encrypted to the
-// current prekey. Useless to anyone but the owner, and it never rotates
-// anything, so it is limited per IP, never per box.
-func (s *Server) token(w http.ResponseWriter, r *http.Request) error {
-	h, err := pathAddr(r)
-	if err != nil {
-		return err
-	}
-	if ok, wait := s.tokenReqs.take(ipKey(s.clientIP(r)), s.now()); !ok {
-		return rateLimited(wait, "too many token requests from this address")
-	}
-	b, err := s.lookup(r, h)
-	switch {
-	case err != nil:
-		return err
-	case b == nil, b.State == Closed:
-		return noSuchMailbox
-	case b.State == Revoked:
-		return revoked()
-	}
-	return s.writeToken(w, http.StatusOK, b)
+	writeJSON(w, http.StatusOK, struct{}{})
+	return nil
 }
 
 // identity is GET /v1/<address>/identity. It answers for closed boxes too, so
@@ -207,8 +207,8 @@ func (s *Server) identity(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// closeBox is DELETE /v1/<address> (Bearer): unacked mail is deleted and the
-// box marked closed. The identity reopens it with a new prekey.
+// closeBox is DELETE /v1/<address> (with the pass): unacked mail is deleted
+// and the box marked closed. A new prekey reopens it.
 func (s *Server) closeBox(w http.ResponseWriter, r *http.Request) error {
 	a, err := s.owner(r)
 	if err != nil {

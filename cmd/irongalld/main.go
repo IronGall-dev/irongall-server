@@ -1,6 +1,6 @@
 // Command irongalld is the irongall.dev server.
 //
-//	irongalld serve -boxes-table T -msgs-table T -accounts-table T -bucket B -keys FILE [-listen addr] [options] [limits]
+//	irongalld serve -boxes-table T -msgs-table T -accounts-table T -bucket B -keys FILE -names NAMES [-listen addr] [options] [limits]
 //	irongalld serve --dev [-listen addr] [limits]
 //	irongalld account create -accounts-table T [-id NAME] [-unmetered]
 //	irongalld account key -accounts-table T -keys FILE -account ID -uses N -ttl D
@@ -14,7 +14,8 @@
 // memory.
 //
 // --dev keeps everything in memory, with no AWS: the honest server every
-// client tests against. Nothing survives a restart, the token key included.
+// client tests against. Nothing survives a restart, the server key included.
+// It takes a pass made for any name, unless -names is given.
 //
 // account is the operator's hand on accounts (PROTOCOL.md §6.5) until
 // accounts have users who log in: create one, mint an adopt key for it, or
@@ -35,6 +36,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/IronGall-dev/irongall-client/protocol"
 	"github.com/IronGall-dev/irongall-server/internal/server"
 	"github.com/aws/aws-sdk-go-v2/config"
 )
@@ -47,7 +49,7 @@ func main() {
 	case len(os.Args) >= 3 && os.Args[1] == "account":
 		err = account(os.Args[2], os.Args[3:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: irongalld serve (-boxes-table T -msgs-table T -accounts-table T -bucket B -keys FILE | --dev) [-listen addr] [options] [limits]")
+		fmt.Fprintln(os.Stderr, "usage: irongalld serve (-boxes-table T -msgs-table T -accounts-table T -bucket B -keys FILE -names NAMES | --dev) [-listen addr] [options] [limits]")
 		fmt.Fprintln(os.Stderr, "       irongalld account (create | key | drop) [flags]")
 		os.Exit(2)
 	}
@@ -64,9 +66,10 @@ func serve(args []string) error {
 	msgs := fs.String("msgs-table", "", "the DynamoDB table of messages")
 	accts := fs.String("accounts-table", "", "the DynamoDB table of accounts")
 	bucket := fs.String("bucket", "", "the S3 Express One Zone directory bucket")
-	keysFile := fs.String("keys", "", "the token keys file, mode 0600: lines of \"<kid> <base64 of 32 bytes>\"")
+	keysFile := fs.String("keys", "", "the server keys file (they make adopt keys), mode 0600: lines of \"<kid> <base64 of 32 bytes>\"")
+	names := fs.String("names", "", "comma-separated names clients call this server by: the host of its URL, lowercase, with its port if it has one; a pass is taken only for one of them")
 	region := fs.String("region", "us-east-1", "the AWS region")
-	boxCache := fs.Int("box-cache", 10000, "box records held in memory, for sends and /token, and as many boxes' encrypted tokens")
+	boxCache := fs.Int("box-cache", 10000, "box records held in memory, for sends and /identity")
 	streamEvery := fs.Duration("stream-interval", time.Second, "how often each stream shard is read")
 	proxies := fs.String("trusted-proxy", "", "comma-separated CIDRs whose CF-Connecting-IP names the client: the proxy in front, if any")
 	l := server.DefaultLimits()
@@ -81,7 +84,6 @@ func serve(args []string) error {
 	fs.DurationVar(&l.PollRefill, "poll-refill", l.PollRefill, "one more poll each")
 	fs.IntVar(&l.PollAfter, "poll-after", l.PollAfter, "poll interval told to clients, seconds")
 	fs.IntVar(&l.RegistrationsPerHour, "registrations-per-hour", l.RegistrationsPerHour, "registrations per IPv4 address or IPv6 /64 (0: off)")
-	fs.IntVar(&l.TokensPerMinute, "tokens-per-minute", l.TokensPerMinute, "POST …/token per IP (0: off)")
 	fs.IntVar(&l.SendsPerMinutePerIP, "sends-per-minute-per-ip", l.SendsPerMinutePerIP, "pre-auth sends per IP (0: off)")
 	fs.IntVar(&l.MissesPerMinute, "misses-per-minute", l.MissesPerMinute, "reads of the boxes table that find no box, per IP (0: off)")
 	if err := fs.Parse(args); err != nil {
@@ -91,9 +93,15 @@ func serve(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg := server.Config{Limits: l, Log: logger, TokenCache: *boxCache}
-	if *boxCache == 0 {
-		cfg.TokenCache = -1 // none, as for box records
+	cfg := server.Config{Limits: l, Log: logger}
+	for _, n := range strings.Split(*names, ",") {
+		if n = strings.TrimSpace(n); n == "" {
+			continue
+		}
+		if err := protocol.CheckServerName(n); err != nil {
+			return fmt.Errorf("-names: %q: %w", n, err)
+		}
+		cfg.Names = append(cfg.Names, n)
 	}
 	for _, c := range strings.Split(*proxies, ",") {
 		if c = strings.TrimSpace(c); c == "" {
@@ -117,8 +125,8 @@ func serve(args []string) error {
 		}
 		cfg.Store, cfg.Keys = server.NewMemStore(time.Now), keys
 		logger.Printf("irongalld --dev on %s (in memory: nothing survives a restart)", *listen)
-	case *boxes == "" || *msgs == "" || *accts == "" || *bucket == "" || *keysFile == "":
-		return errors.New("name -boxes-table, -msgs-table, -accounts-table, -bucket and -keys, or run --dev")
+	case *boxes == "" || *msgs == "" || *accts == "" || *bucket == "" || *keysFile == "" || len(cfg.Names) == 0:
+		return errors.New("name -boxes-table, -msgs-table, -accounts-table, -bucket, -keys and -names, or run --dev")
 	default:
 		keys, err := server.LoadKeys(*keysFile)
 		if err != nil {

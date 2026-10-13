@@ -170,7 +170,6 @@ func (s *Server) fetch(w http.ResponseWriter, r *http.Request) error {
 		ReceivedAt: formatTime(h.ReceivedAt),
 		ExpiresAt:  formatTime(h.ExpiresAt),
 		Ciphertext: body,
-		Signature:  h.Signature,
 	})
 	return nil
 }

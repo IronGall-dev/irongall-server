@@ -41,7 +41,7 @@ func account(cmd string, args []string) error {
 			return nil
 		}
 	case "key":
-		keysFile := fs.String("keys", "", "the token keys file, mode 0600")
+		keysFile := fs.String("keys", "", "the server keys file, mode 0600")
 		id := fs.String("account", "", "the account the key adopts boxes into")
 		uses := fs.Int("uses", 0, "how many boxes the key may adopt")
 		ttl := fs.Duration("ttl", 0, "how long the key is good for")

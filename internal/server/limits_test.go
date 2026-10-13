@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -73,7 +72,7 @@ func counted(t *testing.T, e *env, l Limits) (*env, *countingStore) {
 	cs := &countingStore{Store: e.store}
 	srv := httptest.NewServer(New(Config{Store: cs, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler())
 	t.Cleanup(srv.Close)
-	return &env{t: t, srv: srv}, cs
+	return &env{t: t, clock: e.clock, srv: srv}, cs
 }
 
 func listOf(t *testing.T, r reply) protocol.MessageList {
@@ -95,7 +94,7 @@ func TestCursorIsNoWayAroundThePollRate(t *testing.T) {
 	e := newEnv(t, l)
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	e2, cs := counted(t, e, l)
-	tok := tokenOf(t, b)
+	tok := e2.pass(b)
 	list := func(c Cursor) reply {
 		return e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages?cursor="+formatCursor(Header{ReceivedAt: c.ReceivedAt, ID: c.ID}), nil, tok)
 	}
@@ -154,7 +153,7 @@ func TestUnknownIDsStayInMemory(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	e2, cs := counted(t, e, relaxed())
-	tok := tokenOf(t, b)
+	tok := e2.pass(b)
 	msg := func(method, id string) reply {
 		return e2.do(method, "/v1/"+b.Address().String()+"/messages/"+id, nil, tok)
 	}
@@ -198,7 +197,7 @@ func TestMissesPerIP(t *testing.T) {
 		e2.want(identity(b.Address()), http.StatusOK, "")
 	}
 	e2.want(identity(nobody(1)), http.StatusNotFound, protocol.CodeNoSuchMailbox)
-	e2.want(e2.do(http.MethodPost, "/v1/"+nobody(2).String()+"/token", nil, ""), http.StatusNotFound, protocol.CodeNoSuchMailbox)
+	e2.want(e2.do(http.MethodGet, "/v1/"+nobody(2).String()+"/messages", nil, e2.pass(b)), http.StatusNotFound, protocol.CodeNoSuchMailbox) // a call with a pass, naming no box
 	before := cs.reads.Load()
 	r := identity(nobody(3))
 	e2.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
@@ -211,8 +210,7 @@ func TestMissesPerIP(t *testing.T) {
 	for range 3 {
 		e2.want(identity(b.Address()), http.StatusOK, "") // a live box, held in memory: not a miss
 	}
-	e2.want(e2.do(http.MethodPost, "/v1/"+b.Address().String()+"/token", nil, ""), http.StatusOK, "")
-	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, tokenOf(t, b)); r.status != http.StatusOK {
+	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e2.pass(b)); r.status != http.StatusOK {
 		t.Fatalf("the owner's poll: %d %s", r.status, r.body)
 	}
 	e.clock.Add(30 * time.Second) // one back
@@ -220,10 +218,10 @@ func TestMissesPerIP(t *testing.T) {
 	e2.want(identity(nobody(5)), http.StatusTooManyRequests, protocol.CodeRateLimited)
 }
 
-// An address at its count of misses still makes a box and uses it: the first
-// owner call, which activates the box, carries a token of ours and is no
-// guess at an address.
-func TestABoxActivatesWhateverItsAddressMissed(t *testing.T) {
+// An address at its count of misses still makes a box and uses it: a
+// registration reads no record, and the new box's record is in memory from
+// then on, so its first poll is no read that could miss.
+func TestANewBoxIsUsedWhateverItsAddressMissed(t *testing.T) {
 	l := relaxed()
 	l.MissesPerMinute = 1
 	e := newEnv(t, l)
@@ -232,8 +230,8 @@ func TestABoxActivatesWhateverItsAddressMissed(t *testing.T) {
 	e.want(e.do(http.MethodGet, "/v1/"+nobody.String()+"/identity", nil, ""), http.StatusNotFound, protocol.CodeNoSuchMailbox)
 	nobody[1] = 1
 	e.want(e.do(http.MethodGet, "/v1/"+nobody.String()+"/identity", nil, ""), http.StatusTooManyRequests, protocol.CodeRateLimited)
-	b := e.box(protocol.Classic) // registers, then activates with its first owner call
-	if r := e.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, tokenOf(t, b)); r.status != http.StatusOK {
+	b := e.box(protocol.Classic)
+	if r := e.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e.pass(b)); r.status != http.StatusOK {
 		t.Fatalf("the new box's poll: %d %s", r.status, r.body)
 	}
 }
@@ -245,7 +243,7 @@ func TestARememberedMissIsFree(t *testing.T) {
 	l := relaxed()
 	l.MissesPerMinute = 1
 	e2, cs := counted(t, e, l)
-	nobody := newRaw(t).id.Address()
+	nobody := e.raw().id.Address()
 	identity := func(a protocol.Address) reply {
 		return e2.do(http.MethodGet, "/v1/"+a.String()+"/identity", nil, "")
 	}
@@ -257,7 +255,7 @@ func TestARememberedMissIsFree(t *testing.T) {
 	if n := cs.reads.Load(); n != before {
 		t.Fatalf("%d storage calls for a box remembered as missing", n-before)
 	}
-	e2.want(identity(newRaw(t).id.Address()), http.StatusTooManyRequests, protocol.CodeRateLimited) // another address needs a read
+	e2.want(identity(e.raw().id.Address()), http.StatusTooManyRequests, protocol.CodeRateLimited) // another address needs a read
 }
 
 // A message is fetched once and kept. Its first fetch is never limited; a
@@ -269,7 +267,7 @@ func TestAFetchedMessageIsFetchedAgainFromAnAllowance(t *testing.T) {
 	l := relaxed()
 	l.PollBurst, l.PollRefill = 2, time.Minute
 	e2, cs := counted(t, e, l)
-	tok := tokenOf(t, b)
+	tok := e2.pass(b)
 	msg := func(method, id string) reply {
 		return e2.do(method, "/v1/"+b.Address().String()+"/messages/"+id, nil, tok)
 	}
@@ -333,51 +331,44 @@ func TestIndexCountsFetches(t *testing.T) {
 	}
 }
 
-// The token cache holds one token per box, its newest epoch's, for a bounded
-// number of boxes.
-func TestTokenCacheHoldsOnePerBox(t *testing.T) {
-	keys, _ := NewDevKeys()
-	s := New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: DefaultLimits(), TokenCache: 2})
-	token := func(b *Box) []byte {
-		t.Helper()
-		ct, err := s.encryptedToken(b)
-		if err != nil {
-			t.Fatal(err)
+// The server remembers the pass each box showed last, and nothing else of
+// it: the same pass is taken again until it runs out, only as checked under
+// the certificate that is still the box's, and an entry goes once its pass
+// has run out.
+func TestPassesAreRememberedUntilTheyRunOut(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	var a1, a2 protocol.Address
+	a1[0], a2[0] = 1, 2
+	sum, cert := [32]byte{1}, [32]byte{2}
+	ps := newPasses()
+	if ps.has(a1, sum, cert, now) {
+		t.Fatal("a pass never shown is remembered")
+	}
+	ps.keep(a1, seenPass{sum: sum, cert: cert, until: now.Add(protocol.PassLifetime)}, now)
+	if !ps.has(a1, sum, cert, now) || !ps.has(a1, sum, cert, now.Add(protocol.PassLifetime-time.Second)) {
+		t.Fatal("a pass that was checked is not remembered")
+	}
+	for name, got := range map[string]bool{
+		"run out":             ps.has(a1, sum, cert, now.Add(protocol.PassLifetime)),
+		"another pass":        ps.has(a1, [32]byte{9}, cert, now),
+		"another certificate": ps.has(a1, sum, [32]byte{9}, now),
+		"another box":         ps.has(a2, sum, cert, now),
+	} {
+		if got {
+			t.Errorf("%s: taken as the pass remembered", name)
 		}
-		return ct
 	}
-	at := func(b *Box, epoch uint32) *Box {
-		c := cloneBox(b)
-		c.Epoch, c.Prekey.Serial = epoch, uint64(epoch)+1
-		return c
+	// A box's next pass replaces its last.
+	next := [32]byte{3}
+	ps.keep(a1, seenPass{sum: next, cert: cert, until: now.Add(2 * protocol.PassLifetime)}, now)
+	if ps.has(a1, sum, cert, now) || !ps.has(a1, next, cert, now) || len(ps.seen) != 1 {
+		t.Fatalf("after a second pass: %d held", len(ps.seen))
 	}
-	b := costBox(t, false, 0)
-	first := token(at(b, 1))
-	if !bytes.Equal(first, token(at(b, 1))) { // age encrypts differently each time
-		t.Fatal("a repeat was encrypted again")
-	}
-	next := token(at(b, 2))
-	if bytes.Equal(first, next) {
-		t.Fatal("a new epoch got the old epoch's token")
-	}
-	if n := s.tokens.ll.Len(); n != 1 {
-		t.Fatalf("%d tokens held for one box", n)
-	}
-	token(at(b, 1)) // a caller with a stale record
-	if !bytes.Equal(next, token(at(b, 2))) {
-		t.Fatal("an older epoch's token replaced the newer")
-	}
-	for i := range 3 {
-		c := at(b, 1)
-		c.Addr[0] ^= byte(i + 1)
-		token(c)
-	}
-	if n := s.tokens.ll.Len(); n != 2 {
-		t.Fatalf("%d tokens held, over its size of 2", n)
-	}
-	none := New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: DefaultLimits(), TokenCache: -1})
-	if _, err := none.encryptedToken(b); err != nil || none.tokens.ll.Len() != 0 {
-		t.Fatalf("no cache asked for: %v, %d held", err, none.tokens.ll.Len())
+	// Passes that have run out go when the next is kept after a sweep is due.
+	later := now.Add(protocol.MaxPassLifetime)
+	ps.keep(a2, seenPass{sum: sum, cert: cert, until: later.Add(protocol.PassLifetime)}, later)
+	if len(ps.seen) != 1 || !ps.has(a2, sum, cert, later) {
+		t.Fatalf("%d held after a sweep, want only the pass still good", len(ps.seen))
 	}
 }
 
@@ -435,7 +426,7 @@ func TestMissCache(t *testing.T) {
 func TestMissingBoxIsRememberedUntilItIsWritten(t *testing.T) {
 	e, s := dynamoEnv(t)
 	ctx := context.Background()
-	r := newRaw(t)
+	r := e.raw()
 	a := r.id.Address()
 	if _, err := s.Box(ctx, a); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("an unregistered box: %v", err)
@@ -443,8 +434,8 @@ func TestMissingBoxIsRememberedUntilItIsWritten(t *testing.T) {
 	if m, _ := s.misses.has(a, e.clock.Now()); !m {
 		t.Fatal("the miss was not remembered")
 	}
-	r.prekey(t, 1, e.clock.Now().Add(24*time.Hour), nil)
-	e.want(e.do(http.MethodPut, r.path(""), r.registration(1), ""), http.StatusCreated, "")
+	r.prekey(1, e.clock.Now().Add(24*time.Hour), nil)
+	e.want(e.do(http.MethodPut, r.path(""), r.registration(1), r.pass(1)), http.StatusCreated, "")
 	if b, err := s.Box(ctx, a); err != nil || b.Addr != a {
 		t.Fatalf("the box, once registered: %v", err)
 	}

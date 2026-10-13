@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +37,6 @@ func TestAdoptKeys(t *testing.T) {
 	}
 	for name, bad := range map[string]string{
 		"another server's": other.MintAdopt("echo", id),
-		"a token":          k.Mint(protocol.Address{}, 1),
 		"no prefix":        strings.TrimPrefix(key, adoptPrefix),
 		"truncated":        key[:len(key)-4],
 		"another key id":   flip(1),
@@ -120,7 +118,7 @@ func adopt(t *testing.T, b *client.Box, key string) string {
 func TestAccounts(t *testing.T) {
 	ctx := context.Background()
 	l := relaxed()
-	l.SendsPerDay, l.MaxSize, l.AccountMaxSize = 2, 1024, 4096
+	l.SendsPerDay, l.MaxSize, l.AccountMaxSize = 2, 4096, 16384 // the smallest message is 2,048 bytes
 
 	t.Run("an unmetered account lifts the daily limit and the cap", func(t *testing.T) {
 		e := newEnv(t, l)
@@ -132,13 +130,13 @@ func TestAccounts(t *testing.T) {
 		for i := range 3 {
 			send(t, a, b, strings.Repeat("x", 100*i))
 		}
-		send(t, a, b, strings.Repeat("x", 2000)) // over 1024
-		if _, err := a.Send(ctx, b.Address(), strings.Repeat("x", 5000)); client.Code(err) != protocol.CodeTooLarge || !strings.Contains(err.Error(), "4096") {
+		send(t, a, b, strings.Repeat("x", 5000)) // over 4096
+		if _, err := a.Send(ctx, b.Address(), strings.Repeat("x", 20000)); client.Code(err) != protocol.CodeTooLarge || !strings.Contains(err.Error(), "16384") {
 			t.Fatalf("over the largest cap: %v", err)
 		}
 		// A box in no account has the server's limits.
 		send(t, c, b, "1")
-		if _, err := c.Send(ctx, b.Address(), strings.Repeat("x", 2000)); client.Code(err) != protocol.CodeTooLarge || !strings.Contains(err.Error(), "1024") {
+		if _, err := c.Send(ctx, b.Address(), strings.Repeat("x", 5000)); client.Code(err) != protocol.CodeTooLarge || !strings.Contains(err.Error(), "4096") {
 			t.Fatalf("over the cap: %v", err)
 		}
 		send(t, c, b, "2")
@@ -157,7 +155,7 @@ func TestAccounts(t *testing.T) {
 		if err := a.Leave(ctx); err != nil {
 			t.Fatalf("leave again: %v", err)
 		}
-		if _, err := a.Send(ctx, b.Address(), strings.Repeat("x", 2000)); client.Code(err) != protocol.CodeTooLarge {
+		if _, err := a.Send(ctx, b.Address(), strings.Repeat("x", 5000)); client.Code(err) != protocol.CodeTooLarge || !strings.Contains(err.Error(), "4096") {
 			t.Fatalf("after leaving, over the cap: %v", err)
 		}
 		send(t, a, b, "4")
@@ -234,17 +232,15 @@ func TestAccounts(t *testing.T) {
 
 	t.Run("calls that are refused", func(t *testing.T) {
 		e := newEnv(t, l)
-		r := newRaw(t)
-		r.prekey(t, 1, e.clock.Now().Add(30*24*time.Hour), nil)
-		reg := e.do(http.MethodPut, r.path(""), r.registration(1), "")
-		tok := r.token(t, reg)
+		r := e.raw().register(30 * 24 * time.Hour)
+		pass := r.pass(1)
 		e.want(e.do(http.MethodPut, r.path("/account"), protocol.AdoptRequest{Key: "x"}, ""), 401, protocol.CodeUnauthorized)
-		e.want(e.do(http.MethodPut, r.path("/account"), []byte(`{"key":1}`), tok), 400, protocol.CodeBadRequest)
+		e.want(e.do(http.MethodPut, r.path("/account"), []byte(`{"key":1}`), pass), 400, protocol.CodeBadRequest)
 		e.want(e.do(http.MethodDelete, r.path("/account"), nil, ""), 401, protocol.CodeUnauthorized)
-		e.want(e.do(http.MethodDelete, r.path("/account"), nil, tok), 204, "")
-		// Over the largest cap, a send is refused before anything else is
-		// read: here, that the sender is no box at all.
-		e.want(e.do(http.MethodPost, r.path(""), protocol.SendRequest{From: strings.Repeat("0", 64), Ciphertext: make([]byte, 4097), Signature: []byte("s")}, ""), 413, protocol.CodeTooLarge)
+		e.want(e.do(http.MethodDelete, r.path("/account"), nil, pass), 204, "")
+		// Over the sender's own cap, a send is refused before its body is
+		// read: here, before the server finds it is no age file.
+		e.want(e.do(http.MethodPost, r.path(""), protocol.SendRequest{Ciphertext: make([]byte, 16384)}, pass), 413, protocol.CodeTooLarge)
 	})
 }
 
@@ -355,20 +351,26 @@ func until(t *testing.T, ok func(i int) bool) {
 }
 
 // A send past the free cap's size waits for the one allowance for large
-// reads; a smaller one never does, and one over the largest cap is refused
-// at once.
+// reads; a smaller one never does, and one over the sender's own cap is
+// refused at once. Only a sender whose cap is above the free one ever waits
+// for it: the pass comes before the body, so a body from anyone else is never
+// read that far.
 func TestLargeReadsTakeTurns(t *testing.T) {
 	l := relaxed()
 	l.MaxSize, l.AccountMaxSize = 16<<10, 64<<10 // bodies read at once up to ~25 KB, at most ~91 KB
-	keys, _ := NewDevKeys()
-	srv := New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: l})
-	ts := httptest.NewServer(srv.Handler())
-	t.Cleanup(ts.Close)
-	post := func(size int, wait time.Duration) (int, error) {
-		j, _ := json.Marshal(protocol.SendRequest{From: strings.Repeat("0", 64), Ciphertext: make([]byte, size), Signature: []byte("s")})
+	e := newEnv(t, l)
+	_, key := accountEnv(t, e, true, 1)
+	lifted, free, to := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic)
+	adopt(t, lifted, key)
+	post := func(pass string, size int, wait time.Duration) (int, error) {
+		one := uint64(1)
+		j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, Ciphertext: make([]byte, size)})
 		ctx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/v1/"+strings.Repeat("1", 64), bytes.NewReader(j))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String(), bytes.NewReader(j))
+		if pass != "" {
+			req.Header.Set("Authorization", pass)
+		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return 0, err
@@ -376,21 +378,27 @@ func TestLargeReadsTakeTurns(t *testing.T) {
 		resp.Body.Close()
 		return resp.StatusCode, nil
 	}
-	srv.largeRead <- struct{}{} // another large send is being read
-	if _, err := post(30000, 300*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
+	e.server.largeRead <- struct{}{} // another large send is being read
+	if _, err := post(e.pass(lifted), 30000, 300*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("a large send did not wait its turn: %v", err)
 	}
-	if code, err := post(500, 5*time.Second); err != nil || code != http.StatusBadRequest { // read, then not_age
+	if code, err := post(e.pass(lifted), 500, 5*time.Second); err != nil || code != http.StatusBadRequest { // read, then not_age
 		t.Fatalf("a small send waited: %d %v", code, err)
 	}
-	if code, err := post(100000, 5*time.Second); err != nil || code != http.StatusRequestEntityTooLarge {
+	if code, err := post(e.pass(lifted), 100000, 5*time.Second); err != nil || code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("over the largest cap: %d %v", code, err)
 	}
-	<-srv.largeRead
-	if code, err := post(30000, 5*time.Second); err != nil || code != http.StatusBadRequest {
+	if code, err := post(e.pass(free), 30000, 5*time.Second); err != nil || code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("over a free sender's cap, with the allowance taken: %d %v", code, err)
+	}
+	if code, err := post("", 30000, 5*time.Second); err != nil || code != http.StatusUnauthorized {
+		t.Fatalf("a large send with no pass, with the allowance taken: %d %v", code, err)
+	}
+	<-e.server.largeRead
+	if code, err := post(e.pass(lifted), 30000, 5*time.Second); err != nil || code != http.StatusBadRequest {
 		t.Fatalf("a large send with the allowance free: %d %v", code, err)
 	}
-	if len(srv.largeRead) != 0 {
+	if len(e.server.largeRead) != 0 {
 		t.Fatal("the allowance was not given back")
 	}
 }

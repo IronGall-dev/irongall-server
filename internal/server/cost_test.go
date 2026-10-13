@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"net/http"
 	"os"
 	"runtime"
 	"strings"
@@ -47,13 +48,24 @@ func costAddrs(n int) []protocol.Address {
 	return as
 }
 
-// costBox is a real box record: an identity, and a prekey statement it
-// signed, post-quantum or not, with n retired prekeys.
-func costBox(t *testing.T, pq bool, retired int) *Box {
+// costBox is a real box record: an identity, and a prekey statement signed
+// by a working key under its certificate, post-quantum or not, with n retired
+// prekeys. It returns the working key's signer too.
+func costBox(t *testing.T, pq bool, retired int) (*Box, ssh.Signer) {
 	t.Helper()
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	signer, _ := ssh.NewSignerFromKey(priv)
+	identity, _ := ssh.NewSignerFromKey(priv)
 	id, err := protocol.NewIdentity(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, wpriv, _ := ed25519.GenerateKey(rand.Reader)
+	work, _ := ssh.NewSignerFromKey(wpriv)
+	cert, err := protocol.NewCertificate(id, identity, work.PublicKey(), uint64(retired)+1, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := cert.Signer(work)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,11 +86,12 @@ func costBox(t *testing.T, pq bool, retired int) *Box {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := &Box{Addr: id.Address(), Identity: id.Document(), State: Active, Statement: p.Statement(), Signature: sig, Prekey: p, Epoch: uint32(retired) + 1, Rev: uint64(retired) + 2, Created: now}
+	b := &Box{Addr: id.Address(), Identity: id.Document(), State: Active, Statement: p.Statement(), Signature: sig, Prekey: p,
+		CertSerial: cert.Serial(), Cert: certHash(cert), Rev: uint64(retired) + 2, Created: now}
 	for i := range retired {
 		b.Retired = append(b.Retired, Retired{Type: p.Type(), NotAfter: now.Add(time.Duration(i) * time.Hour), KeyHash: sha256.Sum256([]byte{byte(i)})})
 	}
-	return b
+	return b, signer
 }
 
 // TestCostMemoryPerBox measures the heap each structure holds per box.
@@ -100,7 +113,7 @@ func TestCostMemoryPerBox(t *testing.T) {
 				marks = append(marks, mark{id: uint64(i), from: 1, exp: 1 << 62})
 			}
 			_ = x.ensure(ctx, a, func() (boxRead, error) {
-				return boxRead{exists: true, st: Standing{State: Active, Epoch: 1}, rev: 2, marks: marks}, nil
+				return boxRead{exists: true, st: Standing{State: Active, Key: a, Cert: a}, rev: 2, marks: marks}, nil
 			})
 		}
 		t.Logf("index, %3d live messages: %6.0f B per loaded box", k, float64(heapNow()-before)/n)
@@ -126,29 +139,50 @@ func TestCostMemoryPerBox(t *testing.T) {
 	t.Logf("daily send count: %6.0f B per sender that sent today", float64(heapNow()-before)/n)
 	runtime.KeepAlive(&d)
 
-	// The token cache: one encrypted token per box, its newest epoch's, for
-	// at most Config.TokenCache boxes.
-	keys, _ := NewDevKeys()
-	for _, pq := range []bool{true, false} {
-		const m = 20_000
-		b := costBox(t, pq, 0)
-		s := New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: DefaultLimits(), TokenCache: m})
-		before := heapNow()
-		start := time.Now()
-		var size int
-		for _, a := range addrs[:m] {
-			c := *b
-			c.Addr = a
-			ct, err := s.encryptedToken(&c)
-			if err != nil {
-				t.Fatal(err)
-			}
-			size = len(ct)
-		}
-		el := time.Since(start)
-		t.Logf("token cache, pq=%v: %6.0f B per entry (ciphertext %d B, %.0f µs to encrypt)", pq, float64(heapNow()-before)/m, size, float64(el.Microseconds())/m)
-		runtime.KeepAlive(s)
+	// The passes remembered: one entry per box that showed a pass which has
+	// not run out.
+	before = heapNow()
+	ps := newPasses()
+	for _, a := range addrs {
+		ps.keep(a, seenPass{sum: a, cert: a, until: now.Add(protocol.PassLifetime)}, now)
 	}
+	t.Logf("pass remembered: %6.0f B per box that showed one", float64(heapNow()-before)/n)
+	runtime.KeepAlive(ps)
+
+	// What a pass costs to check: the first time, two signature checks; and
+	// every later call that carries it, a hash of the header and a lookup.
+	keys, _ := NewDevKeys()
+	box, work := costBox(t, false, 0)
+	store := NewMemStore(time.Now)
+	if err := store.CreateBox(ctx, box); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Config{Store: store, Keys: keys, Limits: DefaultLimits()})
+	const name = "irongall.example"
+	auth, _, err := protocol.NewPass(work, box.Addr, name, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://"+name+"/v1/"+box.Addr.String()+"/messages", nil)
+	req.SetPathValue("addr", box.Addr.String())
+	req.Header.Set("Authorization", auth)
+	const first = 2000
+	start := time.Now()
+	for range first {
+		srv.passes = newPasses()
+		if _, err := srv.owner(req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("a pass checked for the first time: %.0f µs (the Authorization value is %d B)", float64(time.Since(start).Microseconds())/first, len(auth))
+	const later = 1_000_000
+	start = time.Now()
+	for range later {
+		if _, err := srv.owner(req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("a pass the server remembers: %.2f µs a call", float64(time.Since(start).Nanoseconds())/later/1000)
 
 	// The box record cache: bounded (-box-cache, default 10,000).
 	for _, c := range []struct {
@@ -156,7 +190,7 @@ func TestCostMemoryPerBox(t *testing.T) {
 		retired int
 	}{{true, 0}, {true, 10}, {false, 0}} {
 		const m = 10_000
-		b := costBox(t, c.pq, c.retired)
+		b, _ := costBox(t, c.pq, c.retired)
 		before := heapNow()
 		cache := newBoxCache(m)
 		for _, a := range addrs[:m] {
@@ -221,30 +255,24 @@ func TestCostItemSizes(t *testing.T) {
 		pq      bool
 		retired int
 	}{{true, 0}, {true, 1}, {true, 10}, {false, 0}, {false, 10}} {
-		b := costBox(t, c.pq, c.retired)
+		b, _ := costBox(t, c.pq, c.retired)
 		n := itemSize(boxItem(b))
 		t.Logf("box record, pq=%v, %2d retired: %5d B = %d write units (identity %d, statement %d, signature %d)",
 			c.pq, c.retired, n, wcu(n), len(b.Identity), len(b.Statement), len(b.Signature))
 	}
 
-	_, priv, _ := ed25519.GenerateKey(rand.Reader)
-	signer, _ := ssh.NewSignerFromKey(priv)
 	to := costAddrs(1)[0]
 	body := make([]byte, 4096)
-	sig, err := protocol.Sign(signer, body, protocol.MessageNamespace(to))
-	if err != nil {
-		t.Fatal(err)
-	}
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	h := &Header{ID: sha256.Sum256(body), From: costAddrs(1)[0], Size: len(body), ReceivedAt: now, ExpiresAt: now.Add(protocol.TTL), Signature: sig}
+	h := &Header{ID: sha256.Sum256(body), From: costAddrs(1)[0], Size: len(body), ReceivedAt: now, ExpiresAt: now.Add(protocol.TTL)}
 	live := msgItem(to, h)
 	n := itemSize(live)
-	t.Logf("message item, unacked: %4d B = %d write unit (signature %d B)", n, wcu(n), len(sig))
+	t.Logf("message item, unacked: %4d B = %d write unit", n, wcu(n))
 	index := map[string]types.AttributeValue{"box": live["box"], "live": live["live"], "id": live["id"], "from": live["from"], "size": live["size"]}
 	t.Logf("its entry in the live index: %4d B", itemSize(index))
 	acked := map[string]types.AttributeValue{}
 	for k, v := range live {
-		if k != "live" && k != "sig" {
+		if k != "live" {
 			acked[k] = v
 		}
 	}

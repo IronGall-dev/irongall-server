@@ -13,24 +13,54 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
-// send is POST /v1/<recipient> (PROTOCOL.md §4, the server pipeline):
+// send is POST /v1/<recipient> (PROTOCOL.md §4.5, the server pipeline):
 // cheapest check first, and only the last step writes.
 func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	now := s.now()
 
-	// 1. Size and shape. A body is read before the sender is known, so up
-	// to the largest cap any sender has; the sender's own cap is checked
-	// once it is (step 4). Past the free cap's size, a read waits for the
-	// one allowance for large reads, so junk from anyone cannot fill memory.
-	free, limit := readLimit(s.limits.MaxSize), readLimit(s.limits.ceiling())
+	// 1. Who is sending: the pass, before the body is read. The pre-auth
+	// rate is per IP, and comes before anything is checked.
+	if ok, wait := s.sendIPs.take(ipKey(s.clientIP(r)), now); !ok {
+		return rateLimited(wait, "too many sends from this address")
+	}
+	from, err := s.sender(r)
+	if err != nil {
+		return err
+	}
+	// The pass showed the box exists, so reading its record is no guess at
+	// an address: it is not a read lookup would count or refuse.
+	sender, err := s.box(ctx, from)
+	if err != nil {
+		return err
+	}
+	if sender == nil {
+		return fail(protocol.CodeUnknownSender, "register your own box first: irongall init", "the box the pass names is not registered, or is closed")
+	}
+	lim, err := s.limitsFor(ctx, sender)
+	if err != nil {
+		return err
+	}
+
+	// 2. Size and shape, to the sender's own cap. Past the free cap's size,
+	// a read waits for the one allowance for large reads, which only a
+	// sender whose cap is larger ever takes.
+	free, limit := readLimit(s.limits.MaxSize), readLimit(lim.MaxSize)
+	tooLarge := fail(protocol.CodeTooLarge, "send less", "the ciphertext is over %d bytes", lim.MaxSize)
 	if r.ContentLength > limit {
-		return fail(protocol.CodeTooLarge, "send less", "the request body is over %d bytes", limit)
+		return tooLarge
 	}
 	body := http.MaxBytesReader(w, r.Body, limit)
+	readProblem := func(err error) error {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			return tooLarge
+		}
+		return fail(protocol.CodeBadRequest, "", "the request body could not be read")
+	}
 	data, err := io.ReadAll(io.LimitReader(body, free+1))
 	if err != nil {
-		return readProblem(err, limit)
+		return readProblem(err)
 	}
 	if int64(len(data)) > free {
 		select {
@@ -43,7 +73,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		}
 		rest, err := io.ReadAll(body)
 		if err != nil {
-			return readProblem(err, limit)
+			return readProblem(err)
 		}
 		data = append(data, rest...)
 	}
@@ -51,39 +81,29 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	if err := decodeJSON(data, &req); err != nil {
 		return err
 	}
-	if req.From == "" {
-		return fail(protocol.CodeBadRequest, "", "missing field %q", "from")
-	}
-	if err := required("ciphertext", req.Ciphertext, "signature", req.Signature); err != nil {
+	if err := required("ciphertext", req.Ciphertext); err != nil {
 		return err
 	}
-	if len(req.Ciphertext) > s.limits.ceiling() {
-		return fail(protocol.CodeTooLarge, "send less", "the ciphertext is over %d bytes", s.limits.ceiling())
+	if len(req.Ciphertext) > lim.MaxSize {
+		return tooLarge
 	}
 
-	// 2. Addresses, the serial, and the pre-auth rate per IP.
+	// 3. The recipient's address, and the serial.
 	to, err := pathAddr(r)
 	if err != nil {
 		return err
 	}
-	from, err := protocol.ParseAddress(req.From)
-	if err != nil {
-		return fail(protocol.CodeBadAddress, "from is this box's address in lowercase", "from is not 64 lowercase hex characters")
-	}
 	if req.PrekeySerial == nil || *req.PrekeySerial < 1 || *req.PrekeySerial > protocol.MaxSerial {
 		return fail(protocol.CodeBadRequest, "name the serial of the prekey the ciphertext is encrypted to: irongall send does", "prekey_serial is missing or not a serial")
 	}
-	if ok, wait := s.sendIPs.take(ipKey(s.clientIP(r)), now); !ok {
-		return rateLimited(wait, "too many sends from this address")
-	}
 
-	// 3. It is an age file.
+	// 4. It is an age file.
 	stanzas, err := stanzasOf(req.Ciphertext)
 	if err != nil {
 		return fail(protocol.CodeNotAge, "encrypt with age to the box's prekey", "the ciphertext is not an age file")
 	}
 
-	// 4. Both boxes are registered and active.
+	// 5. The recipient is registered and active.
 	rcpt, err := s.lookup(r, to)
 	if err != nil {
 		return err
@@ -91,47 +111,18 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	switch {
 	case rcpt == nil, rcpt.State == Closed:
 		return noSuchMailbox
-	case rcpt.State == Pending:
-		return fail(protocol.CodeNoSuchMailbox, "not activated yet: the owner must poll once", "this box is not activated yet")
 	case rcpt.State == Revoked:
 		return revoked()
 	case rcpt.Prekey.Expired(now):
 		return fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall rekey); retry later", "this box's prekey has expired")
 	}
-	sender, err := s.lookup(r, from)
-	if err != nil {
-		return err
-	}
-	switch {
-	case sender == nil, sender.State != Active && sender.State != Revoked:
-		return fail(protocol.CodeUnknownSender, "register your own box and poll it once: irongall init", "the sender is not a registered, active box")
-	case sender.State == Revoked:
-		return fail(protocol.CodeSenderRevoked, "your box is revoked: make a new one, irongall init", "the sending box is revoked")
-	}
-	lim, err := s.limitsFor(ctx, sender)
-	if err != nil {
-		return err
-	}
-	if len(req.Ciphertext) > lim.MaxSize {
-		return fail(protocol.CodeTooLarge, "send less", "the ciphertext is over %d bytes", lim.MaxSize)
-	}
 
-	// 5. The prekey and the stanza.
+	// 6. The prekey and the stanza.
 	if *req.PrekeySerial != rcpt.Prekey.Serial {
 		return fail(protocol.CodeStalePrekey, "a newer prekey exists: fetch GET /v1/<address>/identity and re-encrypt the same envelope (irongall does this)", "the box's current prekey serial is %d", rcpt.Prekey.Serial)
 	}
 	if p := checkStanzas(stanzas, rcpt); p != nil {
 		return p
-	}
-
-	// 6. The signature, against the sender's REGISTERED identity, for this
-	// recipient only.
-	id, err := protocol.ParseIdentity(sender.Identity)
-	if err != nil {
-		return err
-	}
-	if err := protocol.Verify(id, req.Ciphertext, req.Signature, protocol.MessageNamespace(to)); err != nil {
-		return fail(protocol.CodeBadSignature, "sign the ciphertext with your identity, namespace irongall-msg-v1:<recipient>", "the signature does not verify for the sender")
 	}
 
 	// 7. Dedupe, before any quota: a retry gets the original receipt.
@@ -142,7 +133,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	// 8. Quotas, counted only for verified sends.
+	// 8. Quotas, counted only for sends that carried their sender's pass.
 	if ok, wait := s.sends.add(from, now, lim.SendsPerDay, false); !ok {
 		return rateLimited(wait, "this box has sent its %d messages for the day", lim.SendsPerDay)
 	}
@@ -177,7 +168,6 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		Size:       len(req.Ciphertext),
 		ReceivedAt: now.UTC().Truncate(time.Millisecond),
 		ExpiresAt:  now.UTC().Truncate(time.Millisecond).Add(protocol.TTL),
-		Signature:  req.Signature,
 	}
 	orig, err := s.store.PutMessage(ctx, to, h, req.Ciphertext)
 	if err != nil {

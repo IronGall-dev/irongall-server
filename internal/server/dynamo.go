@@ -286,8 +286,9 @@ func boxState(b *Box) map[string]types.AttributeValue {
 		"state":         str(string(b.State)),
 		"statement":     bin(b.Statement),
 		"statement_sig": bin(b.Signature),
+		"cert_serial":   num(b.CertSerial),
+		"cert":          bin(b.Cert[:]),
 		"retired":       &types.AttributeValueMemberL{Value: retired},
-		"epoch":         num(uint64(b.Epoch)),
 		"rev":           num(b.Rev),
 	}
 }
@@ -302,20 +303,30 @@ func boxItem(b *Box) map[string]types.AttributeValue {
 	return it
 }
 
+// decodeStanding reads from a box record what memory holds of it, at its
+// rev.
 func decodeStanding(it item) (Standing, uint64, error) {
 	state, err := it.string("state")
 	if err != nil {
 		return Standing{}, 0, err
 	}
-	epoch, err := it.uint("epoch")
-	if err != nil || epoch > 1<<32-1 {
-		return Standing{}, 0, fmt.Errorf("item: bad epoch: %v", err)
+	doc, err := it.bytes("identity")
+	if err != nil {
+		return Standing{}, 0, err
+	}
+	id, err := protocol.ParseIdentity(doc)
+	if err != nil {
+		return Standing{}, 0, fmt.Errorf("item: the stored identity: %w", err)
+	}
+	cert, err := it.hash("cert")
+	if err != nil {
+		return Standing{}, 0, err
 	}
 	rev, err := it.uint("rev")
 	if err != nil {
 		return Standing{}, 0, err
 	}
-	return Standing{State: State(state), Epoch: uint32(epoch)}, rev, nil
+	return Standing{State: State(state), Key: identityKey(id), Cert: cert}, rev, nil
 }
 
 func decodeBox(it item) (*Box, error) {
@@ -327,8 +338,11 @@ func decodeBox(it item) (*Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &Box{Addr: a, State: st.State, Epoch: st.Epoch, Rev: rev}
+	b := &Box{Addr: a, State: st.State, Cert: st.Cert, Rev: rev}
 	if b.Identity, err = it.bytes("identity"); err != nil {
+		return nil, err
+	}
+	if b.CertSerial, err = it.uint("cert_serial"); err != nil {
 		return nil, err
 	}
 	if _, ok := it["account"]; ok {
@@ -390,7 +404,6 @@ func msgItem(box protocol.Address, h *Header) map[string]types.AttributeValue {
 	it := msgKey(box, h.ID)
 	it["from"] = bin(h.From[:])
 	it["size"] = num(uint64(h.Size)) //nolint:gosec // a size is not negative
-	it["sig"] = bin(h.Signature)
 	it["received_at"] = num(recv)
 	it["expires_at"] = num(ttlSeconds(recv + ttlMs))
 	it["live"] = bin(liveKey(recv, h.ID))
@@ -417,9 +430,6 @@ func decodeMsg(it item) (*Header, bool, error) {
 		return nil, false, err
 	}
 	h := &Header{ID: id, From: from, Size: int(size), ReceivedAt: fromMs(recv), ExpiresAt: fromMs(recv + ttlMs)} //nolint:gosec // sizes are small
-	if sig, err := it.bytes("sig"); err == nil {
-		h.Signature = sig
-	}
 	_, live := it["live"]
 	return h, live, nil
 }
@@ -509,7 +519,10 @@ func (s *DynamoStore) readBox(ctx context.Context, a protocol.Address) (boxRead,
 		return r, err
 	}
 	s.cache.put(b)
-	r.exists, r.st, r.rev = true, Standing{State: b.State, Epoch: b.Epoch}, b.Rev
+	if r.st, err = b.standing(); err != nil {
+		return r, err
+	}
+	r.exists, r.rev = true, b.Rev
 	p := dynamodb.NewQueryPaginator(s.db, s.liveQuery(a, s.liveFrom(), true))
 	for p.HasMorePages() {
 		out, err := p.NextPage(ctx)
@@ -544,24 +557,19 @@ func (s *DynamoStore) liveQuery(box protocol.Address, lo []byte, consistent bool
 	}
 }
 
-// Standing implements Store: from memory, after the box's load on its first
-// use.
-func (s *DynamoStore) Standing(ctx context.Context, a protocol.Address) (Standing, error) {
-	if err := s.ensure(ctx, a); err != nil {
-		return Standing{}, err
-	}
-	st, ok := s.idx.standing(a)
-	if !ok {
-		return Standing{}, ErrNotFound
-	}
-	return st, nil
-}
+// Held implements Store: the standing of a box memory has loaded.
+func (s *DynamoStore) Held(a protocol.Address) (Standing, bool) { return s.idx.standing(a) }
 
 // applyBox records a box this process wrote.
 func (s *DynamoStore) applyBox(b *Box) {
 	s.misses.wrote(b.Addr)
 	s.cache.put(b)
-	s.idx.setStanding(b.Addr, Standing{State: b.State, Epoch: b.Epoch}, b.Rev)
+	st, err := b.standing()
+	if err != nil { // a record this process just checked and wrote
+		s.logf("boxes: a record written with a bad identity: %v", err)
+		return
+	}
+	s.idx.setStanding(b.Addr, st, b.Rev)
 }
 
 // Box implements Store: the cache, or a read. A box the read does not find is
@@ -723,9 +731,9 @@ func (s *DynamoStore) retire(ctx context.Context, box protocol.Address, id [32]b
 	out, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.msgs,
 		Key:                       msgKey(box, id),
-		UpdateExpression:          aws.String("REMOVE #l, #sig"),
+		UpdateExpression:          aws.String("REMOVE #l"),
 		ConditionExpression:       aws.String("attribute_exists(#l) AND #r > :cutoff"),
-		ExpressionAttributeNames:  map[string]string{"#l": "live", "#sig": "sig", "#r": "received_at"},
+		ExpressionAttributeNames:  map[string]string{"#l": "live", "#r": "received_at"},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":cutoff": num(now - ttlMs)},
 		ReturnValues:              types.ReturnValueUpdatedOld,
 	})

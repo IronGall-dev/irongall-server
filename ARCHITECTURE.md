@@ -15,7 +15,7 @@
 
 | What | How many | Notes |
 |---|---|---|
-| `irongalld` | 1 today, then one per host; a scaled shape is ~4 hosts of 4 cores | All identical; one is to hold a lease and run the background jobs (not built: there are no jobs yet). **One Go process uses every core of its host**, so it's one process per host, never one per core: the runtime spreads goroutines across all CPUs, and since Go 1.25 it reads the container's CPU limit too. CPU is never the reason for more hosts: 1M mailboxes polling once a minute is ~0.4 vCPU |
+| `irongalld` | 1 today, then one per host; a scaled shape is ~4 hosts of 4 cores | All identical; one is to hold a lease and run the background jobs (not built: there are no jobs yet). **One Go process uses every core of its host**, so it's one process per host, never one per core: the runtime spreads goroutines across all CPUs, and since Go 1.25 it reads the container's CPU limit too. CPU is never the reason for more hosts: 1M mailboxes polling once a minute is about 0.9 vCPU, 0.57 for the polls at 34 µs each and 0.32 for the check of each box's new pass every ten minutes at 190 µs (measured 2026-10-13, `PROTOCOL-SERVER.md` §5.1 and §6.1b) |
 | Echo boxes | 2 | `irongall` clients with their own keys, one post-quantum and one X25519-only (`PROTOCOL.md` §10, decided), never inside the server |
 | AWS, managed | — | Three DynamoDB tables, boxes, messages and accounts, each with its stream on; the S3 Express One Zone directory bucket |
 | Edge | — | For irongall.dev today, Cloudflare (TLS) and its tunnel to one host; later an NLB on AWS |
@@ -44,9 +44,9 @@ flowchart LR
 4. **Propagation takes ~1–2 s, which is fine.** With more than one process it opens these windows, each 1–2 s:
    - new mail appears on another process late, and until it does that process answers a fetch or an ack of it `404` from memory (since 2026-10-11 a fetch or an ack reads storage only for a message that memory holds): the client gets it at its next poll;
    - a just-acked message can reappear in a list another process serves. Clients skip ids they've acked and treat a 404 on fetch as already gone;
-   - a revoked or rotated token still works on the other processes;
+   - a pass under a certificate the box has since replaced, and a revoked box's pass, are still taken on the other processes;
    - a burst of sends can go a few over the per-pair cap;
-   - a new box's first poll, if it lands on a process the stream has not reached, is served as an active box's and does not activate it: the box stays pending, and senders get `404`, until a poll lands on a process that knows it is pending.
+   - a call naming a box just registered, if it lands on another process before a read there sees the record, is answered `404`, and that process remembers the miss until the stream brings the record.
 5. **Applying a change twice, or late, is harmless:**
    - Messages are a **set** keyed by id: add if absent, remove if present.
    - A removal leaves a short tombstone, so a late insert can't resurrect an acked message. An id can't legitimately come back within the TTL, because the dedupe record answers any resend.
@@ -70,7 +70,7 @@ flowchart LR
 
 | Layer | Holds | Size (estimate) | Used for | Under memory pressure |
 |---|---|---|---|---|
-| **1. Counts** — always resident | For each box WITH mail, one 32-byte mark per live message (id, sender, expiry, a count of its fetches) | 32 to 51 B per live message, plus 159 B per loaded box (measured 2026-10-11) | **Every poll:** the exact count, the ETag, the per-pair and box caps | Never shed: it IS the poll. If it doesn't fit, that's capacity, because every process holds all of it |
+| **1. Counts** — always resident | For each box WITH mail, one 32-byte mark per live message (id, sender, expiry, a count of its fetches) | 32 to 51 B per live message, plus 223 B per loaded box (measured 2026-10-13) | **Every poll:** the exact count, the ETag, the per-pair and box caps | Never shed: it IS the poll. If it doesn't fit, that's capacity, because every process holds all of it |
 | **2. Listings** — optional | Full metadata for recently listed boxes: id, sender, size, received_at | ~100 B per message | Serving a list from memory | Shrinks first (an LRU under a byte budget), down to off; lists then come from DynamoDB |
 
 ```go
@@ -109,25 +109,26 @@ A set keyed by message id absorbs all three. The penciled Redis count cache was 
   - A client that ignores ETags pays a Query per poll, capped by the poll rate and the page size.
 
 **The rest of each process's memory:**
-- the standing (state, epoch, rev) of every box this process has used;
+- the standing of every box this process has used: its state, its identity's public key, the SHA-256 of its current certificate, and the record's rev. It is what a pass is checked against with no read (`PROTOCOL-SERVER.md` §6.1b);
+- the pass each box showed last, until it runs out, so that a call carrying it again is a lookup;
 - the poll buckets;
-- an LRU of box records for sends and `/token`, which the stream invalidates;
+- an LRU of box records for sends and `/identity`, which the stream invalidates;
 - an LRU of account records, as many as box records, for a sender in an account (`PROTOCOL.md` §6.5): filled on first use by a strongly consistent read, refreshed or evicted by the accounts stream;
-- the server MAC keys, from the 0600 secrets file (`PROTOCOL.md` §6.1).
+- the server MAC keys, from the 0600 secrets file: they make adopt keys (`PROTOCOL.md` §6.5).
 
-That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go maps). As built it measures 286 B a polling box, index and poll bucket together: 0.29 GB per million. The other maps are bounded since 2026-10-11: a bucket key goes once its bucket is full again, and the token cache and the boxes remembered as missing each hold at most `-box-cache` entries.
+That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go maps). As built it measures 518 B a polling box: 223 in the index, 127 for the poll bucket and 168 for the pass remembered (2026-10-13), so 0.52 GB per million. It was 286 B before a box proved itself with a pass: the key and the certificate's hash are 64 B of the difference, and the pass the rest. The other maps are bounded: a bucket key goes once its bucket is full again, a remembered pass when it has run out, and the boxes remembered as missing hold at most `-box-cache` entries.
 
 ### Request paths
 
 | Call | Touches | Notes |
 |---|---|---|
-| Poll / list `GET …/messages` | Layer 1 for the count and ETag; the page from one DynamoDB Query (from layer 2 once it is built) | Empty: the precomputed empty body. `If-None-Match` equal to the version: `304`. Every list response carries `count`, an `ETag`, pages of 50 and `poll_after` (the delivery contract, decided; `PROTOCOL.md` §5.1) |
+| Poll / list `GET …/messages` | The pass, from memory. Layer 1 for the count and ETag; the page from one DynamoDB Query (from layer 2 once it is built) | Empty: the precomputed empty body. `If-None-Match` equal to the version: `304`. Every list response carries `count`, an `ETag`, pages of 50 and `poll_after` (the delivery contract, decided; `PROTOCOL.md` §5.1) |
 | Fetch `GET …/messages/<id>` | Memory first: an id the box does not hold is `404` with no storage call, and a fetch of a message this process has served before takes from the box's allowance (`PROTOCOL.md` §5.7). Then DynamoDB GetItem of the message item by `box, id`, S3 Express GET | Memory can say a message is absent, never that it is there: the read decides. A live item whose body is gone leaves the list and is answered as gone |
 | Ack `DELETE …/messages/<id>` | Memory first, as for a fetch (an id not held is `404`); then S3 DELETE, then a conditional UpdateItem that removes `live` (`PROTOCOL-SERVER.md` §7) | Both steps are safe to repeat. Applied to local memory at once; the stream tells the others |
-| Send `POST /v1/<addr>` | GetItem (the dedupe check), S3 PUT, then one conditional PutItem: the header and the dedupe record are one item (`PROTOCOL-SERVER.md` §7) | Cheapest check first (`PROTOCOL.md` §4); the caps read layer 1 |
-| Register `PUT /v1/<addr>` | DynamoDB PutItem, one age encryption (152–164 µs PQ, measured) | A pending box is meant to carry a DynamoDB TTL: NOT built |
-| New prekey `PUT …/prekey` | DynamoDB UpdateItem (epoch +1), one age encryption | No token needed: the identity's signature is the authority |
-| `/token`, `/identity` | memory or LRU; DynamoDB on a miss | `/identity` cached briefly at the edge is `PROTOCOL-SERVER.md` §12's plan, NOT built |
+| Send `POST /v1/<addr>` | The sender's pass, before the body is read; its record for its account (the LRU, or one GetItem); GetItem (the dedupe check), S3 PUT, then one conditional PutItem: the header and the dedupe record are one item (`PROTOCOL-SERVER.md` §7) | Cheapest check first (`PROTOCOL.md` §4.5); the caps read layer 1. No signature is checked: the message's is inside the ciphertext |
+| Register `PUT /v1/<addr>` | Four signature checks (the statement and the pass, each under the certificate), then DynamoDB PutItem | The box is in use from this one write |
+| New prekey `PUT …/prekey` | The record (the LRU, or one GetItem), the same four checks, DynamoDB UpdateItem | The authority is the statement's own certificate and a pass under it: no pass under the box's current certificate is needed |
+| `/identity` | The LRU; DynamoDB on a miss | Cached briefly at the edge is `PROTOCOL-SERVER.md` §12's plan, NOT built |
 
 ```mermaid
 sequenceDiagram
@@ -137,8 +138,8 @@ sequenceDiagram
   participant D as DynamoDB
   participant P2 as irongalld (others)
   participant B as recipient
-  A->>P1: POST /v1/B with from, ciphertext, signature
-  P1->>P1: parse, stanza check, verify SSHSIG (71 µs)
+  A->>P1: POST /v1/B with prekey_serial and ciphertext, carrying A's pass
+  P1->>P1: check the pass (from memory once seen), parse, stanza check
   P1->>D: GetItem B, id (dedupe)
   P1->>S3: PUT B/id
   P1->>D: PutItem B, id (if no live one)
@@ -170,9 +171,9 @@ sequenceDiagram
 
 What changes:
 - **Memory stops being replicated.** Each shard group holds only its sixteenth of layer 1, layer 2, the box standings and the poll buckets. That removes the one capacity limit above, where every process held all of layer 1.
-- **The stream bouncer routes by the same character.** Mailbox events go only to their shard. Box-record changes (revocations, epochs, prekeys) go to every shard, because any shard may check a sender.
+- **The stream bouncer routes by the same character.** Mailbox events go only to their shard. Box-record changes (revocations, certificates, prekeys) go to every shard, because any shard may check a sender.
 - **Per-sender send limits cross shards.** A's sends land on each recipient's shard. The bouncer would broadcast a compact "A sent one" event, so every process keeps per-sender daily counts (~16 B per active sender, estimate).
-- **Unchanged:** sends still verify the sender from the LRU or DynamoDB, the link page (`/to/<address>`) goes to any shard, and DynamoDB and S3 need nothing new.
+- **Unchanged:** sends still check the sender's pass against its record, from the LRU or DynamoDB, the link page (`/to/<address>`) goes to any shard, and DynamoDB and S3 need nothing new.
 
 ### Startup
 **Lazy, per box.** A full Scan at start saves no reads over loading boxes as they are used, reads dormant boxes too, holds the whole service at 503 until it ends, and is a burst that provisioned capacity throttles; at 1M boxes the boxes table alone is ~0.6 read units a box.
@@ -182,7 +183,7 @@ What changes:
    - A change to the box that arrives meanwhile, from a stream or this process, queues and applies after the load, in order: the read predates it, and the changes are idempotent.
    - A change to a box memory does not hold is dropped: its first use reads it.
    - A failed load (a throttle, say) leaves the box unloaded, and that call answers 503; the next call reads again.
-3. **Only a token this server minted for the address, at any epoch, loads a box.** A call with no token or another token reads the record instead (from the LRU or one GetItem), so junk tokens cannot fill memory.
+3. **Only a call that has shown the box's pass loads a box.** Until a box is loaded, a pass is checked against the box's record (from the LRU or one GetItem), so a call with no pass, or a bad one, fills no memory. A box's first call to a process therefore reads its record twice, once for the pass and once in the load: there is nothing cheaper that shows a pass names a box that exists.
 4. A loaded box stays in memory until the process restarts. Evicting idle boxes is possible later: a reload is the same read.
 
 ### Limits
@@ -190,10 +191,11 @@ What changes:
 - **The per-pair cap (`-pair-cap`) and the box total are global**: they read layer 1's marks, which the stream feeds on every process, 1–2 s behind, with no extra writes; a process's own sends count at once. **Sends per sender a day are counted in each process today.** Every accepted send arrives on the stream with its sender, so each process can count across all of them: that is stage 2, not built.
 - **Prekey renewals per box (`-renewals-per-day`, by UTC day) and the retired prekeys a box record keeps (`-retired-kept`, newest first)** are service limits, not protocol: they keep any one box from spending the boxes table's provisioned write capacity, and its record small. Renewals are counted in memory (one process at stage 1; every renewal is also a box-record write on the stream, so later stages can count them across processes as sends are); an identical retry is not a renewal.
 - **The page allowance (list pages after the first) is per process too,** like the poll bucket it is derived from.
-- **Registrations per /64, `/token` per IP and the misses per IP (reads of the boxes table that find no box)** leave nothing per IP in the stream, and a box's allowance for fetching a message again is each process's own too. So with N processes each is to enforce a 1/N share (not built: one process enforces the whole of each), which keeps the bill ceiling, and rules at an edge in front can sit on top, keyed by /64 for IPv6.
+- **The passes remembered are per process,** so with N processes a box's new pass is checked once on each it calls.
+- **Registrations per /64, the pre-auth sends per IP and the misses per IP (reads of the boxes table that find no box)** leave nothing per IP in the stream, and a box's allowance for fetching a message again is each process's own too. So with N processes each is to enforce a 1/N share (not built: one process enforces the whole of each), which keeps the bill ceiling, and rules at an edge in front can sit on top, keyed by /64 for IPv6.
 
 ### Background jobs
-**Not built.** The plan: one process holds a lease, a DynamoDB item taken with a conditional put that expires, and runs the background jobs. None is planned now: sweeps of abandoned or pending boxes are deferred, since nothing forces them. There is no dormant reaper and no `last_seen`. Pending and closed boxes do not stay resident in memory, since memory loads per box (§ Startup).
+**Not built.** The plan: one process holds a lease, a DynamoDB item taken with a conditional put that expires, and runs the background jobs. None is planned now: sweeps of abandoned boxes are deferred, since nothing forces them. There is no dormant reaper and no `last_seen`. A closed box is not in memory unless something used it, since memory loads per box (§ Startup).
 
 ### Failure modes
 
@@ -212,10 +214,9 @@ What changes:
 As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each message one item, its header and its dedupe record, with a sparse LSI listing the unacked ones), and for accounts since 2026-10-11, and S3 Express for bodies. **Split 2026-10-11**: a mail flood can't throttle registration or rekey, boxes get PITR and backups while mail gets neither, and each stream feeds its own cache. This design adds:
 - **the three tables are always provisioned capacity, never on-demand**, so a burst read is throttled rather than absorbed: memory loads per box (§ Startup);
 - a stream on each, with `NEW_IMAGE`;
-- a `rev` on box items;
-- a TTL on pending boxes (not built).
+- a `rev` on box items.
 
-**No compression.** Bodies are age ciphertext, which doesn't compress. Measured with age 1.3.2, best of gzip -9, zstd -19 and xz -9:
+**No compression.** Bodies are age ciphertext, which doesn't compress. Measured with age 1.3.2, best of gzip -9, zstd -19 and xz -9, on messages as they were before padding and the signature inside (2026-10-10; the sizes have changed since, what compresses has not):
 
 | Message | Stored | Best compressed |
 |---|---|---|
@@ -237,12 +238,14 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
   identity, identity.pub     OpenSSH Ed25519, which ssh-keygen reads directly
   identity.doc, address      the identity document and its hex SHA-256
   prekeys/<serial>.agekey    age identities, each with its signed statement (.txt, .txt.sig); the current one and the newest retired one are kept, older retired ones deleted after an emptying drain an hour on (Go client), or at not_after + 33 days at the latest (PROTOCOL Terms, §6.4)
-  token                      0600
+  work/<serial>              the working key made with that prekey, its .pub and its certificate -cert.pub, as ssh-keygen names them (PROTOCOL §2b).
+                             The one made with the prekey published last signs mail and passes; older ones are deleted when a newer prekey is published
+  pass                       0600: the Authorization value last signed, sent on every call until it is about to run out (PROTOCOL §6.1b)
   serial                     the highest prekey serial this box published: a renewal refuses a served serial below it
-  peers/<addr>/              the pinned identity document, the highest prekey serial seen, the last statement fetched.
-                             Made at a receive only once the served identity hashes to the address: until then it is held in memory
+  peers/<addr>/              the pinned identity document, the highest prekey serial and certificate serial seen, the last statement fetched.
+                             Made on a send once the peer's prekey statement verified, and on a receive once a message from it passed every check
   seen                       ciphertext hash, sent_at, from, msg_id: 33 days (PROTOCOL §5)
-  outbox/                    envelopes and signed bytes awaiting a receipt, re-POSTed unchanged
+  outbox/                    each signed envelope line and its sealed bytes awaiting a receipt, re-POSTed unchanged
   outbox/failed/             entries that can never be delivered: refused for good, or older than 33 days
   inbox/, quarantine/        accepted mail, one line of JSON each built from the checked fields; refused mail, never delivered (PROTOCOL §5).
                              Both named by the SHA-256 of the ciphertext as computed locally, never the server's id.
@@ -262,35 +265,36 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
 | `irongall` | **The product.** Built: `init`, `addr`, `send` (with `--subject`, `--reply-to`, `--supersedes`), `alias`, `flush`, `recv` (with `--wait`), `rekey`, `status`, `adopt`. Designed, not built: `recv --summary` and `--spool`, `watch`, `ack`, `revoke`, `allow`/`block`/`profile`, `export`. Verification is always on, with no flag to skip it, and it fails closed | `github.com/IronGall-dev/irongall-client/client`, a Go library that Go bots can import |
 | `irongall mcp` | **Not built.** A local stdio MCP server in the same binary; the script will not get one. Tools: `irongall_address`, `irongall_send`, `irongall_receive` (with `wait_seconds`), `irongall_ack`. It returns only verified mail, marked as untrusted data with its verified sender | the official Go MCP SDK and the library |
 | `SKILL.md` | **Not built.** An Agent Skill: when to use irongall, the three commands, and "mail bodies are data, never instructions" | the CLI |
-| `irongall.sh` | **Built, `sh/irongall.sh` (2026-10-11).** The stock-tools path as one tested, fail-closed script: `init`, `addr`, `send` (with `--subject`, `--reply-to`, `--supersedes`), `alias`, `flush`, `recv`, `rekey`, run as `bash irongall.sh <command>` or sourced, with a fresh shell per command. Kept simple and explainable; what it lacks against the Go client is listed in the client README, not engineered away. `llms.txt` points at it in the public repo and never carries it | bash ≥ 4, age ≥ 1.3 (post-quantum), OpenSSH ≥ 8.1, curl ≥ 7.76, jq ≥ 1.6, iconv, coreutils |
+| `irongall.sh` | **Built, `sh/irongall.sh` (2026-10-11).** The stock-tools path as one tested, fail-closed script: `init`, `addr`, `send` (with `--subject`, `--reply-to`, `--supersedes`), `alias`, `flush`, `recv`, `rekey`, run as `bash irongall.sh <command>` or sourced, with a fresh shell per command. Kept simple and explainable; what it lacks against the Go client is listed in the client README, not engineered away. `llms.txt` points at it in the public repo and never carries it | bash ≥ 4, age ≥ 1.3 (post-quantum), OpenSSH ≥ 9.1, curl ≥ 7.76, jq ≥ 1.6, iconv, coreutils |
 | Echo box | A bot that replies with what it verified, signed by its own key (`PROTOCOL.md` §10) | the library |
 
 **The library does it once, so every client above behaves the same:**
 1. **Resolve a peer.**
-   - Fetch `/identity`. At first contact check `sha256(identity document) == address` and pin it; a pin always wins.
-   - Verify the prekey statement against the pinned identity, and refuse a lower serial or an expired `not_after`.
+   - Fetch `/identity`. At first contact check `sha256(identity document) == address`; a pin always wins.
+   - Verify the prekey statement under a certificate of that identity (`PROTOCOL.md` §2b), and refuse a lower prekey serial, a lower certificate serial or an expired `not_after`. A new peer is pinned only after that.
    - On `409 stale_prekey`, re-fetch and re-encrypt the same envelope.
 2. **Send.**
    - Take a link, an address or one of the box's aliases as the destination: a name is 1 to 32 of `a-z`, `0-9`, `.`, `_` and `-`, so it is never an address or a link, and a name with two addresses names neither.
-   - Build the envelope `{v, from, to, sent_at, msg_id, body}`, with `subject`, `in_reply_to` and `supersedes` when the sender gives them (one that is not a `msg_id` is refused before anything is built), pad it for the prekey's type so that the ciphertext is a whole number of blocks (`PROTOCOL.md` §4.3a), encrypt it with age to the prekey, and sign the ciphertext with SSHSIG. The outbox keeps the envelope without its padding.
-   - Write the result to the outbox, then POST it with the prekey's serial (`prekey_serial`, required: the server takes mail only for the current prekey).
+   - Build the envelope `{v, from, to, sent_at, msg_id, identity, body}`, with `subject`, `in_reply_to` and `supersedes` when the sender gives them (one that is not a `msg_id` is refused before anything is built). `identity` is the sender's identity document.
+   - Sign the envelope's line with the working key, in the recipient's namespace; put the signature after it, pad the two for the prekey's type so that the ciphertext is a whole number of blocks, and encrypt that with age to the prekey (`PROTOCOL.md` §4.3a, §4.4). The outbox keeps the signed line.
+   - Write the result to the outbox, then POST it with the prekey's serial (`prekey_serial`, required: the server takes mail only for the current prekey), carrying the box's pass.
    - On a receipt, keep the envelope and the receipt in `sent/`, and only then delete the outbox entry: a crash in between posts it again, gets the original receipt and records it again. The echo box deletes its own: its state is in memory.
    - A retry re-POSTs the same bytes. A failed entry never blocks the others; one that can never be delivered moves to `outbox/failed/`, and one older than 33 days, the TTL, is never posted (the server would take it; the recipient refuses it).
 3. **Receive.**
    - Take the lock, send a conditional GET, and drain every page.
    - Skip ids already acked. Fetch the rest, and treat a 404 as already gone.
-   - Verify each signature against the sender's pinned identity, then decrypt.
-   - Parse the envelope strictly: UTF-8, one object, exact keys, no key twice, `v` the number 1 (so no two readers take different values from the envelope's fields; the body is the verified sender's own JSON, passed on as it is). Check the inner `from`/`to`, the 33-day `sent_at` window, the seen-set and `(from, msg_id)`, and that the server's id is the ciphertext's SHA-256.
+   - Decrypt, then check what was decrypted in the order of `PROTOCOL.md` §5: its layout; the envelope's line as one JSON object with no key twice; the identity document it carries, and that `from` is its hash; the signature over the line exactly as decrypted, under a certificate of that identity. The server is asked nothing about a sender.
+   - Then the rest of the envelope, strictly: UTF-8, exact keys, `v` the number 1 (so no two readers take different values from the envelope's fields; the body is the verified sender's own JSON, passed on as it is). Check the inner `to`, the 33-day `sent_at` window, that the server's `from` is the verified sender, the seen-set and `(from, msg_id)`, and that the server's id is the ciphertext's SHA-256.
    - Deliver, then ack, both after the delivery is on disk (fsync). Print or pass on one line of JSON built from the checked fields, never the sender's bytes, with U+0085, U+2028 and U+2029 escaped (Python's `splitlines` and Node's `readline` end lines there). A crash between storing and recording as seen delivers again, never loses: consumers de-duplicate on `from` + `msg_id`. Refused mail is quarantined and acked, and never blocks its claimed sender.
    - A fault in the box itself (an unreadable key or seen-set, a full disk) is an error, never a verdict: the drain stops and nothing is acked.
    - A refusal is a code and the client's own words, kept beside the quarantined message, never text the sender or the server chose; and a drain is bounded in messages, bytes and pages, deleting no retired prekey when it stopped at a bound (`PROTOCOL.md` §5).
-4. **Renew.** A new prekey, with the identity alone, under the box's lock, refusing a served serial below the box's own `serial` (a rollback). A serial is signed once: a statement the server did not take is sent again as it was signed, never signed again, and the next serial gets a new key only when that statement has expired (`PROTOCOL.md` §6.4). The Go client renews in `irongall recv` once the prekey is more than a day old (a failed renewal does not stop the drain and is retried hourly); `irongall rekey` renews at once, waiting up to a minute for a drain's lock so a scheduled run does not die on one collision. `irongall.sh` never renews on its own: `rekey` by hand, at least monthly. Delete retired keys: the Go client keeps the current prekey and the newest retired one, and deletes the older ones after a drain that empties the box and began more than an hour after the newest retired one was made (the hour covers a send in progress as a renewal lands); any retired prekey goes at its `not_after` + 33 days, the Go client's backstop and `irongall.sh`'s only rule. `irongall rekey` keeps the box's key type unless told otherwise, where the recipe's `ig_rekey` defaults to post-quantum; the Go client names the server in `IRONGALL_BASE`, the recipe in `IG_BASE`.
-5. **Token.** On `401 token_stale`, `POST …/token`, decrypt and retry. Take an `irongall-token` header when one arrives (`PROTOCOL.md` §6.1a).
+4. **Renew.** A new prekey, a new working key and its certificate, with the identity alone, under the box's lock, refusing a served serial below the box's own `serial` (a rollback). A serial is signed once: a statement the server did not take is sent again as it was signed, never signed again, and the next serial gets a new key only when that statement has expired (`PROTOCOL.md` §6.4). The Go client renews in `irongall recv` once the prekey is more than a day old (a failed renewal does not stop the drain and is retried hourly); `irongall rekey` renews at once, waiting up to a minute for a drain's lock so a scheduled run does not die on one collision. `irongall.sh` never renews on its own: `rekey` by hand, at least monthly. Delete retired keys: the Go client keeps the current prekey and the newest retired one, and deletes the older ones after a drain that empties the box and began more than an hour after the newest retired one was made (the hour covers a send in progress as a renewal lands); any retired prekey goes at its `not_after` + 33 days, the Go client's backstop and `irongall.sh`'s only rule. `irongall rekey` keeps the box's key type unless told otherwise, where the recipe's `ig_rekey` defaults to post-quantum; the Go client names the server in `IRONGALL_BASE`, the recipe in `IG_BASE`.
+5. **Pass.** Sign a pass good for ten minutes with the working key, keep it in the box and send it on every call. On `401 pass_expired` or `401 unauthorized`, sign another and retry, once (`PROTOCOL.md` §6.1b).
 6. **Pace.** Follow `429` `Retry-After`. (The RateLimit header fields are specified and the server does not send them.)
 7. **Say what needs a look.** Refused mail and a failed renewal go to stderr; `recv` exits 3 after a renewal that failed and 0 after refused mail, which any sender can cause; `irongall status` reads the box's own files and lists what needs attention (the client README has the exit statuses). This step is the Go client's: the script has no `status`, and its `recv` never renews.
 
 **Conformance kit:**
-- `testdata/vectors/` (built, stock tools): identity to address, prekey statements and signatures, a message and its signature, revocation, envelopes, and the refusals of each; `irongall.sh` gets the Go client's verdict on every one (`sh/sh_test.go`). Still to add: problem+json bodies. The token MAC needs the server key, so its vectors belong with the server.
+- `testdata/vectors/` (built, stock tools): identity to address, certificates, prekey statements and signatures, a pass, a message and what is encrypted in it, revocation, envelopes, and the refusals of each; `irongall.sh` gets the Go client's verdict on every one (`sh/sh_test.go`). Still to add: problem+json bodies.
 - **The forging-operator tests are PUBLIC, in irongall-client**: `client/forgery_test.go` and `client/failure_test.go` run the Go client against `internal/fakeserver`, an honest in-memory server a middleware turns hostile, with `go test ./...` and nothing to set up. This repo keeps the tests of what the real server enforces.
 - `irongalld serve --dev` (built): an in-memory store with no AWS, the real server's logic. `test/interop.sh` runs `irongall.sh` and the Go client against it.
 
@@ -300,7 +304,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
 
 ```
 irongall-client
-  protocol/           identity document, address, prekey statement, envelope, namespaces, error codes
+  protocol/           identity document, address, certificate, prekey statement, pass, envelope, namespaces, error codes
   sshsig/             SSHSIG sign/verify on x/crypto/ssh, since no first-party Go one exists
   client/             the Go client library
   cmd/irongall/       the client: the CLI (`mcp` is not built)
@@ -311,7 +315,7 @@ irongall-client
 irongall-server (this repo)
   cmd/irongalld/      the server; imports protocol/ and sshsig/ from irongall-client
   internal/server/    api (net/http routing, problem+json) · index (layer 1) · feed (stream follower) ·
-                      store (DynamoDB + S3 Express, and in-memory) · limits · token format
+                      store (DynamoDB + S3 Express, and in-memory) · limits · the pass check · adopt keys
   design docs, test/, bench/
 ```
 
@@ -348,7 +352,7 @@ Decided 2026-10-10 and gone from this list: DynamoDB Streams as the change log (
 - **The default budget for layer 2.** Proposed: on, with a byte budget; 0 means counts only.
 - **Limits and resident state:**
   - per-process shares plus edge rules for the per-IP limits;
-  - the pending-box TTL and closed-box eviction.
+  - closed-box eviction.
 - **The readiness threshold:** 30 s of stream lag, proposed.
 
 ## Estimates and measurements
@@ -358,5 +362,5 @@ Decided 2026-10-10 and gone from this list: DynamoDB Streams as the change log (
   - ~32 B per mark and ~100 B per listed message;
   - ~4 read units per page Query;
   - ~300 lines of shard following.
-- **Measured:** the poll cost (18–24 µs), base process memory at 1M boxes, SSHSIG verify (71 µs), PQ token encryption (152–164 µs) and the compression table.
+- **Measured:** the poll cost (33 to 34 µs with a pass the server remembers), a new pass's check (190 µs), memory per box, and the compression table.
 - **From AWS docs, read 2026-10-10:** the stream guarantees and the two-reader advice.

@@ -19,7 +19,6 @@ import (
 	"strings"
 	"time"
 
-	"filippo.io/age"
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
@@ -39,13 +38,13 @@ type Config struct {
 	// address. From any other peer the header is ignored. None: the
 	// peer is always the client.
 	TrustedProxies []netip.Prefix
-	// TokenCache is how many boxes' encrypted tokens memory holds: 0 is
-	// defaultTokenCache, and below zero none.
-	TokenCache int
+	// Names are the names clients call this server by: the host of its URL,
+	// lowercase, with its port if it has one. A pass is taken only on a
+	// request whose Host is one of them (PROTOCOL.md §6.1b). None: any Host
+	// is taken, which is for the dev server and tests only, since a pass
+	// made for another server would then pass here.
+	Names []string
 }
-
-// defaultTokenCache is Config.TokenCache when it is not set.
-const defaultTokenCache = 10000
 
 // Server is the API.
 type Server struct {
@@ -56,43 +55,27 @@ type Server struct {
 	log     *log.Logger
 	ready   func() bool
 	proxies []netip.Prefix
+	names   []string
 
-	polls     *buckets // per box
-	pages     *buckets // per box: list pages after the first
-	repeats   *buckets // per box: fetches of a message already fetched
-	regs      *buckets // per IP
-	tokenReqs *buckets // per IP
-	sendIPs   *buckets // per IP
-	misses    *buckets // per IP: reads of the boxes table that found no box
-	sends     daily    // per sender
-	renewals  daily    // per box
+	polls    *buckets // per box
+	pages    *buckets // per box: list pages after the first
+	repeats  *buckets // per box: fetches of a message already fetched
+	regs     *buckets // per IP
+	sendIPs  *buckets // per IP
+	misses   *buckets // per IP: reads of the boxes table that found no box
+	sends    daily    // per sender
+	renewals daily    // per box
 	// largeRead is the one allowance for reading a send past the free
-	// cap's size, held until the send is answered: every sender's body is
-	// read before the server knows who sent it.
+	// cap's size, held until the send is answered. Only a sender whose own
+	// cap is larger ever asks for it.
 	largeRead chan struct{}
 
-	// tokens holds boxes' current tokens, encrypted: a repeat /token call is
-	// a memory lookup. One per box, its newest epoch's, and at most
-	// Config.TokenCache boxes, the least recently used going first.
-	tokens *recCache[protocol.Address, *sealedToken]
-}
-
-// sealedToken is a box's token at an epoch, encrypted to the prekey that
-// epoch published.
-type sealedToken struct {
-	box    protocol.Address
-	kid    uint8
-	epoch  uint32
-	serial uint64
-	ct     []byte
+	// passes remembers the pass each box showed last (pass.go).
+	passes *passes
 }
 
 // New returns a Server.
 func New(c Config) *Server {
-	tokens := c.TokenCache
-	if tokens == 0 {
-		tokens = defaultTokenCache
-	}
 	s := &Server{
 		store:     c.Store,
 		keys:      c.Keys,
@@ -101,18 +84,15 @@ func New(c Config) *Server {
 		log:       c.Log,
 		ready:     c.Ready,
 		proxies:   c.TrustedProxies,
+		names:     c.Names,
 		polls:     newBuckets(c.Limits.PollBurst, c.Limits.PollRefill),
 		pages:     c.Limits.continuations(),
 		repeats:   newBuckets(c.Limits.PollBurst, c.Limits.PollRefill),
 		regs:      perPeriod(c.Limits.RegistrationsPerHour, time.Hour),
-		tokenReqs: perPeriod(c.Limits.TokensPerMinute, time.Minute),
 		sendIPs:   perPeriod(c.Limits.SendsPerMinutePerIP, time.Minute),
 		misses:    perPeriod(c.Limits.MissesPerMinute, time.Minute),
 		largeRead: make(chan struct{}, 1),
-		tokens: newRecCache(max(tokens, 0),
-			func(t *sealedToken) protocol.Address { return t.box },
-			func(t *sealedToken) uint64 { return uint64(t.epoch) },
-			func(t *sealedToken) *sealedToken { return t }),
+		passes:    newPasses(),
 	}
 	if s.now == nil {
 		s.now = time.Now
@@ -130,7 +110,6 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("PUT /v1/{addr}/prekey", s.handle(s.prekey))
 	api.HandleFunc("PUT /v1/{addr}/account", s.handle(s.adopt))
 	api.HandleFunc("DELETE /v1/{addr}/account", s.handle(s.leave))
-	api.HandleFunc("POST /v1/{addr}/token", s.handle(s.token))
 	api.HandleFunc("GET /v1/{addr}/messages", s.handle(s.list))
 	api.HandleFunc("GET /v1/{addr}/messages/{id}", s.handle(s.fetch))
 	api.HandleFunc("DELETE /v1/{addr}/messages/{id}", s.handle(s.ack))
@@ -265,7 +244,7 @@ func (s *Server) box(ctx context.Context, a protocol.Address) (*Box, error) {
 	return b, err
 }
 
-// lookup reads a box's record for a call that has not shown it owns the box.
+// lookup reads a box's record for a call that has not shown that box's pass.
 // What memory holds is answered at once and is never refused or counted: a
 // box's record, or that a read found no such box a moment ago. Anything else
 // costs a read of the boxes table, and that read is what
@@ -291,120 +270,6 @@ var noSuchMailbox = fail(protocol.CodeNoSuchMailbox, "check the address", "no bo
 
 func revoked() *problem {
 	return fail(protocol.CodeRevoked, "the box you named is revoked, forever: ask its owner for their new address", "this box is revoked")
-}
-
-// owner authenticates an owner call (Bearer) and returns the box's address.
-// A token this server minted for the address, at any epoch, proves the box
-// was registered; only such a call reads the box into memory, on its first
-// use by this process, and every later call is answered from memory
-// (ARCHITECTURE.md § Memory). Anything else reads the record: a pending box,
-// whose first owner call activates it (using the token proves the registrant
-// decrypted it, so it holds the prekey), and a call whose token is missing
-// or not ours, which may name no box.
-func (s *Server) owner(r *http.Request) (protocol.Address, error) {
-	a, err := pathAddr(r)
-	if err != nil {
-		return a, err
-	}
-	tok, hasTok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	tok = strings.TrimSpace(tok)
-	hasTok = hasTok && tok != ""
-	ours := false
-	if _, err := s.keys.verify(a, tok); hasTok && err == nil {
-		ours = true
-		st, err := s.store.Standing(r.Context(), a)
-		switch {
-		case errors.Is(err, ErrNotFound):
-			return a, noSuchMailbox
-		case err != nil:
-			return a, err
-		case st.State == Closed:
-			return a, noSuchMailbox
-		case st.State == Revoked:
-			return a, revoked()
-		case st.State == Active:
-			return a, s.tokenProblem(a, st.Epoch, tok, true)
-		}
-	}
-	// A token of ours names a box that was registered, so reading its record
-	// is no guess at an address: it is not a call lookup would count or refuse.
-	read := s.lookup
-	if ours {
-		read = func(r *http.Request, a protocol.Address) (*Box, error) { return s.box(r.Context(), a) }
-	}
-	b, err := read(r, a)
-	if err != nil {
-		return a, err
-	}
-	switch {
-	case b == nil, b.State == Closed:
-		return a, noSuchMailbox
-	case b.State == Revoked:
-		return a, revoked()
-	}
-	if p := s.tokenProblem(a, b.Epoch, tok, hasTok); p != nil {
-		return a, p
-	}
-	if b.State == Pending {
-		b.State = Active
-		if err := s.store.UpdateBox(r.Context(), b); err != nil {
-			return a, err
-		}
-	}
-	return a, nil
-}
-
-// tokenProblem checks an owner token against the box's epoch: nil if it is
-// valid, otherwise the problem to answer.
-func (s *Server) tokenProblem(a protocol.Address, epoch uint32, tok string, hasTok bool) error {
-	if !hasTok {
-		return fail(protocol.CodeUnauthorized, "send the box's owner token: Authorization: Bearer <token>", "no owner token")
-	}
-	switch err := s.keys.Check(a, epoch, tok); {
-	case errors.Is(err, errStaleToken):
-		p := fail(protocol.CodeTokenStale, "the client refreshes it: POST /v1/<address>/token, decrypt, retry (irongall and ig_owner do this)", "the token's epoch has moved on")
-		p.tokenPresented = true
-		return p
-	case err != nil:
-		p := fail(protocol.CodeUnauthorized, "send the box's owner token", "the token is not valid for this box")
-		p.tokenPresented = true
-		return p
-	}
-	return nil
-}
-
-// encryptedToken returns the box's current token, age-encrypted to its
-// current prekey.
-func (s *Server) encryptedToken(b *Box) ([]byte, error) {
-	if t, ok := s.tokens.get(b.Addr); ok && t.kid == s.keys.Current && t.epoch == b.Epoch && t.serial == b.Prekey.Serial {
-		return t.ct, nil
-	}
-	r, err := b.Prekey.Recipient()
-	if err != nil {
-		return nil, err
-	}
-	var buf bytes.Buffer
-	w, err := age.Encrypt(&buf, r)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := io.WriteString(w, s.keys.Mint(b.Addr, b.Epoch)); err != nil {
-		return nil, err
-	}
-	if err := w.Close(); err != nil {
-		return nil, err
-	}
-	s.tokens.put(&sealedToken{box: b.Addr, kid: s.keys.Current, epoch: b.Epoch, serial: b.Prekey.Serial, ct: buf.Bytes()})
-	return buf.Bytes(), nil
-}
-
-func (s *Server) writeToken(w http.ResponseWriter, status int, b *Box) error {
-	ct, err := s.encryptedToken(b)
-	if err != nil {
-		return err
-	}
-	writeJSON(w, status, protocol.TokenResponse{Token: ct})
-	return nil
 }
 
 // fetchedAlready refuses a fetch of a message the box has fetched before, once
@@ -465,7 +330,7 @@ func (w *statusWriter) WriteHeader(status int) {
 	w.ResponseWriter.WriteHeader(status)
 }
 
-// accessLog logs method, redacted path, status and duration. Never a token,
+// accessLog logs method, redacted path, status and duration. Never a pass,
 // never a body.
 func (s *Server) accessLog(h http.Handler) http.Handler {
 	if s.log == nil {

@@ -45,6 +45,7 @@ type env struct {
 	clock  *clock
 	keys   *Keys
 	store  Store
+	server *Server
 	srv    *httptest.Server
 	mu     sync.Mutex
 	middle func(w http.ResponseWriter, r *http.Request, next http.Handler)
@@ -65,7 +66,8 @@ func newEnv(t *testing.T, l Limits) *env {
 	e := &env{t: t, clock: &clock{t: time.Now().UTC().Truncate(time.Second)}, keys: keys}
 	var ready func() bool
 	e.store, ready = newTestStore(t, e.clock.Now)
-	h := New(Config{Store: e.store, Keys: keys, Limits: l, Now: e.clock.Now, Ready: ready}).Handler()
+	e.server = New(Config{Store: e.store, Keys: keys, Limits: l, Now: e.clock.Now, Ready: ready})
+	h := e.server.Handler()
 	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e.mu.Lock()
 		m := e.middle
@@ -90,7 +92,7 @@ func (e *env) opts() client.Options {
 	return client.Options{Base: e.srv.URL, Now: e.clock.Now}
 }
 
-// box makes, registers and activates a box.
+// box makes and registers a box.
 func (e *env) box(kt protocol.KeyType) *client.Box {
 	e.t.Helper()
 	b, err := client.Init(context.Background(), e.t.TempDir(), e.opts(), kt)
@@ -216,17 +218,6 @@ func capture(e *env, method, suffix string) *[]byte {
 	return &got
 }
 
-func post(t *testing.T, url string, body []byte) (int, []byte) {
-	t.Helper()
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body)) //nolint:gosec // test server
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, b
-}
-
 func TestRetryGetsOriginalReceipt(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
@@ -234,50 +225,47 @@ func TestRetryGetsOriginalReceipt(t *testing.T) {
 	r := send(t, a, b, "once")
 	e.setMiddle(nil)
 
-	status, body := post(t, e.srv.URL+"/v1/"+b.Address().String(), *sent)
+	retry := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a))
 	var again protocol.Receipt
-	if err := json.Unmarshal(body, &again); err != nil || status != http.StatusOK || again != *r {
-		t.Fatalf("retry: %d %s, want 200 and %+v", status, body, *r)
+	if err := json.Unmarshal(retry.body, &again); err != nil || retry.status != http.StatusOK || again != *r {
+		t.Fatalf("retry: %d %s, want 200 and %+v", retry.status, retry.body, *r)
 	}
 	if res := receive(t, b); len(res.Delivered) != 1 {
 		t.Fatalf("delivered %d, want 1", len(res.Delivered))
 	}
 	// Still a retry after the ack: the dedupe record outlives it.
-	if status, _ := post(t, e.srv.URL+"/v1/"+b.Address().String(), *sent); status != http.StatusOK {
-		t.Fatalf("retry after ack: %d", status)
-	}
+	e.want(e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a)), http.StatusOK, "")
 	if res := receive(t, b); len(res.Delivered) != 0 {
 		t.Fatal("a retry after the ack was delivered again")
 	}
 }
 
-// A new prekey bumps the epoch: the old token gets 401 token_stale.
-func TestTokenStaleAfterRekey(t *testing.T) {
+// A new prekey comes under a new certificate: the pass the box held before
+// it, which the server had taken, is refused.
+func TestPassRefusedAfterRekey(t *testing.T) {
 	e := newEnv(t, relaxed())
 	b := e.box(protocol.Classic)
-	old, _ := os.ReadFile(filepath.Join(b.Dir(), "token"))
+	receive(t, b)
+	pass := func() string {
+		p, err := os.ReadFile(filepath.Join(b.Dir(), "pass"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(p))
+	}
+	old := pass()
+	messages := "/v1/" + b.Address().String() + "/messages"
+	e.want(e.do(http.MethodGet, messages, nil, old), http.StatusOK, "")
 	if _, err := b.Rekey(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
-	cur, _ := os.ReadFile(filepath.Join(b.Dir(), "token"))
-	if bytes.Equal(old, cur) {
-		t.Fatal("a new prekey did not bring a new token")
+	if pass() == old {
+		t.Fatal("a new prekey did not bring a new pass")
 	}
-	// The old token is dead.
-	req, _ := http.NewRequest(http.MethodGet, e.srv.URL+"/v1/"+b.Address().String()+"/messages", nil)
-	req.Header.Set("Authorization", "Bearer "+string(old))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var p protocol.Problem
-	_ = json.NewDecoder(resp.Body).Decode(&p)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized || p.Code != protocol.CodeTokenStale ||
-		resp.Header.Get("WWW-Authenticate") != `Bearer error="invalid_token"` {
-		t.Fatalf("old token: %d %s %q", resp.StatusCode, p.Code, resp.Header.Get("WWW-Authenticate"))
-	}
-	// The client's refresh on token_stale is tested in irongall-client.
+	e.want(e.do(http.MethodGet, messages, nil, old), http.StatusUnauthorized, protocol.CodeUnauthorized)
+	e.want(e.do(http.MethodGet, messages, nil, pass()), http.StatusOK, "")
+	// The client signing a new pass when one is refused is tested in
+	// irongall-client.
 }
 
 func mustHex(t *testing.T, s string) []byte {
@@ -301,14 +289,18 @@ func mustHex(t *testing.T, s string) []byte {
 	return b
 }
 
-// A box whose prekey expired still works for its owner, and renewing needs
-// no token. (Senders refusing the expired prekey is tested in irongall-client.)
+// A box whose prekey expired still works for its owner, and renews. (Senders
+// refusing the expired prekey is tested in irongall-client.)
 func TestRenewalAfterExpiry(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	e.clock.Add(protocol.MaxPrekeyLifetime)
-	if _, err := b.Rekey(context.Background(), ""); err != nil {
-		t.Fatal(err)
+	// Both renew: b for a prekey mail can be sent to, a for a certificate
+	// with long enough left to sign mail under.
+	for _, x := range []*client.Box{a, b} {
+		if _, err := x.Rekey(context.Background(), ""); err != nil {
+			t.Fatal(err)
+		}
 	}
 	send(t, a, b, "after renewal")
 	if res := receive(t, b); len(res.Delivered) != 1 {
@@ -320,7 +312,7 @@ func TestRecoveryWithIdentityAlone(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.PostQuantum), e.box(protocol.PostQuantum)
 	// A restored machine: the identity, nothing else.
-	for _, g := range []string{"prekeys/*", "token"} {
+	for _, g := range []string{"prekeys/*", "work/*", "pass"} {
 		names, _ := filepath.Glob(filepath.Join(b.Dir(), g))
 		for _, n := range names {
 			if err := os.Remove(n); err != nil {
@@ -340,7 +332,7 @@ func TestRecoveryWithIdentityAlone(t *testing.T) {
 func TestPagination(t *testing.T) {
 	l := relaxed()
 	l.PairCap = 0
-	l.PollBurst = 2 // init activates with one poll; a drain of two pages is one more
+	l.PollBurst = 1 // a drain of two pages is one poll, and a continuation
 	e := newEnv(t, l)
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	const n = pageSize + 5
@@ -412,8 +404,8 @@ func TestLimits(t *testing.T) {
 		d := DefaultLimits()
 		l.PollBurst, l.PollRefill = d.PollBurst, d.PollRefill
 		e := newEnv(t, l)
-		b := e.box(protocol.Classic) // init's activation is one poll
-		for range 9 {
+		b := e.box(protocol.Classic)
+		for range 10 {
 			receive(t, b)
 		}
 		_, err := b.Receive(ctx)

@@ -2,18 +2,21 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
+	"golang.org/x/crypto/ssh"
 )
 
 // State is a box's state (PROTOCOL.md §3a).
 type State string
 
-// The box states. The epoch never resets across them.
+// The box states.
 const (
-	Pending State = "pending"
 	Active  State = "active"
 	Closed  State = "closed"
 	Revoked State = "revoked"
@@ -24,15 +27,19 @@ type Box struct {
 	Addr     protocol.Address
 	Identity []byte // the identity document, exactly as registered
 	State    State
-	// The current prekey: its statement, the identity's signature over it,
-	// and the statement parsed.
+	// The current prekey: its statement, the working key's signature over it,
+	// which carries the key's certificate, and the statement parsed.
 	Statement []byte
 	Signature []byte
 	Prekey    *protocol.Prekey
+	// The certificate Signature carries, which is the box's current one: its
+	// serial, and the SHA-256 of its bytes. A pass is taken only under it,
+	// and a prekey only under it or a later one (PROTOCOL.md §2b).
+	CertSerial uint64
+	Cert       [32]byte
 	// Retired holds the newest retired prekeys (Limits.RetiredKept), each
 	// until its not_after: its key may not come back.
 	Retired []Retired
-	Epoch   uint32 // bumps on every prekey change and token rotation; never resets
 	Rev     uint64 // the record's revision; a write must name the one it read
 	Created time.Time
 	// Account is the account the box belongs to, or "" (PROTOCOL.md §6.5).
@@ -53,7 +60,7 @@ type Account struct {
 }
 
 // AdoptKey is the state of an adopt key: the key itself is an HMAC, never
-// stored (token.go).
+// stored (keys.go).
 type AdoptKey struct {
 	Account string
 	ID      [16]byte
@@ -75,14 +82,34 @@ type Header struct {
 	Size       int
 	ReceivedAt time.Time // to the millisecond
 	ExpiresAt  time.Time
-	Signature  []byte
 }
 
-// Standing is what an owner call needs of a box: its state and its epoch.
+// Standing is what checking a box's pass needs of it (PROTOCOL.md §6.1b):
+// its state, its identity's public key, and which certificate is its current
+// one.
 type Standing struct {
 	State State
-	Epoch uint32
+	Key   [ed25519.PublicKeySize]byte
+	Cert  [32]byte // Box.Cert
 }
+
+// standing is b's standing.
+func (b *Box) standing() (Standing, error) {
+	id, err := protocol.ParseIdentity(b.Identity)
+	if err != nil {
+		return Standing{}, fmt.Errorf("the stored identity: %w", err)
+	}
+	return Standing{State: b.State, Key: identityKey(id), Cert: b.Cert}, nil
+}
+
+// identityKey is an identity's Ed25519 public key.
+func identityKey(id *protocol.Identity) (k [ed25519.PublicKeySize]byte) {
+	copy(k[:], id.PublicKey().(ssh.CryptoPublicKey).CryptoPublicKey().(ed25519.PublicKey))
+	return k
+}
+
+// certHash names a certificate by the SHA-256 of its bytes.
+func certHash(c *protocol.Certificate) [32]byte { return sha256.Sum256(c.Marshal()) }
 
 // Store errors.
 var (
@@ -98,10 +125,10 @@ var (
 // DynamoStore keeps it in DynamoDB + S3 Express, with what a poll needs in
 // memory.
 type Store interface {
-	// Standing returns a box's standing, or ErrNotFound. A store with memory
-	// reads the box on its first use, then answers from memory
-	// (ARCHITECTURE.md § Memory).
-	Standing(ctx context.Context, a protocol.Address) (Standing, error)
+	// Held returns the standing of a box memory holds, with no read. ok is
+	// false for a box this process has not loaded, which only its record
+	// answers for: Known, then Box (ARCHITECTURE.md § Memory).
+	Held(a protocol.Address) (st Standing, ok bool)
 	// Box returns a box's record, or ErrNotFound.
 	Box(ctx context.Context, a protocol.Address) (*Box, error)
 	// Known returns what memory holds of a box, with no read: its record, or
@@ -151,7 +178,8 @@ type Store interface {
 
 	// Count returns the number of live messages in a box and its version:
 	// the XOR of the first 8 bytes of their ids, identical on every process.
-	// Count and PairCount answer from memory as Standing does.
+	// Count and PairCount answer from memory: a store with memory loads the
+	// box on its first use, then answers from memory.
 	Count(ctx context.Context, box protocol.Address) (n int, version uint64, err error)
 	// PairCount returns how many live messages from one sender a box holds,
 	// and when the oldest of them expires.

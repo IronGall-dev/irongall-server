@@ -29,7 +29,8 @@ Every commit carries `Signed-off-by:` (the DCO, `CONTRIBUTING.md`). 🛑 An AI a
 
 - 🛑 **The server never holds a box's private key and never sees plaintext.** A server feature that needs either is wrong. (The echo box, `PROTOCOL.md` §10, is a separate CLIENT process with its own keys.)
 - 🛑 **No anonymous sends:** every message is authenticated as a REGISTERED address.
-- **The address is the SHA-256 of the identity alone; mail is encrypted to an age PREKEY the identity signs.** Every renewal is a new key: the server refuses one that comes back.
+- **The address is the SHA-256 of the identity alone. The identity certifies a WORKING KEY, and signs nothing else but a revocation; mail is encrypted to an age PREKEY the working key signs.** Every renewal is a new key: the server refuses one that comes back.
+- 🛑 **The server holds no signature on a message, and issues no credential.** A message's signature is inside the ciphertext, and a box proves itself with a pass it signs, which says who is calling and nothing of what a call does (`PROTOCOL.md` §4.4, §6.1b). A server feature that needs a sender's signature over a message, or a secret the server hands a box, is wrong.
 - **Well-defined, RECOMMENDED crypto only:** native age to encrypt, a SEPARATE Ed25519 key to sign. No home-rolled constructions, and no key used for both. Other identity key types are decided and not built (the client repo's issue #21).
 - 🛑 **Keyed hashing is HMAC or HKDF only, never `hash(secret ‖ …)`.**
 - **Go. Every API path under `/v1/`.**

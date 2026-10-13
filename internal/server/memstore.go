@@ -18,6 +18,7 @@ type MemStore struct {
 
 	mu       sync.Mutex
 	boxes    map[protocol.Address]*Box
+	held     map[protocol.Address]Standing // each box's standing, as of its last write
 	messages map[protocol.Address]map[[32]byte]*memMessage
 	dedupe   map[protocol.Address]map[[32]byte]Header
 	accounts map[string]*Account
@@ -40,6 +41,7 @@ func NewMemStore(now func() time.Time) *MemStore {
 	return &MemStore{
 		now:      now,
 		boxes:    map[protocol.Address]*Box{},
+		held:     map[protocol.Address]Standing{},
 		messages: map[protocol.Address]map[[32]byte]*memMessage{},
 		dedupe:   map[protocol.Address]map[[32]byte]Header{},
 		accounts: map[string]*Account{},
@@ -57,15 +59,12 @@ func cloneBox(b *Box) *Box {
 	return &c
 }
 
-// Standing implements Store: the dev store holds every box in memory.
-func (s *MemStore) Standing(_ context.Context, a protocol.Address) (Standing, error) {
+// Held implements Store: the dev store holds every box in memory.
+func (s *MemStore) Held(a protocol.Address) (Standing, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	b, ok := s.boxes[a]
-	if !ok {
-		return Standing{}, ErrNotFound
-	}
-	return Standing{State: b.State, Epoch: b.Epoch}, nil
+	st, ok := s.held[a]
+	return st, ok
 }
 
 // Box implements Store.
@@ -98,8 +97,12 @@ func (s *MemStore) CreateBox(_ context.Context, b *Box) error {
 	if _, ok := s.boxes[b.Addr]; ok {
 		return ErrExists
 	}
+	st, err := b.standing()
+	if err != nil {
+		return err
+	}
 	b.Rev = 1
-	s.boxes[b.Addr] = cloneBox(b)
+	s.boxes[b.Addr], s.held[b.Addr] = cloneBox(b), st
 	return nil
 }
 
@@ -111,8 +114,12 @@ func (s *MemStore) UpdateBox(_ context.Context, b *Box) error {
 	if !ok || cur.Rev != b.Rev {
 		return ErrStale
 	}
+	st, err := b.standing()
+	if err != nil {
+		return err
+	}
 	b.Rev++
-	s.boxes[b.Addr] = cloneBox(b)
+	s.boxes[b.Addr], s.held[b.Addr] = cloneBox(b), st
 	return nil
 }
 

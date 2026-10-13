@@ -116,13 +116,14 @@ func TestIndex(t *testing.T) {
 	})
 
 	t.Run("standing only moves forward", func(t *testing.T) {
-		x := loaded(t, box, boxRead{exists: true, st: Standing{State: Pending}, rev: 1})
-		x.setStanding(box, Standing{State: Active, Epoch: 1}, 3)
-		x.setStanding(box, Standing{State: Pending}, 1) // a late image
-		if st, ok := x.standing(box); !ok || st != (Standing{State: Active, Epoch: 1}) {
+		first, second := Standing{State: Active, Cert: [32]byte{1}}, Standing{State: Active, Cert: [32]byte{2}}
+		x := loaded(t, box, boxRead{exists: true, st: first, rev: 1})
+		x.setStanding(box, second, 3)
+		x.setStanding(box, first, 1) // a late image
+		if st, ok := x.standing(box); !ok || st != second {
 			t.Fatalf("standing %v %v", st, ok)
 		}
-		x.setStanding(box, Standing{State: Revoked, Epoch: 1}, 4)
+		x.setStanding(box, Standing{State: Revoked, Cert: [32]byte{2}}, 4)
 		if st, _ := x.standing(box); st.State != Revoked {
 			t.Fatal("revoked not kept")
 		}
@@ -130,8 +131,8 @@ func TestIndex(t *testing.T) {
 		if _, ok := x.standing(box); ok {
 			t.Fatal("a deleted record kept its standing")
 		}
-		x.setStanding(box, Standing{State: Pending}, 1) // registered again
-		if st, ok := x.standing(box); !ok || st.State != Pending {
+		x.setStanding(box, first, 1) // registered again
+		if st, ok := x.standing(box); !ok || st != first {
 			t.Fatal("a new record after a deletion was not taken")
 		}
 	})
@@ -182,7 +183,7 @@ func TestIndexLoad(t *testing.T) {
 		}
 		x.remove(box, k1.id, k1.exp, now, true) // acked meanwhile
 		x.insert(box, k2, now)                  // and a new message
-		x.setStanding(box, Standing{State: Active, Epoch: 1}, 2)
+		x.setStanding(box, Standing{State: Active, Cert: [32]byte{1}}, 2)
 		close(release)
 		if err := <-done; err != nil {
 			t.Fatal(err)
@@ -190,7 +191,7 @@ func TestIndexLoad(t *testing.T) {
 		if n, v := x.count(box, now); n != 1 || v != k2.id {
 			t.Fatalf("count %d, version %d: the queued changes were not applied after the load", n, v)
 		}
-		if st, _ := x.standing(box); st.Epoch != 1 {
+		if st, _ := x.standing(box); st.Cert != [32]byte{1} {
 			t.Fatal("the queued standing was not applied")
 		}
 	})

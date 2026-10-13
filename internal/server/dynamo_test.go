@@ -164,14 +164,14 @@ func TestRetryAfterAckIsNotRedelivered(t *testing.T) {
 	receive(t, b)
 	// A retry of the same bytes after the ack: the original receipt, from the
 	// item the ack left as the dedupe record.
-	if code, out := post(t, e.srv.URL+"/v1/"+b.Address().String(), *sent); code != http.StatusOK {
-		t.Fatalf("retry after the ack: %d %s", code, out)
+	if r := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a)); r.status != http.StatusOK {
+		t.Fatalf("retry after the ack: %d %s", r.status, r.body)
 	}
 	if n, _, _ := s.Count(context.Background(), b.Address()); n != 0 {
 		t.Fatal("the retry brought back an acked message")
 	}
 	// In the table, too: memory's tomb for the ack would hide a message the
-	// retry listed again, until the stream brought it. The record keeps no
+	// retry listed again, until the stream brought it. No record holds a
 	// signature.
 	var req protocol.SendRequest
 	_ = json.Unmarshal(*sent, &req)
@@ -180,7 +180,7 @@ func TestRetryAfterAckIsNotRedelivered(t *testing.T) {
 		t.Fatalf("after the ack and the retry: %v", it)
 	}
 	if _, ok := it["sig"]; ok {
-		t.Fatal("the acked message's record kept its signature")
+		t.Fatal("a message's record holds a signature")
 	}
 	id := sha256.Sum256(req.Ciphertext)
 	if s.bodyExists(t, b.Address(), id) {
@@ -270,13 +270,7 @@ func TestTwoProcesses(t *testing.T) {
 	e2 := &env{t: t, clock: e.clock, store: other, srv: srv2}
 
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	tok := func() string {
-		tk, err := os.ReadFile(filepath.Join(b.Dir(), "token"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return strings.TrimSpace(string(tk))
-	}
+	tok := func() string { return e2.pass(b) }
 	waitFor := func(what string, ok func() bool) time.Duration {
 		t.Helper()
 		start := time.Now()
@@ -310,18 +304,29 @@ func TestTwoProcesses(t *testing.T) {
 		t.Fatalf("list on the other process: %d %s", r.status, r.body)
 	}
 
-	// A new prekey bumps the epoch: the other process refuses the old token
-	// from memory once the stream brings it.
+	// A new prekey comes under a new certificate: the other process, which
+	// took the old pass a moment ago, refuses it from memory once the stream
+	// brings the change.
 	old := tok()
+	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, old); r.status != http.StatusOK {
+		t.Fatalf("the pass before the renewal, on the other process: %d %s", r.status, r.body)
+	}
 	if _, err := b.Rekey(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	waitFor("the epoch reaching the other process", func() bool {
-		st, err := other.Standing(ctx, b.Address())
-		return err == nil && st.Epoch == 1
+	rec, err := e.store.Box(ctx, b.Address())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor("the new certificate reaching the other process", func() bool {
+		st, ok := other.Held(b.Address())
+		return ok && st.Cert == rec.Cert
 	})
-	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, old); r.code() != protocol.CodeTokenStale {
-		t.Fatalf("old token on the other process: %d %s", r.status, r.body)
+	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, old); r.code() != protocol.CodeUnauthorized {
+		t.Fatalf("the old pass on the other process: %d %s", r.status, r.body)
+	}
+	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, tok()); r.status != http.StatusOK {
+		t.Fatalf("the new pass on the other process: %d %s", r.status, r.body)
 	}
 }
 
@@ -338,10 +343,14 @@ func TestRestartLoadsLazily(t *testing.T) {
 		t.Fatal(err)
 	}
 	send(t, a, d, "deleted by the close")
-	if r := e.do(http.MethodDelete, "/v1/"+d.Address().String(), nil, tokenOf(t, d)); r.status != http.StatusNoContent {
+	if r := e.do(http.MethodDelete, "/v1/"+d.Address().String(), nil, e.pass(d)); r.status != http.StatusNoContent {
 		t.Fatalf("close: %d %s", r.status, r.body)
 	}
 	_, version, _ := e.store.Count(ctx, b.Address())
+	renewed, err := e.store.Box(ctx, c.Address())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	fresh := startDynamo(t, e.clock.Now)
 	if !fresh.Ready() || fresh.loads.Load() != 0 {
@@ -360,18 +369,29 @@ func TestRestartLoadsLazily(t *testing.T) {
 	if n := fresh.loads.Load(); n != 2 {
 		t.Fatalf("%d loads for two boxes", n)
 	}
-	if st, err := fresh.Standing(ctx, c.Address()); err != nil || st.Epoch != 1 {
-		t.Fatalf("rekeyed box: %v %v", st, err)
+	// A box memory has not loaded has no standing there; its first use
+	// loads it, as its record is now.
+	if _, ok := fresh.Held(c.Address()); ok {
+		t.Fatal("a box nothing has used is in memory")
 	}
-	if st, err := fresh.Standing(ctx, d.Address()); err != nil || st.State != Closed {
-		t.Fatalf("closed box: %v %v", st, err)
+	if n, _, err := fresh.Count(ctx, c.Address()); n != 0 || err != nil {
+		t.Fatalf("rekeyed box: %d %v", n, err)
+	}
+	if st, ok := fresh.Held(c.Address()); !ok || st.State != Active || st.Cert != renewed.Cert || st.Key != identityKey(c.Identity()) {
+		t.Fatalf("rekeyed box: %v %v", st, ok)
 	}
 	if n, _, _ := fresh.Count(ctx, d.Address()); n != 0 {
 		t.Fatal("the close left mail in the table")
 	}
+	if st, ok := fresh.Held(d.Address()); !ok || st.State != Closed {
+		t.Fatalf("closed box: %v %v", st, ok)
+	}
 	var nobody protocol.Address
-	if _, err := fresh.Standing(ctx, nobody); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("no box: %v", err)
+	if n, _, err := fresh.Count(ctx, nobody); n != 0 || err != nil {
+		t.Fatalf("no box: %d %v", n, err)
+	}
+	if _, ok := fresh.Held(nobody); ok {
+		t.Fatal("no box, and memory holds a standing for it")
 	}
 }
 
@@ -382,7 +402,7 @@ func TestPollsReadOncePerProcess(t *testing.T) {
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	poll := func() reply {
 		e.clock.Add(time.Minute) // past the poll limit
-		return e.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, tokenOf(t, b))
+		return e.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e.pass(b))
 	}
 	if r := poll(); r.status != http.StatusOK {
 		t.Fatalf("%d %s", r.status, r.body)
@@ -412,11 +432,10 @@ func (throttled) Count(context.Context, protocol.Address) (int, uint64, error) {
 func TestThrottleIs503(t *testing.T) {
 	e := newEnv(t, relaxed())
 	b := e.box(protocol.Classic)
-	tk, _ := os.ReadFile(filepath.Join(b.Dir(), "token"))
 	srv := httptest.NewServer(New(Config{Store: throttled{e.store}, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now}).Handler())
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
-	r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, strings.TrimSpace(string(tk)))
+	r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e2.pass(b))
 	if r.status != http.StatusServiceUnavailable || r.code() != protocol.CodeUnavailable || r.header.Get("Retry-After") == "" {
 		t.Fatalf("%d %s, Retry-After %q", r.status, r.body, r.header.Get("Retry-After"))
 	}
@@ -432,7 +451,7 @@ func TestNotReadyIs503(t *testing.T) {
 	defer srv.Close()
 	e := &env{t: t, srv: srv}
 	var a protocol.Address
-	if r := e.do(http.MethodGet, "/v1/"+a.String()+"/messages", nil, "igt1_x"); r.status != http.StatusServiceUnavailable || r.header.Get("Retry-After") == "" {
+	if r := e.do(http.MethodGet, "/v1/"+a.String()+"/messages", nil, ""); r.status != http.StatusServiceUnavailable || r.header.Get("Retry-After") == "" {
 		t.Fatalf("%d %s", r.status, r.body)
 	}
 }
@@ -441,15 +460,14 @@ func TestLoadKeys(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "keys")
 	k32 := "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
-	if err := os.WriteFile(path, []byte("# server token keys\n2 "+k32+"\n1 "+k32+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("# server keys\n2 "+k32+"\n1 "+k32+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	k, err := LoadKeys(path)
 	if err != nil || k.Current != 2 || len(k.keys) != 2 {
 		t.Fatalf("%v %+v", err, k)
 	}
-	var a protocol.Address
-	if err := k.Check(a, 0, k.Mint(a, 0)); err != nil {
+	if acc, _, err := k.VerifyAdopt(k.MintAdopt("echo", [16]byte{1})); err != nil || acc != "echo" {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(path, 0o640); err != nil {
@@ -499,17 +517,9 @@ func (c *countingStore) DeleteMessage(ctx context.Context, box protocol.Address,
 	return c.Store.DeleteMessage(ctx, box, id)
 }
 
-func tokenOf(t *testing.T, b *client.Box) string {
-	t.Helper()
-	tk, err := os.ReadFile(filepath.Join(b.Dir(), "token"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return strings.TrimSpace(string(tk))
-}
-
-// An empty poll never leaves the process (ARCHITECTURE.md § Memory): an active
-// box at epoch 0, a rekeyed one, a stale token and a closed box are all
+// An empty poll never leaves the process (ARCHITECTURE.md § Memory): a box
+// showing a new pass, one showing a pass the server has taken, a renewed
+// one, a pass from before the renewal, a closed box and a revoked one are all
 // answered from memory.
 func TestPollStaysInMemory(t *testing.T) {
 	e := newEnv(t, relaxed())
@@ -518,28 +528,41 @@ func TestPollStaysInMemory(t *testing.T) {
 	cs := &countingStore{Store: e.store}
 	srv := httptest.NewServer(New(Config{Store: cs, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now}).Handler())
 	defer srv.Close()
-	e2 := &env{t: t, srv: srv}
-	poll := func(x *client.Box, tok string) reply {
-		return e2.do(http.MethodGet, "/v1/"+x.Address().String()+"/messages", nil, tok)
+	e2 := &env{t: t, clock: e.clock, srv: srv}
+	poll := func(x *client.Box, pass string) reply {
+		return e2.do(http.MethodGet, "/v1/"+x.Address().String()+"/messages", nil, pass)
 	}
 
-	if r := poll(b, tokenOf(t, b)); r.status != http.StatusOK {
-		t.Fatalf("active box: %d %s", r.status, r.body)
+	pass := e2.pass(b)
+	for range 3 {
+		if r := poll(b, pass); r.status != http.StatusOK {
+			t.Fatalf("active box: %d %s", r.status, r.body)
+		}
 	}
-	old := tokenOf(t, c)
+	e.clock.Add(protocol.PassLifetime) // the box signs another
+	if r := poll(b, pass); r.code() != protocol.CodePassExpired {
+		t.Fatalf("a pass that ran out: %d %s", r.status, r.body)
+	}
+	if r := poll(b, e2.pass(b)); r.status != http.StatusOK {
+		t.Fatalf("the box's next pass: %d %s", r.status, r.body)
+	}
+	old := e2.pass(c)
+	if r := poll(c, old); r.status != http.StatusOK {
+		t.Fatalf("before the renewal: %d %s", r.status, r.body)
+	}
 	if _, err := c.Rekey(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if r := poll(c, tokenOf(t, c)); r.status != http.StatusOK {
+	if r := poll(c, e2.pass(c)); r.status != http.StatusOK {
 		t.Fatalf("rekeyed box: %d %s", r.status, r.body)
 	}
-	if r := poll(c, old); r.code() != protocol.CodeTokenStale {
-		t.Fatalf("stale token: %d %s", r.status, r.body)
+	if r := poll(c, old); r.code() != protocol.CodeUnauthorized {
+		t.Fatalf("the pass from before the renewal: %d %s", r.status, r.body)
 	}
-	if r := e.do(http.MethodDelete, "/v1/"+c.Address().String(), nil, tokenOf(t, c)); r.status != http.StatusNoContent {
+	if r := e.do(http.MethodDelete, "/v1/"+c.Address().String(), nil, e.pass(c)); r.status != http.StatusNoContent {
 		t.Fatalf("close: %d %s", r.status, r.body)
 	}
-	if r := poll(c, tokenOf(t, c)); r.code() != protocol.CodeNoSuchMailbox {
+	if r := poll(c, e2.pass(c)); r.code() != protocol.CodeNoSuchMailbox {
 		t.Fatalf("closed box: %d %s", r.status, r.body)
 	}
 	before := cs.reads.Load()
@@ -554,7 +577,7 @@ func TestPollStaysInMemory(t *testing.T) {
 	if cs.reads.Load() != before {
 		t.Fatal("the test's own reads were counted")
 	}
-	if r := poll(b, tokenOf(t, b)); r.code() != protocol.CodeRevoked {
+	if r := poll(b, e2.pass(b)); r.code() != protocol.CodeRevoked {
 		t.Fatalf("revoked box: %d %s", r.status, r.body)
 	}
 	if n := cs.reads.Load(); n != 0 {
@@ -571,17 +594,17 @@ func TestExpiredHeadersAreNotListed(t *testing.T) {
 	e.clock.Add(protocol.TTL / 2)
 	live := send(t, a, b, "still live")
 	e.clock.Add(protocol.TTL / 2)
-	r := e.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, tokenOf(t, b))
+	r := e.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e.pass(b))
 	var l protocol.MessageList
 	_ = json.Unmarshal(r.body, &l)
 	if r.status != http.StatusOK || l.Count != 1 || len(l.Messages) != 1 || l.Messages[0].ID != live.ID {
 		t.Fatalf("%d %s", r.status, r.body)
 	}
 	e.clock.Add(protocol.TTL / 2)
-	if r := e.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages/"+live.ID, nil, tokenOf(t, b)); r.code() != protocol.CodeNoSuchMessage {
+	if r := e.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages/"+live.ID, nil, e.pass(b)); r.code() != protocol.CodeNoSuchMessage {
 		t.Fatalf("fetch after expiry: %d %s", r.status, r.body)
 	}
-	if r := e.do(http.MethodDelete, "/v1/"+b.Address().String()+"/messages/"+live.ID, nil, tokenOf(t, b)); r.code() != protocol.CodeNoSuchMessage {
+	if r := e.do(http.MethodDelete, "/v1/"+b.Address().String()+"/messages/"+live.ID, nil, e.pass(b)); r.code() != protocol.CodeNoSuchMessage {
 		t.Fatalf("ack after expiry: %d %s", r.status, r.body)
 	}
 }
@@ -596,15 +619,15 @@ func TestResendAfterExpiryIsRefused(t *testing.T) {
 	first := send(t, a, b, "once, then again")
 	e.setMiddle(nil)
 	e.clock.Add(protocol.TTL - time.Second)
-	code, out := post(t, e.srv.URL+"/v1/"+b.Address().String(), *sent)
+	again := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a))
 	var r protocol.Receipt
-	_ = json.Unmarshal(out, &r)
-	if code != http.StatusOK || r.ReceivedAt != first.ReceivedAt {
-		t.Fatalf("inside the TTL: %d %s", code, out)
+	_ = json.Unmarshal(again.body, &r)
+	if again.status != http.StatusOK || r.ReceivedAt != first.ReceivedAt {
+		t.Fatalf("inside the TTL: %d %s", again.status, again.body)
 	}
 	e.clock.Add(time.Second)
-	if code, out := post(t, e.srv.URL+"/v1/"+b.Address().String(), *sent); code != http.StatusConflict || !strings.Contains(string(out), `"prekey_expired"`) {
-		t.Fatalf("past the TTL: %d %s", code, out)
+	if late := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a)); late.code() != protocol.CodePrekeyExpired {
+		t.Fatalf("past the TTL: %d %s", late.status, late.body)
 	}
 }
 
@@ -653,7 +676,7 @@ func TestUpdateBoxIsConditional(t *testing.T) {
 	b := e.box(protocol.Classic)
 	first, _ := e.store.Box(ctx, b.Address())
 	second, _ := e.store.Box(ctx, b.Address())
-	first.Epoch++
+	first.CertSerial++
 	if err := e.store.UpdateBox(ctx, first); err != nil {
 		t.Fatal(err)
 	}
@@ -661,8 +684,8 @@ func TestUpdateBoxIsConditional(t *testing.T) {
 	if err := e.store.UpdateBox(ctx, second); !errors.Is(err, ErrStale) {
 		t.Fatalf("an update over a stale read: %v", err)
 	}
-	if got, _ := e.store.Box(ctx, b.Address()); got.State != Active || got.Epoch != first.Epoch {
-		t.Fatalf("stored %v at epoch %d", got.State, got.Epoch)
+	if got, _ := e.store.Box(ctx, b.Address()); got.State != Active || got.CertSerial != first.CertSerial {
+		t.Fatalf("stored %v at certificate serial %d", got.State, got.CertSerial)
 	}
 }
 
@@ -675,19 +698,18 @@ func TestRetryAfterCloseIsNotRedelivered(t *testing.T) {
 	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String())
 	send(t, a, b, "deleted unread")
 	e.setMiddle(nil)
-	if r := e.do(http.MethodDelete, "/v1/"+b.Address().String(), nil, tokenOf(t, b)); r.status != http.StatusNoContent {
+	if r := e.do(http.MethodDelete, "/v1/"+b.Address().String(), nil, e.pass(b)); r.status != http.StatusNoContent {
 		t.Fatalf("close: %d %s", r.status, r.body)
 	}
 	if _, err := b.Rekey(ctx, ""); err != nil { // reopen
 		t.Fatal(err)
 	}
-	receive(t, b) // activates it
 	// A retry of the same bytes names the retired serial: it is stale, and
 	// never reaches the dedupe record.
 	var req protocol.SendRequest
 	_ = json.Unmarshal(*sent, &req)
-	if code, out := post(t, e.srv.URL+"/v1/"+b.Address().String(), *sent); code != http.StatusConflict || !strings.Contains(string(out), `"stale_prekey"`) {
-		t.Fatalf("retry: %d %s", code, out)
+	if r := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a)); r.code() != protocol.CodeStalePrekey {
+		t.Fatalf("retry: %d %s", r.status, r.body)
 	}
 	if res := receive(t, b); len(res.Delivered) != 0 {
 		t.Fatal("mail deleted by the close came back")
@@ -708,8 +730,8 @@ func TestBoxCache(t *testing.T) {
 	if b, _ := c.get(a1); b.Rev != 3 {
 		t.Fatalf("rev %d: an older record replaced a newer one", b.Rev)
 	}
-	c.refresh(a1, 3, func() (*Box, error) { return &Box{Addr: a1, Rev: 3, Epoch: 9}, nil })
-	if b, _ := c.get(a1); b.Epoch == 9 {
+	c.refresh(a1, 3, func() (*Box, error) { return &Box{Addr: a1, Rev: 3, CertSerial: 9}, nil })
+	if b, _ := c.get(a1); b.CertSerial == 9 {
 		t.Fatal("refreshed at the same rev")
 	}
 	c.refresh(a1, 4, func() (*Box, error) { return &Box{Addr: a1, Rev: 4}, nil })
@@ -735,13 +757,14 @@ func TestBoxCache(t *testing.T) {
 	}
 }
 
-// A call whose token is missing or not ours reads the record, never memory:
-// the box's state answers first, as for a box this process has not used.
-func TestCallsWithoutOurTokenReadTheRecord(t *testing.T) {
+// A box's state answers before its pass is looked at: a call naming no box,
+// a closed one or a revoked one is told so whatever it carries, and only a
+// call on a box in use is asked for that box's pass.
+func TestTheBoxsStateAnswersBeforeItsPass(t *testing.T) {
 	e := newEnv(t, relaxed())
 	ctx := context.Background()
-	poll := func(a protocol.Address, tok string) reply {
-		return e.do(http.MethodGet, "/v1/"+a.String()+"/messages", nil, tok)
+	poll := func(a protocol.Address, pass string) reply {
+		return e.do(http.MethodGet, "/v1/"+a.String()+"/messages", nil, pass)
 	}
 	set := func(x *client.Box, f func(*Box)) {
 		rec, err := e.store.Box(ctx, x.Address())
@@ -754,26 +777,28 @@ func TestCallsWithoutOurTokenReadTheRecord(t *testing.T) {
 		}
 	}
 	b, c, d := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic)
-	if r := poll(b.Address(), "igt1_not-a-token"); r.code() != protocol.CodeUnauthorized {
-		t.Fatalf("bad token: %d %s", r.status, r.body)
+	if r := poll(b.Address(), "irongall-pass not-a-pass"); r.code() != protocol.CodeUnauthorized {
+		t.Fatalf("not a pass: %d %s", r.status, r.body)
 	}
-	if r := poll(b.Address(), tokenOf(t, c)); r.code() != protocol.CodeUnauthorized {
-		t.Fatalf("another box's token: %d %s", r.status, r.body)
+	if r := poll(b.Address(), e.pass(c)); r.code() != protocol.CodeUnauthorized {
+		t.Fatalf("another box's pass: %d %s", r.status, r.body)
 	}
 	var nobody protocol.Address
-	if r := poll(nobody, "igt1_x"); r.code() != protocol.CodeNoSuchMailbox {
+	if r := poll(nobody, e.pass(c)); r.code() != protocol.CodeNoSuchMailbox {
 		t.Fatalf("unknown box: %d %s", r.status, r.body)
 	}
-	// Our token, but no record (a box this server never registered here).
-	if r := poll(nobody, e.keys.Mint(nobody, 0)); r.code() != protocol.CodeNoSuchMailbox {
-		t.Fatalf("our token, no box: %d %s", r.status, r.body)
-	}
+	pass := e.pass(c)
 	set(c, func(x *Box) { x.State = Closed })
-	if r := poll(c.Address(), "igt1_x"); r.code() != protocol.CodeNoSuchMailbox {
-		t.Fatalf("closed box: %d %s", r.status, r.body)
+	for _, p := range []string{"", pass} {
+		if r := poll(c.Address(), p); r.code() != protocol.CodeNoSuchMailbox {
+			t.Fatalf("closed box: %d %s", r.status, r.body)
+		}
 	}
+	pass = e.pass(d)
 	set(d, func(x *Box) { x.State = Revoked })
-	if r := poll(d.Address(), ""); r.code() != protocol.CodeRevoked {
-		t.Fatalf("revoked box, no token: %d %s", r.status, r.body)
+	for _, p := range []string{"", pass} {
+		if r := poll(d.Address(), p); r.code() != protocol.CodeRevoked {
+			t.Fatalf("revoked box: %d %s", r.status, r.body)
+		}
 	}
 }

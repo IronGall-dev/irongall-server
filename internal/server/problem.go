@@ -26,8 +26,7 @@ var titles = map[protocol.Code]string{
 	protocol.CodeNotAge:             "Not an age file",
 	protocol.CodeWrongRecipientType: "Wrong recipient type",
 	protocol.CodeUnauthorized:       "Unauthorized",
-	protocol.CodeTokenStale:         "Token stale",
-	protocol.CodeBadSignature:       "Bad signature",
+	protocol.CodePassExpired:        "Pass expired",
 	protocol.CodeUnknownSender:      "Unknown sender",
 	protocol.CodeSenderRevoked:      "Sender revoked",
 	protocol.CodeSenderNotAllowed:   "Sender not allowed",
@@ -53,8 +52,6 @@ type problem struct {
 	// pair_full only
 	unacked *int
 	oldest  time.Time
-	// 401 only: whether a token was presented
-	tokenPresented bool
 }
 
 func (p *problem) Error() string { return string(p.code) + ": " + p.detail }
@@ -80,12 +77,7 @@ func writeProblem(w http.ResponseWriter, p *problem) {
 	h := w.Header()
 	h.Set("Content-Type", protocol.ProblemContentType)
 	if status == http.StatusUnauthorized {
-		// RFC 6750 §3: error="invalid_token" only when a token was presented.
-		if p.tokenPresented {
-			h.Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-		} else {
-			h.Set("WWW-Authenticate", "Bearer")
-		}
+		h.Set("WWW-Authenticate", protocol.PassScheme) // RFC 9110 §11.6.1
 	}
 	if p.retryAfter > 0 {
 		h.Set("Retry-After", strconv.Itoa(retrySeconds(p.retryAfter)))
