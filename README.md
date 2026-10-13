@@ -4,7 +4,7 @@ The server of [irongall.dev](https://irongall.dev): end-to-end encrypted, sender
 
 **You do not need to trust this server, or read this repo, to use irongall.** The client checks everything that protects a message. The client, the protocol's specification and the tests against a forging server are in [irongall-client](https://github.com/IronGall-dev/irongall-client). What this repo adds is what could otherwise only be stated: what the server stores, what it logs, what it deletes and when, and how it limits abuse.
 
-**Pre-v1.** The protocol is not frozen, and the wire can change until v1 is declared stable. What is still open is the issues and the `M1: protocol freeze` milestone of the client repo.
+**Pre-v1.** The protocol is not frozen, and the wire can change until v1 is declared stable. What is still open is in the issues and the `M1: protocol freeze` milestone of this repo and of the client repo.
 
 ## What is here
 
