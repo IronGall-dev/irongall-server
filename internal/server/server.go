@@ -301,13 +301,22 @@ func revoked() *problem {
 // whose first owner call activates it (using the token proves the registrant
 // decrypted it, so it holds the prekey), and a call whose token is missing
 // or not ours, which may name no box.
+// bearerToken returns the token of an Authorization header that uses the Bearer scheme.
+// The scheme name is case-insensitive (RFC 9110 section 11.1, RFC 6750 section 2.1).
+func bearerToken(header string) (string, bool) {
+	scheme, tok, ok := strings.Cut(header, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	return strings.TrimSpace(tok), true
+}
+
 func (s *Server) owner(r *http.Request) (protocol.Address, error) {
 	a, err := pathAddr(r)
 	if err != nil {
 		return a, err
 	}
-	tok, hasTok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	tok = strings.TrimSpace(tok)
+	tok, hasTok := bearerToken(r.Header.Get("Authorization"))
 	hasTok = hasTok && tok != ""
 	ours := false
 	if _, err := s.keys.verify(a, tok); hasTok && err == nil {
