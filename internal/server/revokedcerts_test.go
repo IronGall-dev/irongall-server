@@ -169,12 +169,25 @@ func TestRevokedCertificates(t *testing.T) {
 	r.prekey(5, now.Add(protocol.MaxPrekeyLifetime), nil)
 	e.want(put(5, 5), 200, "")
 
-	// A revocation of the address may come with a list: both are kept, and
-	// both are shown. A revoked box takes no list alone.
+	// A revocation of the address may come with a list. Everything in a
+	// body is checked before anything is changed: a good list with what is
+	// not a revocation, and a good revocation with what is not a list, each
+	// change nothing.
 	both := other.list(1, one)
 	if both.Revocation, err = protocol.SignRevocation(other.signer, other.id.Address()); err != nil {
 		t.Fatal(err)
 	}
+	halfList, halfRevocation := both, both
+	halfList.Revocation = []byte("revoke it")
+	halfRevocation.RevokedCertificatesSignature = byWork
+	e.want(e.do("PUT", other.path("/revocations"), halfList, ""), 400, protocol.CodeBadRevocation)
+	e.want(e.do("PUT", other.path("/revocations"), halfRevocation, ""), 400, protocol.CodeBadRevocation)
+	if stored, err = e.store.Box(ctx, other.id.Address()); err != nil || stored.State != Active || len(stored.RevokedCerts) != 0 || len(stored.Revocation) != 0 {
+		t.Fatalf("a body that verified in part changed the record: %+v, %v", stored, err)
+	}
+	e.want(e.do("GET", other.path("/revocations"), nil, ""), 404, protocol.CodeNotRevoked)
+	// Whole, both are kept, and both are shown. A revoked box takes no list
+	// alone.
 	e.want(e.do("PUT", other.path("/revocations"), both, ""), 201, "")
 	shown = e.do("GET", other.path("/revocations"), nil, "")
 	e.want(shown, 200, "")
