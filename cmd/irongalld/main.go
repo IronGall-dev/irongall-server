@@ -32,6 +32,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -68,6 +69,7 @@ func serve(args []string) error {
 	bucket := fs.String("bucket", "", "the S3 Express One Zone directory bucket")
 	keysFile := fs.String("keys", "", "the server keys file (they make adopt keys), mode 0600: lines of \"<kid> <base64 of 32 bytes>\"")
 	names := fs.String("names", "", "comma-separated names clients call this server by: the host of its URL, lowercase, with its port if it has one; a pass is taken only for one of them")
+	idTypes := fs.String("identity-types", strings.Join(protocol.IdentityTypes(), ","), "comma-separated identity key types a box may register with, of those this build verifies; "+protocol.IdentityEd25519+" is always one of them")
 	region := fs.String("region", "us-east-1", "the AWS region")
 	boxCache := fs.Int("box-cache", 10000, "box records held in memory, for sends and /identity")
 	streamEvery := fs.Duration("stream-interval", time.Second, "how often each stream shard is read")
@@ -102,6 +104,18 @@ func serve(args []string) error {
 			return fmt.Errorf("-names: %q: %w", n, err)
 		}
 		cfg.Names = append(cfg.Names, n)
+	}
+	for _, t := range strings.Split(*idTypes, ",") {
+		if t = strings.TrimSpace(t); t == "" {
+			continue
+		}
+		if !slices.Contains(protocol.IdentityTypes(), t) {
+			return fmt.Errorf("-identity-types: %q is not a key type this build verifies: %s", t, strings.Join(protocol.IdentityTypes(), ", "))
+		}
+		cfg.IdentityTypes = append(cfg.IdentityTypes, t)
+	}
+	if !slices.Contains(cfg.IdentityTypes, protocol.IdentityEd25519) {
+		return fmt.Errorf("-identity-types: %s must be one of them: it is the type every client makes and verifies", protocol.IdentityEd25519)
 	}
 	for _, c := range strings.Split(*proxies, ",") {
 		if c = strings.TrimSpace(c); c == "" {

@@ -4,7 +4,8 @@
 #   1. mail both ways between a recipe box and a Go box, sent to each box's link, across a prekey renewal on each side; the page each link opens;
 #   2. ONE box run by both clients: the Go client receives in a box the recipe made, and the recipe in one Go made;
 #   3. the recipe's error path on a real problem+json body;
-#   4. the envelope's optional fields, each client's sent/ record (with the real server's receipt) and aliases, across the clients.
+#   4. the envelope's optional fields, each client's sent/ record (with the real server's receipt) and aliases, across the clients;
+#   5. a box whose identity is of the optional key type, in each client, and the sender key types a box declares.
 # Every script step runs in a FRESH shell (agents run each command in a new one). --no-pq boxes only when the local
 # age is older than 1.3 (it cannot make or send to a post-quantum box); the Go client handles both either way.
 # Needs: go, bash ≥ 4, age, age-keygen, ssh-keygen, curl, jq, sha256sum, base64, od. Run from anywhere:
@@ -103,6 +104,36 @@ out=$(gocli "$G" recv 2> "$work/err") && jq -e --arg m "$mid" --arg f "$RA" '.su
 rec="$R/sent/$GA.$(jq -r .msg_id <<< "$out").json"
 jq -e --argjson d "$out" '(.receipt | keys == ["expires_at", "id", "received_at"]) and del(.receipt) == $d' "$rec" > /dev/null && [ -e "$G/inbox/$(jq -r .receipt.id "$rec").json" ] \
   && ok "the recipe's sent/ record is the same, its receipt naming the file in the recipient's inbox/" || bad "the recipe's sent/ record: $(cat "$rec" 2>&1)"
+
+# --- 5. a box whose identity is of the optional key type, ecdsa-sha2-nistp256, in each client ---
+# The recipe takes the identity key it finds, so its box's key is made with ssh-keygen first. Each client's P-256 box
+# then exchanges mail with the other client's Ed25519 box of step 1, which declared that it verifies the type.
+RP="$work/rp"; GP="$work/gp"; mkdir -p "$RP"
+ssh-keygen -q -t ecdsa -b 256 -N '' -C '' -f "$RP/identity" < /dev/null
+RPL=$(recipe "$RP" "ig_init $(nopq_arg)") && RPA=${RPL##*/} && ig_hex "$RPA" && [ "$(sed -n 2p "$RP/identity.doc" | cut -d' ' -f1)" = ecdsa-sha2-nistp256 ] \
+  && ok "recipe init on a P-256 identity made by ssh-keygen" || bad "recipe init on P-256: $RPL"
+GPL=$(gocli "$GP" init --identity-type ecdsa-sha2-nistp256 $(nopq_arg) 2> "$work/err") && GPA=${GPL##*/} && ig_hex "$GPA" && grep -q '^WARNING: ' "$work/err" \
+  && ok "Go init --identity-type ecdsa-sha2-nistp256, with its warning" || bad "Go init on P-256: $GPL $(cat "$work/err")"
+[ "$(curl -s "$IG_BASE/v1/$GA/identity" | jq -c .sender_key_types)" = '["ssh-ed25519","ecdsa-sha2-nistp256"]' ] && [ "$(curl -s "$IG_BASE/v1/$RA/identity" | jq -c .sender_key_types)" = '["ssh-ed25519","ecdsa-sha2-nistp256"]' ] \
+  && ok "each client's box is served with the sender key types it declared" || bad "sender_key_types: $(curl -s "$IG_BASE/v1/$GA/identity" | jq -c .sender_key_types) $(curl -s "$IG_BASE/v1/$RA/identity" | jq -c .sender_key_types)"
+printf 'p256 recipe to go\n' > "$work/body5"
+recipe "$RP" "ig_send $GL '$work/body5'" && out=$(gocli "$G" recv 2> "$work/err") && jq -e --arg f "$RPA" '.body == "p256 recipe to go\n" and .from == $f' <<< "$out" > /dev/null \
+  && ok "recipe on P-256 → Go: delivered, verified under a certificate ssh-keygen made with a P-256 key" || bad "recipe on P-256 → Go: $out $(cat "$work/err")"
+printf 'go to p256 recipe\n' | gocli "$G" send "$RPL" > /dev/null && out=$(recipe "$RP" ig_recv 2> "$work/err") && jq -e --arg f "$GA" '.body == "go to p256 recipe\n" and .from == $f' <<< "$out" > /dev/null \
+  && ok "Go → recipe on P-256: delivered" || bad "Go → recipe on P-256: $out $(cat "$work/err")"
+printf 'p256 go to recipe\n' | gocli "$GP" send "$RL" > /dev/null && out=$(recipe "$R" ig_recv 2> "$work/err") && jq -e --arg f "$GPA" '.body == "p256 go to recipe\n" and .from == $f' <<< "$out" > /dev/null \
+  && ok "Go on P-256 → recipe: delivered, verified by ssh-keygen under a certificate the Go client made with a P-256 key" || bad "Go on P-256 → recipe: $out $(cat "$work/err")"
+printf 'recipe to p256 go\n' > "$work/body5"
+recipe "$R" "ig_send $GPL '$work/body5'" && out=$(gocli "$GP" recv 2> "$work/err") && jq -e --arg f "$RA" '.body == "recipe to p256 go\n" and .from == $f' <<< "$out" > /dev/null \
+  && ok "recipe → Go on P-256: delivered" || bad "recipe → Go on P-256: $out $(cat "$work/err")"
+# A box that declares Ed25519 only: the server refuses it a P-256 sender's mail, and the Go client does not even post it.
+GE="$work/ge"
+GEL=$(IRONGALL_SENDER_KEY_TYPES=ssh-ed25519 gocli "$GE" init $(nopq_arg)) && GEA=${GEL##*/} && [ "$(curl -s "$IG_BASE/v1/$GEA/identity" | jq -c .sender_key_types)" = '["ssh-ed25519"]' ] \
+  && ok "a box told to declare Ed25519 only is served so" || bad "IRONGALL_SENDER_KEY_TYPES: $(curl -s "$IG_BASE/v1/$GEA/identity")"
+out=$(printf 'x\n' | gocli "$GP" send "$GEL" 2>&1); [ $? -ne 0 ] && grep -q "does not verify identities of this box's key type" <<< "$out" \
+  && ok "Go on P-256 does not send to a box that does not verify its key type" || bad "Go on P-256 → Ed25519-only box: $out"
+out=$(recipe "$RP" "ig_send $GEL '$work/body5'" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 403 sender_key_type" <<< "$out" \
+  && ok "the server refuses the recipe's P-256 box the same send: 403 sender_key_type, and no receipt" || bad "recipe on P-256 → Ed25519-only box: $out"
 
 echo "interop: $pass PASS, $fail FAIL"
 [ "$fail" -eq 0 ]

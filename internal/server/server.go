@@ -44,6 +44,11 @@ type Config struct {
 	// is taken, which is for the dev server and tests only, since a pass
 	// made for another server would then pass here.
 	Names []string
+	// IdentityTypes are the identity key types this server registers: some
+	// of protocol.IdentityTypes, ssh-ed25519 among them, since that is the
+	// one every client makes and verifies (PROTOCOL.md §2). None: every type
+	// this build verifies.
+	IdentityTypes []string
 }
 
 // Server is the API.
@@ -56,6 +61,8 @@ type Server struct {
 	ready   func() bool
 	proxies []netip.Prefix
 	names   []string
+	// identityTypes are the identity key types a box may register with.
+	identityTypes []string
 
 	polls    *buckets // per box
 	pages    *buckets // per box: list pages after the first
@@ -77,25 +84,29 @@ type Server struct {
 // New returns a Server.
 func New(c Config) *Server {
 	s := &Server{
-		store:     c.Store,
-		keys:      c.Keys,
-		limits:    c.Limits,
-		now:       c.Now,
-		log:       c.Log,
-		ready:     c.Ready,
-		proxies:   c.TrustedProxies,
-		names:     c.Names,
-		polls:     newBuckets(c.Limits.PollBurst, c.Limits.PollRefill),
-		pages:     c.Limits.continuations(),
-		repeats:   newBuckets(c.Limits.PollBurst, c.Limits.PollRefill),
-		regs:      perPeriod(c.Limits.RegistrationsPerHour, time.Hour),
-		sendIPs:   perPeriod(c.Limits.SendsPerMinutePerIP, time.Minute),
-		misses:    perPeriod(c.Limits.MissesPerMinute, time.Minute),
-		largeRead: make(chan struct{}, 1),
-		passes:    newPasses(),
+		store:         c.Store,
+		keys:          c.Keys,
+		limits:        c.Limits,
+		now:           c.Now,
+		log:           c.Log,
+		ready:         c.Ready,
+		proxies:       c.TrustedProxies,
+		names:         c.Names,
+		identityTypes: c.IdentityTypes,
+		polls:         newBuckets(c.Limits.PollBurst, c.Limits.PollRefill),
+		pages:         c.Limits.continuations(),
+		repeats:       newBuckets(c.Limits.PollBurst, c.Limits.PollRefill),
+		regs:          perPeriod(c.Limits.RegistrationsPerHour, time.Hour),
+		sendIPs:       perPeriod(c.Limits.SendsPerMinutePerIP, time.Minute),
+		misses:        perPeriod(c.Limits.MissesPerMinute, time.Minute),
+		largeRead:     make(chan struct{}, 1),
+		passes:        newPasses(),
 	}
 	if s.now == nil {
 		s.now = time.Now
+	}
+	if len(s.identityTypes) == 0 {
+		s.identityTypes = protocol.IdentityTypes()
 	}
 	return s
 }

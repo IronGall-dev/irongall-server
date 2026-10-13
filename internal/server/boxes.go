@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
@@ -14,6 +15,10 @@ import (
 // registerLimit bounds a registration or prekey body: a post-quantum prekey
 // statement is ~2 KB, so this is generous.
 const registerLimit = 64 << 10
+
+// hintDocument is what to do about an identity document the server does not
+// take as one.
+const hintDocument = "the identity document is \"irongall-v1\", LF, one SSH public key with no comment, LF: look for a comment, CRLF or a missing final newline"
 
 // register is PUT /v1/<address> (PROTOCOL.md §3).
 func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
@@ -29,13 +34,18 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if protocol.Address(sha256.Sum256(req.Identity)) != h {
-		return fail(protocol.CodeIdentityMismatch, "the identity document is \"irongall-v1\", LF, the ssh-ed25519 key with no comment, LF: look for a comment, CRLF or a missing final newline",
-			"the identity document does not hash to the address")
+		return fail(protocol.CodeIdentityMismatch, hintDocument, "the identity document does not hash to the address")
 	}
+	// The document's form, then its key's type, then its key (PROTOCOL.md §3).
+	// A well-formed document of a type the protocol does not define, or that
+	// this server does not register, is neither malformed nor a bad key.
 	id, err := protocol.ParseIdentity(req.Identity)
 	switch {
 	case errors.Is(err, protocol.ErrIdentityFormat):
-		return fail(protocol.CodeIdentityMismatch, "the identity document is \"irongall-v1\", LF, the ssh-ed25519 key with no comment, LF: look for a comment, CRLF or a missing final newline", "%v", err)
+		return fail(protocol.CodeIdentityMismatch, hintDocument, "%v", err)
+	case errors.Is(err, protocol.ErrIdentityType), err == nil && !slices.Contains(s.identityTypes, id.Type()):
+		return fail(protocol.CodeUnsupportedKeyType, "make a box whose identity is an ssh-ed25519 key, as irongall init does unless told otherwise",
+			"this server registers identities of these key types: %s", strings.Join(s.identityTypes, ", "))
 	case err != nil:
 		return fail(protocol.CodeBadKey, "make a new identity: irongall init in a new box", "%v", err)
 	}
@@ -46,7 +56,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	// The pass, under the certificate the statement is signed under: the
 	// certificate shows the identity chose this working key, and a pass
 	// minutes old that its holder is here now.
-	if err := s.checkPass(r, h, identityKey(id), certHash(cert), nil); err != nil {
+	if err := s.checkPass(r, h, string(id.PublicKey().Marshal()), certHash(cert), nil); err != nil {
 		return err
 	}
 	if ok, wait := s.regs.take(ipKey(s.clientIP(r)), s.now()); !ok {
@@ -54,15 +64,16 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	b := &Box{
-		Addr:       h,
-		Identity:   req.Identity,
-		State:      Active,
-		Statement:  req.Prekey,
-		Signature:  req.PrekeySignature,
-		Prekey:     p,
-		CertSerial: cert.Serial(),
-		Cert:       certHash(cert),
-		Created:    s.now(),
+		Addr:           h,
+		Identity:       req.Identity,
+		State:          Active,
+		Statement:      req.Prekey,
+		Signature:      req.PrekeySignature,
+		Prekey:         p,
+		CertSerial:     cert.Serial(),
+		Cert:           certHash(cert),
+		SenderKeyTypes: declared(req.SenderKeyTypes),
+		Created:        s.now(),
 	}
 	err = s.store.CreateBox(r.Context(), b)
 	if err == nil {
@@ -142,7 +153,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	under := certHash(cert)
-	if err := s.checkPass(r, h, identityKey(id), under, nil); err != nil {
+	if err := s.checkPass(r, h, string(id.PublicKey().Marshal()), under, nil); err != nil {
 		return err
 	}
 	if bytes.Equal(req.Prekey, b.Statement) && bytes.Equal(req.PrekeySignature, b.Signature) {
@@ -175,7 +186,8 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	b.Retired = retired
 	b.Statement, b.Signature, b.Prekey = req.Prekey, req.PrekeySignature, p
 	b.CertSerial, b.Cert = cert.Serial(), under
-	b.State = Active // a closed box reopens
+	b.SenderKeyTypes = declared(req.SenderKeyTypes) // the declaration that comes with this prekey, in place of the one before
+	b.State = Active                                // a closed box reopens
 	if err := s.store.UpdateBox(r.Context(), b); err != nil {
 		if errors.Is(err, ErrStale) {
 			return fail(protocol.CodeConflict, "retry: irongall rekey", "the box changed during the request")
@@ -203,7 +215,7 @@ func (s *Server) identity(w http.ResponseWriter, r *http.Request) error {
 	case b.State == Revoked:
 		return revoked()
 	}
-	writeJSON(w, http.StatusOK, protocol.IdentityResponse{Identity: b.Identity, Prekey: b.Statement, PrekeySignature: b.Signature})
+	writeJSON(w, http.StatusOK, protocol.IdentityResponse{Identity: b.Identity, Prekey: b.Statement, PrekeySignature: b.Signature, SenderKeyTypes: b.SenderKeyTypes})
 	return nil
 }
 

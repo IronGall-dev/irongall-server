@@ -113,7 +113,7 @@ func TestCostMemoryPerBox(t *testing.T) {
 				marks = append(marks, mark{id: uint64(i), from: 1, exp: 1 << 62})
 			}
 			_ = x.ensure(ctx, a, func() (boxRead, error) {
-				return boxRead{exists: true, st: Standing{State: Active, Key: a, Cert: a}, rev: 2, marks: marks}, nil
+				return boxRead{exists: true, st: Standing{State: Active, Key: string(bytes.Repeat([]byte{1}, 51)), Cert: a}, rev: 2, marks: marks}, nil
 			})
 		}
 		t.Logf("index, %3d live messages: %6.0f B per loaded box", k, float64(heapNow()-before)/n)
@@ -149,8 +149,10 @@ func TestCostMemoryPerBox(t *testing.T) {
 	t.Logf("pass remembered: %6.0f B per box that showed one", float64(heapNow()-before)/n)
 	runtime.KeepAlive(ps)
 
-	// What a pass costs to check: the first time, two signature checks; and
-	// every later call that carries it, a hash of the header and a lookup.
+	// What a pass costs to check: the first time, a hash of the certificate
+	// it carries and two signature checks, the working key's and then the
+	// identity's; and every later call that carries it, a hash of the header
+	// and a lookup.
 	keys, _ := NewDevKeys()
 	box, work := costBox(t, false, 0)
 	store := NewMemStore(time.Now)
@@ -183,6 +185,31 @@ func TestCostMemoryPerBox(t *testing.T) {
 		}
 	}
 	t.Logf("a pass the server remembers: %.2f µs a call", float64(time.Since(start).Nanoseconds())/later/1000)
+
+	// What a pass that is not the box's costs to refuse. Under any other
+	// certificate: no signature check. Carrying the box's own certificate,
+	// which is public, with a signature that does not verify: one, the
+	// working key's. The identity's is reached only by a pass that is the
+	// box's.
+	_, otherWork := costBox(t, false, 0)
+	notAfter := time.Now().UTC().Truncate(time.Second).Add(protocol.PassLifetime)
+	elsewhere, _, err := protocol.NewPass(otherWork, box.Addr, name, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for what, junk := range map[string]string{
+		"under another certificate":                             elsewhere,
+		"carrying the box's certificate, signed by another key": passCarrying(t, work.PublicKey(), otherWork, box.Addr, name, notAfter),
+	} {
+		req.Header.Set("Authorization", junk)
+		start = time.Now()
+		for range first {
+			if _, err := srv.owner(req); err == nil {
+				t.Fatalf("a pass %s was taken", what)
+			}
+		}
+		t.Logf("a pass %s, refused: %.0f µs", what, float64(time.Since(start).Microseconds())/first)
+	}
 
 	// The box record cache: bounded (-box-cache, default 10,000).
 	for _, c := range []struct {

@@ -116,6 +116,14 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	case rcpt.Prekey.Expired(now):
 		return fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall rekey); retry later", "this box's prekey has expired")
 	}
+	// A box takes mail from a sender whose identity its client can verify:
+	// one on an Ed25519 key always, and otherwise what it declared with its
+	// prekey. Refused here, the sender has an error and no receipt for mail
+	// the recipient would have refused on reading it.
+	if t := identityType(sender.Identity); !protocol.AcceptsSender(rcpt.SenderKeyTypes, t) {
+		return fail(protocol.CodeSenderKeyType, "a box whose identity is an ssh-ed25519 key, as irongall init makes one, can write to any box",
+			"this box's client does not verify identities of your box's key type, %s", t)
+	}
 
 	// 6. The prekey and the stanza.
 	if *req.PrekeySerial != rcpt.Prekey.Serial {

@@ -282,7 +282,12 @@ func boxState(b *Box) map[string]types.AttributeValue {
 			"key_hash":  bin(r.KeyHash[:]),
 		}})
 	}
+	senders := make([]types.AttributeValue, 0, len(b.SenderKeyTypes))
+	for _, t := range b.SenderKeyTypes {
+		senders = append(senders, str(t))
+	}
 	return map[string]types.AttributeValue{
+		"senders":       &types.AttributeValueMemberL{Value: senders},
 		"state":         str(string(b.State)),
 		"statement":     bin(b.Statement),
 		"statement_sig": bin(b.Signature),
@@ -314,7 +319,7 @@ func decodeStanding(it item) (Standing, uint64, error) {
 	if err != nil {
 		return Standing{}, 0, err
 	}
-	id, err := protocol.ParseIdentity(doc)
+	key, err := identityWire(doc)
 	if err != nil {
 		return Standing{}, 0, fmt.Errorf("item: the stored identity: %w", err)
 	}
@@ -326,7 +331,7 @@ func decodeStanding(it item) (Standing, uint64, error) {
 	if err != nil {
 		return Standing{}, 0, err
 	}
-	return Standing{State: State(state), Key: identityKey(id), Cert: cert}, rev, nil
+	return Standing{State: State(state), Key: key, Cert: cert}, rev, nil
 }
 
 func decodeBox(it item) (*Box, error) {
@@ -365,6 +370,21 @@ func decodeBox(it item) (*Box, error) {
 	b.Created = fromMs(created)
 	if b.Prekey, err = protocol.ParsePrekey(b.Statement); err != nil {
 		return nil, fmt.Errorf("item: the stored prekey: %w", err)
+	}
+	// A record written before boxes declared sender key types has none: it
+	// declared nothing.
+	if v, ok := it["senders"]; ok {
+		l, ok := v.(*types.AttributeValueMemberL)
+		if !ok {
+			return nil, errors.New("item: senders is not a list")
+		}
+		for _, e := range l.Value {
+			t, ok := e.(*types.AttributeValueMemberS)
+			if !ok {
+				return nil, errors.New("item: a sender key type is not a string")
+			}
+			b.SenderKeyTypes = append(b.SenderKeyTypes, t.Value)
+		}
 	}
 	l, ok := it["retired"].(*types.AttributeValueMemberL)
 	if !ok {

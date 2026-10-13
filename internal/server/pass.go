@@ -1,7 +1,6 @@
 package server
 
 import (
-	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
 	"net/http"
@@ -11,15 +10,23 @@ import (
 	"time"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
+	"golang.org/x/crypto/ssh"
 )
 
 // A box proves itself with a pass it signs for itself (PROTOCOL.md §6.1b):
-// the server issues nothing and stores nothing for it. Checking one costs two
-// signature checks, so a pass that passed is remembered until it runs out,
-// and every later call that carries it is a lookup in memory.
+// the server issues nothing and stores nothing for it. A pass is checked in
+// three steps, cheapest first: the certificate it carries against the hash of
+// the box's current one, which costs no signature check; the working key's
+// signature on the pass; and then the identity's signature on the
+// certificate, with every rule of a certificate, as when it was put on
+// record. So a pass that is not the box's costs at most one signature check
+// to refuse, and one that is costs two. A pass that passed is remembered
+// until it runs out, and every later call that carries it is a lookup in
+// memory.
 
 // seenPass is a pass this process checked: the hash of its Authorization
-// value, the certificate it is signed under, and when it runs out.
+// value, the certificate it is signed under, and until when it is taken: the
+// moment it runs out or its certificate ends, whichever comes first.
 type seenPass struct {
 	sum   [32]byte
 	cert  [32]byte
@@ -96,10 +103,11 @@ const (
 )
 
 // checkPass checks that the call carries the pass of box a: made for this
-// server, not run out, and signed under the certificate cert by a working
-// key of the identity whose public key is key (PROTOCOL.md §6.1b). p is the
-// call's pass if the caller parsed it already, and otherwise nil.
-func (s *Server) checkPass(r *http.Request, a protocol.Address, key [ed25519.PublicKeySize]byte, cert [32]byte, p *protocol.Pass) error {
+// server, not run out, and signed under the certificate whose hash is cert
+// by a working key of the identity whose key, in SSH wire form, is key
+// (PROTOCOL.md §6.1b). p is the call's pass if the caller parsed it already,
+// and otherwise nil.
+func (s *Server) checkPass(r *http.Request, a protocol.Address, key string, cert [32]byte, p *protocol.Pass) error {
 	auth := r.Header.Get("Authorization")
 	now := s.now()
 	sum := sha256.Sum256([]byte(auth))
@@ -127,21 +135,54 @@ func (s *Server) checkPass(r *http.Request, a protocol.Address, key [ed25519.Pub
 		return fail(protocol.CodePassExpired, hintNewPass+"; if it is refused again, check this machine's clock",
 			"the pass runs out more than %d minutes from now", protocol.MaxPassLifetime/time.Minute)
 	}
-	id, err := protocol.NewIdentity(key[:])
-	if err != nil {
-		return err
-	}
-	under, err := p.Verify(id, name, now)
+	// The certificate's hash, then the working key's signature: what
+	// refuses a pass that is not the box's, for one signature check at most.
+	under, err := p.VerifyUnder(cert, name, now)
 	switch {
+	case errors.Is(err, protocol.ErrCertificate):
+		return unauthorized("sign the pass with the working key of the box's newest prekey; if that key is lost, irongall rekey", "the pass is not under the box's current certificate")
 	case errors.Is(err, protocol.ErrCertificateTime):
 		return unauthorized("publish a new prekey, which comes with a new certificate: irongall rekey", "the certificate the pass is signed under has ended, or has not begun")
 	case err != nil:
 		return unauthorized(hintNewPass, "the pass is not this box's for this server")
-	case certHash(under) != cert:
-		return unauthorized("sign the pass with the working key of the box's newest prekey; if that key is lost, irongall rekey", "the pass is not under the box's current certificate")
 	}
-	s.passes.keep(a, seenPass{sum: sum, cert: cert, until: p.NotAfter}, now)
+	// Then the certificate itself, against the box's identity, as when it was
+	// put on record: the identity's signature and every rule of a
+	// certificate. It is a second check of what was checked then, and it is
+	// reached only by a pass the working key signed. If it fails, the record
+	// is wrong, and a new prekey, which is checked in full, puts it right.
+	checked, err := checkCertificate(key, under, a, now)
+	if err != nil {
+		if s.log != nil {
+			s.log.Printf("box %s: the certificate on record does not verify against the identity on record: %v", redact("/"+a.String()), err)
+		}
+		return unauthorized("publish a new prekey, which comes with a new certificate: irongall rekey", "the box's certificate on record does not verify against its identity")
+	}
+	// A pass is never good for longer than the certificate it is under.
+	until := p.NotAfter
+	if end := checked.NotAfter(); end.Before(until) {
+		until = end
+	}
+	s.passes.keep(a, seenPass{sum: sum, cert: cert, until: until}, now)
 	return nil
+}
+
+// checkCertificate holds a certificate to the identity whose key, in SSH wire
+// form, is key, and whose address is a: protocol.CheckCertificate, for an
+// identity rebuilt from its key with every check its document had.
+func checkCertificate(key string, cert ssh.PublicKey, a protocol.Address, now time.Time) (*protocol.Certificate, error) {
+	pub, err := ssh.ParsePublicKey([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+	id, err := protocol.IdentityOf(pub)
+	if err != nil {
+		return nil, err
+	}
+	if id.Address() != a {
+		return nil, errors.New("the identity on record is not this address's")
+	}
+	return protocol.CheckCertificate(id, cert, now)
 }
 
 // owner authenticates a call a box makes about itself: it returns the

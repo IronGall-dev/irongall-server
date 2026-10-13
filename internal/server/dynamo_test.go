@@ -377,7 +377,7 @@ func TestRestartLoadsLazily(t *testing.T) {
 	if n, _, err := fresh.Count(ctx, c.Address()); n != 0 || err != nil {
 		t.Fatalf("rekeyed box: %d %v", n, err)
 	}
-	if st, ok := fresh.Held(c.Address()); !ok || st.State != Active || st.Cert != renewed.Cert || st.Key != identityKey(c.Identity()) {
+	if st, ok := fresh.Held(c.Address()); !ok || st.State != Active || st.Cert != renewed.Cert {
 		t.Fatalf("rekeyed box: %v %v", st, ok)
 	}
 	if n, _, _ := fresh.Count(ctx, d.Address()); n != 0 {

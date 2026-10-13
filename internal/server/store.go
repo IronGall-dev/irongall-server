@@ -1,15 +1,16 @@
 package server
 
 import (
+	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
-	"golang.org/x/crypto/ssh"
 )
 
 // State is a box's state (PROTOCOL.md §3a).
@@ -37,6 +38,11 @@ type Box struct {
 	// and a prekey only under it or a later one (PROTOCOL.md §2b).
 	CertSerial uint64
 	Cert       [32]byte
+	// SenderKeyTypes is what the box declared with its current prekey: the
+	// identity key types of the senders it takes mail from, or
+	// protocol.AnySender (PROTOCOL.md §2). Only names this build verifies
+	// are kept (declared): a box of any other type cannot send here.
+	SenderKeyTypes []string
 	// Retired holds the newest retired prekeys (Limits.RetiredKept), each
 	// until its not_after: its key may not come back.
 	Retired []Retired
@@ -89,23 +95,55 @@ type Header struct {
 // one.
 type Standing struct {
 	State State
-	Key   [ed25519.PublicKeySize]byte
+	Key   string   // the identity's key in SSH wire form, of whatever type: what line 2 of its document holds
 	Cert  [32]byte // Box.Cert
 }
 
 // standing is b's standing.
 func (b *Box) standing() (Standing, error) {
-	id, err := protocol.ParseIdentity(b.Identity)
+	key, err := identityWire(b.Identity)
 	if err != nil {
 		return Standing{}, fmt.Errorf("the stored identity: %w", err)
 	}
-	return Standing{State: b.State, Key: identityKey(id), Cert: b.Cert}, nil
+	return Standing{State: b.State, Key: key, Cert: b.Cert}, nil
 }
 
-// identityKey is an identity's Ed25519 public key.
-func identityKey(id *protocol.Identity) (k [ed25519.PublicKeySize]byte) {
-	copy(k[:], id.PublicKey().(ssh.CryptoPublicKey).CryptoPublicKey().(ed25519.PublicKey))
-	return k
+// identityWire is the key of a stored identity document, in SSH wire form:
+// the base64 of its second line, decoded. The document was parsed when its
+// box registered, so this reads it and checks nothing.
+func identityWire(doc []byte) (string, error) {
+	_, line, _ := bytes.Cut(doc, []byte("\n"))
+	_, b64, _ := bytes.Cut(bytes.TrimSuffix(line, []byte("\n")), []byte(" "))
+	wire, err := base64.StdEncoding.Strict().DecodeString(string(b64))
+	if err != nil || len(wire) == 0 {
+		return "", errors.New("its key is not base64")
+	}
+	return string(wire), nil
+}
+
+// declared is what the server keeps of a box's declaration of sender key
+// types: the names this build verifies, or protocol.AnySender alone if that
+// was among them. A name it does not know is dropped, not refused: a client
+// may verify more types than this server registers.
+func declared(types []string) []string {
+	if slices.Contains(types, protocol.AnySender) {
+		return []string{protocol.AnySender}
+	}
+	var kept []string
+	for _, t := range protocol.IdentityTypes() {
+		if slices.Contains(types, t) {
+			kept = append(kept, t)
+		}
+	}
+	return kept
+}
+
+// identityType is the key type of a stored identity document: the first word
+// of its second line. The document was parsed when its box registered.
+func identityType(doc []byte) string {
+	_, line, _ := bytes.Cut(doc, []byte("\n"))
+	name, _, _ := bytes.Cut(line, []byte(" "))
+	return string(name)
 }
 
 // certHash names a certificate by the SHA-256 of its bytes.

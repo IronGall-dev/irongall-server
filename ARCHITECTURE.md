@@ -72,7 +72,7 @@ flowchart LR
 
 | Layer | Holds | Size (estimate) | Used for | Under memory pressure |
 |---|---|---|---|---|
-| **1. Counts** — always resident | For each box WITH mail, one 32-byte mark per live message (id, sender, expiry, a count of its fetches) | 32 to 51 B per live message, plus 223 B per loaded box (measured 2026-10-13) | **Every poll:** the exact count, the ETag, the per-pair and box caps | Never shed: it IS the poll. If it doesn't fit, that's capacity, because every process holds all of it |
+| **1. Counts** — always resident | For each box WITH mail, one 32-byte mark per live message (id, sender, expiry, a count of its fetches) | 32 to 51 B per live message, plus 271 B per loaded box on an Ed25519 identity (measured 2026-10-13) | **Every poll:** the exact count, the ETag, the per-pair and box caps | Never shed: it IS the poll. If it doesn't fit, that's capacity, because every process holds all of it |
 | **2. Listings** — optional | Full metadata for recently listed boxes: id, sender, size, received_at | ~100 B per message | Serving a list from memory | Shrinks first (an LRU under a byte budget), down to off; lists then come from DynamoDB |
 
 ```go
@@ -118,7 +118,7 @@ A set keyed by message id absorbs all three. The penciled Redis count cache was 
 - an LRU of account records, as many as box records, for a sender in an account (`PROTOCOL.md` §6.5): filled on first use by a strongly consistent read, refreshed or evicted by the accounts stream;
 - the server MAC keys, from the 0600 secrets file: they make adopt keys (`PROTOCOL.md` §6.5).
 
-That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go maps). As built it measures 518 B a polling box: 223 in the index, 127 for the poll bucket and 168 for the pass remembered (2026-10-13), so 0.52 GB per million. It was 286 B before a box proved itself with a pass: the key and the certificate's hash are 64 B of the difference, and the pass the rest. The other maps are bounded: a bucket key goes once its bucket is full again, a remembered pass within an hour of running out, and the boxes remembered as missing hold at most `-box-cache` entries.
+That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go maps). As built it measures 566 B a polling box: 271 in the index, 127 for the poll bucket and 168 for the pass remembered (2026-10-13), so 0.57 GB per million. It was 286 B before a box proved itself with a pass: the identity's key, kept in SSH wire form so that it can be of any type, and the certificate's hash are 112 B of the difference, and the pass the rest. A box on a P-256 identity holds a 104-byte key where an Ed25519 one holds 51. The other maps are bounded: a bucket key goes once its bucket is full again, a remembered pass within an hour of running out, and the boxes remembered as missing hold at most `-box-cache` entries.
 
 ### Request paths
 
@@ -128,7 +128,7 @@ That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go map
 | Fetch `GET …/messages/<id>` | Memory first: an id the box does not hold is `404` with no storage call, and a fetch of a message this process has served before takes from the box's allowance (`PROTOCOL.md` §5.7). Then DynamoDB GetItem of the message item by `box, id`, S3 Express GET | Memory can say a message is absent, never that it is there: the read decides. A live item whose body is gone leaves the list and is answered as gone |
 | Ack `DELETE …/messages/<id>` | Memory first, as for a fetch (an id not held is `404`); then S3 DELETE, then a conditional UpdateItem that removes `live` (`PROTOCOL-SERVER.md` §7) | Both steps are safe to repeat. Applied to local memory at once; the stream tells the others |
 | Send `POST /v1/<addr>` | The sender's pass, before the body is read; its record for its account (the LRU, or one GetItem); GetItem (the dedupe check), S3 PUT, then one conditional PutItem: the header and the dedupe record are one item (`PROTOCOL-SERVER.md` §7) | Cheapest check first (`PROTOCOL.md` §4.5); the caps read layer 1. No signature on the message is checked: it is inside the ciphertext |
-| Register `PUT /v1/<addr>` | Four signature checks (the statement and the pass, each under the certificate), then DynamoDB PutItem | The box is in use from this one write |
+| Register `PUT /v1/<addr>` | Four signature checks (the certificate and the statement under it, then the pass under it and the certificate again), then DynamoDB PutItem | The box is in use from this one write |
 | New prekey `PUT …/prekey` | The record (the LRU, or one GetItem), the same four checks, DynamoDB UpdateItem | The authority is the statement's own certificate and a pass under it: no pass under the box's current certificate is needed |
 | `/identity` | The LRU; DynamoDB on a miss | Cached briefly at the edge is `PROTOCOL-SERVER.md` §12's plan, NOT built |
 
@@ -237,7 +237,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
 
 ```
 ~/.config/irongall/<name>/   0700, never the working directory; a .gitignore of * makes it ignore itself
-  identity, identity.pub     OpenSSH Ed25519, which ssh-keygen reads directly
+  identity, identity.pub     an OpenSSH key file, which ssh-keygen reads directly: Ed25519, unless the box was made on another type
   identity.doc, address      the identity document and its hex SHA-256
   prekeys/<serial>.agekey    age identities, each with its signed statement (.txt, .txt.sig); the current one and the newest retired one are kept, older retired ones deleted after an emptying drain an hour on (Go client), or at not_after + 33 days at the latest (PROTOCOL Terms, §6.4)
   work/<serial>              the working key made with that prekey, its .pub and its certificate -cert.pub, as ssh-keygen names them (PROTOCOL §2b).
@@ -364,5 +364,5 @@ Decided 2026-10-10 and gone from this list: DynamoDB Streams as the change log (
   - ~32 B per mark and ~100 B per listed message;
   - ~4 read units per page Query;
   - ~300 lines of shard following.
-- **Measured:** the poll cost (33 to 34 µs with a pass the server remembers), a new pass's check (190 µs), memory per box, and the compression table.
+- **Measured:** the poll cost (33 to 34 µs with a pass the server remembers), a new pass's check (about 180 µs), memory per box, and the compression table.
 - **From AWS docs, read 2026-10-10:** the stream guarantees and the two-reader advice.
