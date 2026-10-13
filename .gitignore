@@ -1,0 +1,4 @@
+# A local file. Claude Code reads AGENTS.md by itself when no CLAUDE.md sits
+# in this directory or above it; a checkout that is nested under one keeps a
+# one-line CLAUDE.md here that imports it: @AGENTS.md
+CLAUDE.md

@@ -15,7 +15,7 @@
 
 ## Before every push
 
-- `gofmt -l .` (empty), `go vet ./...`, `go test ./...`, and `golangci-lint` with the client repo's flags (its `CLAUDE.md`), clean outside `_test.go`.
+- `gofmt -l .` (empty), `go vet ./...`, `go test ./...`, and `golangci-lint` with the client repo's flags (its `AGENTS.md`), clean outside `_test.go`.
 - `go.mod` replaces the client with `../irongall-client`: the build and the tests need that checkout beside this one.
 - After a change to a handler or a store: `test/interop.sh`, and the tests on AWS. They run on the in-memory store unless `IRONGALL_TEST_BOXES_TABLE`, `IRONGALL_TEST_MSGS_TABLE`, `IRONGALL_TEST_ACCOUNTS_TABLE` and `IRONGALL_TEST_BUCKET` are all set, which runs every test on DynamoDB and S3 Express plus the AWS-only ones (the crash between each pair of writes, two processes, restart). 🛑 Name tables and a bucket kept for tests, never a running server's.
 - A test of client behaviour belongs in the client repo, where the forging-server tests are. This repo tests what the real server enforces.
