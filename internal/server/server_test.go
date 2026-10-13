@@ -643,7 +643,8 @@ func TestSendPipeline(t *testing.T) {
 		t.Fatalf("a fetched message: %s", fetched.body)
 	}
 
-	// Revoked boxes, set by hand: revocation's endpoint is not built yet.
+	// Revoked boxes, set by hand: this test puts B back afterwards, which no
+	// route does. The route itself is TestRevocation.
 	for _, box := range []protocol.Address{a.Address(), b.Address()} {
 		rec, _ := e.store.Box(ctx, box)
 		rec.State = Revoked

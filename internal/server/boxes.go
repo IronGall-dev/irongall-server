@@ -234,6 +234,95 @@ func (s *Server) identity(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+// hintRevocation is what to do about a body that is not a revocation.
+const hintRevocation = "a revocation is the identity key's own signature over its fixed statement, with the identity document: irongall revocation makes the record"
+
+// revoke is PUT /v1/<address>/revocations (PROTOCOL.md §6.3): the identity
+// document and the identity's own signature over the fixed statement. No
+// pass: a working key can be stolen without the identity and must not be
+// able to end the address, and an owner who lost the box holds no working
+// key at all. The signature is the whole authority, and it may have been
+// made long ago.
+//
+// The box is revoked for good, its mail is deleted, and the signature is
+// kept and served (revocations). A second revocation of a revoked box is
+// answered 200 and changes nothing.
+//
+// A body that does not verify counts against the caller's address as a
+// lookup of a box that does not exist does (-misses-per-minute): each costs
+// the server a signature check that nothing else has paid for.
+func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
+	h, err := pathAddr(r)
+	if err != nil {
+		return err
+	}
+	var req protocol.Revocations
+	if err := decodeBody(w, r, registerLimit, &req); err != nil {
+		return err
+	}
+	if err := required("identity", req.Identity, "revocation", req.Revocation); err != nil {
+		return err
+	}
+	if protocol.Address(sha256.Sum256(req.Identity)) != h {
+		return fail(protocol.CodeIdentityMismatch, hintDocument, "the identity document does not hash to the address")
+	}
+	b, err := s.lookup(r, h)
+	switch {
+	case err != nil:
+		return err
+	case b == nil:
+		return noSuchMailbox
+	}
+	ip, now := ipKey(s.clientIP(r)), s.now()
+	if ok, wait := s.misses.ready(ip, now); !ok {
+		return rateLimited(wait, "too many requests from this address that named no box or carried no revocation")
+	}
+	if _, err := protocol.VerifyRevocation(h, req.Identity, req.Revocation); err != nil {
+		s.misses.take(ip, now)
+		return fail(protocol.CodeBadRevocation, hintRevocation, "this is not a revocation of this address")
+	}
+	status := http.StatusOK
+	if b.State != Revoked {
+		b.State, b.Revocation = Revoked, req.Revocation
+		if err := s.store.UpdateBox(r.Context(), b); err != nil {
+			if errors.Is(err, ErrStale) {
+				return fail(protocol.CodeConflict, "retry: irongall revoke", "the box changed during the request")
+			}
+			return err
+		}
+		status = http.StatusCreated
+	}
+	// After the record says revoked, and again on every retry: mail that
+	// arrived around the write is never served, and this deletes it sooner
+	// than its expiry would.
+	if err := s.store.DeleteMessages(r.Context(), b.Addr); err != nil {
+		return err
+	}
+	writeJSON(w, status, struct{}{})
+	return nil
+}
+
+// revocations is GET /v1/<address>/revocations: what this server holds about
+// the address, which today is its revocation or nothing. It asks for no pass
+// and tells nothing a 410 does not already tell; what it adds is the proof.
+func (s *Server) revocations(w http.ResponseWriter, r *http.Request) error {
+	h, err := pathAddr(r)
+	if err != nil {
+		return err
+	}
+	b, err := s.lookup(r, h)
+	switch {
+	case err != nil:
+		return err
+	case b == nil:
+		return noSuchMailbox
+	case b.State != Revoked || len(b.Revocation) == 0:
+		return fail(protocol.CodeNotRevoked, "nothing to do: this server holds no revocation of that address", "no revocation of this address is held here")
+	}
+	writeJSON(w, http.StatusOK, protocol.Revocations{Identity: b.Identity, Revocation: b.Revocation})
+	return nil
+}
+
 // closeBox is DELETE /v1/<address> (with the pass): unacked mail is deleted
 // and the box marked closed. A new prekey reopens it.
 func (s *Server) closeBox(w http.ResponseWriter, r *http.Request) error {

@@ -5,7 +5,9 @@
 #   2. ONE box run by both clients: the Go client receives in a box the recipe made, and the recipe in one Go made;
 #   3. the recipe's error path on a real problem+json body;
 #   4. the envelope's optional fields, each client's sent/ record (with the real server's receipt) and aliases, across the clients;
-#   5. a box whose identity is of the optional key type, in each client, and the sender key types a box declares.
+#   5. a box whose identity is of the optional key type, in each client, and the sender key types a box declares;
+#   6. a box whose clock is off from the server's;
+#   7. revocation: each client revokes a box at the real server, the other checks the proof it is shown, and a record alone revokes.
 # Every script step runs in a FRESH shell (agents run each command in a new one). --no-pq boxes only when the local
 # age is older than 1.3 (it cannot make or send to a post-quantum box); the Go client handles both either way.
 # Needs: go, bash ≥ 4, age, age-keygen, ssh-keygen, curl, jq, sha256sum, base64, od. Run from anywhere:
@@ -154,6 +156,47 @@ out=$(recipe "$work/clock-late" "$(clock -660); ig_init $(nopq_arg)" 2>&1); [ $?
 out=$(recipe "$work/clock-early" "$(clock 3660); ig_init $(nopq_arg)" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 400 bad_key" <<< "$out" && grep -q "has not begun; the server's clock reads" <<< "$out" \
   && L=$(recipe "$work/clock-early" "ig_init $(nopq_arg)" 2> "$work/err") && ig_hex "${L##*/}" \
   && ok "a recipe box first made 61 minutes fast is refused, the server stating its clock; with the clock right, the same box registers" || bad "clock 61 minutes fast: $out $(cat "$work/err")"
+
+# --- 7. revocation (PROTOCOL.md §6.3): the server keeps the identity's own signature and shows it, and each client checks it ---
+V1="$work/v1"; V2="$work/v2"; V3="$work/v3"; V4="$work/v4"; V5="$work/v5"
+V1L=$(recipe "$V1" "ig_init $(nopq_arg)") && V1A=${V1L##*/} && V2L=$(gocli "$V2" init $(nopq_arg)) && V2A=${V2L##*/} && V3L=$(gocli "$V3" init $(nopq_arg)) && V3A=${V3L##*/} \
+  && V4L=$(recipe "$V4" "ig_init $(nopq_arg)") && V4A=${V4L##*/} && V5L=$(gocli "$V5" init $(nopq_arg)) && V5A=${V5L##*/} || bad "revocation: the boxes"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V1A/revocations")" = 404 ] && [ "$(curl -s "$IG_BASE/v1/$V1A/revocations" | jq -r .code)" = not_revoked ] \
+  && [ "$(curl -s -D - -o /dev/null "$IG_BASE/v1/$V1A/identity" | tr -d '\r' | grep -i '^cache-control:' | cut -d' ' -f2)" = no-store ] \
+  && ok "a box nobody revoked: 404 not_revoked, and the API's answers say no-store" || bad "not_revoked: $(curl -s -D - "$IG_BASE/v1/$V1A/revocations")"
+# The recipe revokes its box; mail it had sent a Go box is refused there, by the proof the server shows.
+printf 'sent before the revocation\n' > "$work/body7"; recipe "$V1" "ig_send $V2L '$work/body7'" 2> "$work/err" || bad "revocation: the recipe's send: $(cat "$work/err")"
+printf 'waiting in the box that is revoked\n' | gocli "$V2" send "$V1L" > /dev/null 2> "$work/err" || bad "revocation: the Go send: $(cat "$work/err")"
+out=$(recipe "$V1" "ig_revoke ${V1A:0:63}" 2>&1); [ $? -ne 0 ] && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V1A/identity")" = 200 ] \
+  && ok "the recipe does not revoke without the address in full, and nothing is published" || bad "revoke with a short address: $out"
+out=$(recipe "$V1" "ig_revoke $V1A" 2>&1) && [ "$out" = "revoked $V1A" ] && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V1A/identity")" = 410 ] \
+  && curl -sf "$IG_BASE/v1/$V1A/revocations" | jq -e 'keys == ["identity","revocation"]' > /dev/null \
+  && ok "the recipe revokes its box: 410 from then on, and the server shows the record to anyone" || bad "recipe revoke: $out"
+out=$(gocli "$V2" recv 2>&1); [ $? -eq 0 ] && grep -q ": revoked: " <<< "$out" && ! grep -q '"body"' <<< "$out" && [ -s "$V2/peers/$V1A/revoke.sig" ] \
+  && ok "the Go client refuses mail from the box the recipe revoked, and keeps the revocation it checked" || bad "Go recv from a revoked box: $out"
+out=$(printf 'x\n' | gocli "$V2" send "$V1L" 2>&1); [ $? -ne 0 ] && grep -q "REVOKED: $V1A" <<< "$out" && ls "$V2"/outbox/failed/*.P > /dev/null 2>&1 \
+  && ok "the Go client sends nothing to it: REVOKED, and the message moves to outbox/failed/" || bad "Go send to a revoked box: $out"
+out=$(recipe "$V1" "ig_recv" 2>&1); [ $? -ne 0 ] && grep -q "REVOKED: this box's own address" <<< "$out" && ok "the revoked recipe box is told so by its own revocation" || bad "revoked recipe box's recv: $out"
+# The Go client revokes its box; the recipe refuses the mail it had sent, and sends it nothing.
+printf 'sent before the revocation\n' | gocli "$V3" send "$V4L" > /dev/null 2> "$work/err" || bad "revocation: the Go send: $(cat "$work/err")"
+out=$(gocli "$V3" revoke "$V4A" 2>&1); [ $? -ne 0 ] && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V3A/identity")" = 200 ] \
+  && ok "the Go client does not revoke for another box's address" || bad "Go revoke with another address: $out"
+out=$(gocli "$V3" revoke "$V3A" 2>&1) && [ "$out" = "revoked $V3A" ] && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V3A/identity")" = 410 ] \
+  && jq -e '.revoked == true' <<< "$(gocli "$V3" status 2> /dev/null)" > /dev/null \
+  && ok "the Go client revokes its box, and its status says so" || bad "Go revoke: $out"
+out=$(recipe "$V4" "ig_recv" 2>&1); [ $? -eq 0 ] && grep -q ": revoked: " <<< "$out" && ! grep -q '"body"' <<< "$out" && [ -s "$V4/peers/$V3A/revoke.sig" ] \
+  && ok "the recipe refuses mail from the box the Go client revoked, and keeps the revocation it checked" || bad "recipe recv from a revoked box: $out"
+out=$(recipe "$V4" "ig_send $V3L '$work/body7'" 2>&1); [ $? -ne 0 ] && grep -q "REVOKED" <<< "$out" && ok "the recipe sends nothing to it: REVOKED" || bad "recipe send to a revoked box: $out"
+# A record made in advance revokes with no box and no key, by either client or by curl; what is not one is refused.
+gocli "$V5" revocation > "$work/v5.json" 2> /dev/null && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V5A/identity")" = 200 ] && ok "a record is made, and nothing is published" || bad "Go revocation"
+jq -c --arg s "$(printf 'revoke it' | base64)" '.revocation = $s' "$work/v5.json" > "$work/v5-junk.json"
+[ "$(curl -s -X PUT -H 'Content-Type: application/json' --data-binary "@$work/v5-junk.json" "$IG_BASE/v1/$V5A/revocations" | jq -r .code)" = bad_revocation ] \
+  && [ "$(curl -s -X PUT -H 'Content-Type: application/json' --data-binary "@$work/v5.json" "$IG_BASE/v1/$V4A/revocations" | jq -r .code)" = identity_mismatch ] \
+  && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V5A/identity")" = 200 ] \
+  && ok "the server refuses what is not a revocation of that address: 400 bad_revocation, 400 identity_mismatch" || bad "junk revocations"
+out=$(recipe "$work/nobox" "ig_revoke $V5A '$work/v5.json'" 2>&1) && [ "$out" = "revoked $V5A" ] && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V5A/identity")" = 410 ] \
+  && [ "$(IRONGALL_HOME="$work/nobox2" "$work/irongall" revoke --record "$work/v5.json" "$V5A" 2>&1)" = "revoked $V5A" ] \
+  && ok "the Go client's record revokes from the recipe with no box, and again from the Go client with none: 200, nothing changes" || bad "revoke with a record: $out"
 
 echo "interop: $pass PASS, $fail FAIL"
 [ "$fail" -eq 0 ]

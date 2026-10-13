@@ -119,6 +119,8 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("DELETE /v1/{addr}", s.handle(s.closeBox))
 	api.HandleFunc("GET /v1/{addr}/identity", s.handle(s.identity))
 	api.HandleFunc("PUT /v1/{addr}/prekey", s.handle(s.prekey))
+	api.HandleFunc("PUT /v1/{addr}/revocations", s.handle(s.revoke))
+	api.HandleFunc("GET /v1/{addr}/revocations", s.handle(s.revocations))
 	api.HandleFunc("PUT /v1/{addr}/account", s.handle(s.adopt))
 	api.HandleFunc("DELETE /v1/{addr}/account", s.handle(s.leave))
 	api.HandleFunc("GET /v1/{addr}/messages", s.handle(s.list))
@@ -126,8 +128,20 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("DELETE /v1/{addr}/messages/{id}", s.handle(s.ack))
 	mux := http.NewServeMux()
 	mux.Handle("GET "+protocol.LinkPath+"{addr}", linkPage())
-	mux.Handle("/v1/", s.whenReady(api))
+	mux.Handle("/v1/", notStored(s.whenReady(api)))
 	return s.accessLog(s.dated(mux))
+}
+
+// notStored marks every answer of the API as one no cache may keep. What a
+// box's identity, prekey or revocation is can change at any moment, and an
+// answer served again from a cache would be this server's word outliving the
+// fact: a prekey that was replaced, or a box that has since been revoked. A
+// 410 is cacheable by default (RFC 9110 §15.5.11), so this is said outright.
+func notStored(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		h.ServeHTTP(w, r)
+	})
 }
 
 // dated dates every answer by the server's own clock, the one its checks

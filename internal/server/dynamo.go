@@ -286,7 +286,7 @@ func boxState(b *Box) map[string]types.AttributeValue {
 	for _, t := range b.SenderKeyTypes {
 		senders = append(senders, str(t))
 	}
-	return map[string]types.AttributeValue{
+	st := map[string]types.AttributeValue{
 		"senders":       &types.AttributeValueMemberL{Value: senders},
 		"state":         str(string(b.State)),
 		"statement":     bin(b.Statement),
@@ -296,6 +296,11 @@ func boxState(b *Box) map[string]types.AttributeValue {
 		"retired":       &types.AttributeValueMemberL{Value: retired},
 		"rev":           num(b.Rev),
 	}
+	// Written once, when the box is revoked, and never taken away.
+	if len(b.Revocation) > 0 {
+		st["revocation"] = bin(b.Revocation)
+	}
+	return st
 }
 
 func boxItem(b *Box) map[string]types.AttributeValue {
@@ -356,6 +361,11 @@ func decodeBox(it item) (*Box, error) {
 			return nil, err
 		}
 		b.Account = string(acc)
+	}
+	if _, ok := it["revocation"]; ok {
+		if b.Revocation, err = it.bytes("revocation"); err != nil {
+			return nil, err
+		}
 	}
 	if b.Statement, err = it.bytes("statement"); err != nil {
 		return nil, err

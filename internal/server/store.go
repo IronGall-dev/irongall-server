@@ -51,6 +51,11 @@ type Box struct {
 	// Account is the account the box belongs to, or "" (PROTOCOL.md §6.5).
 	// Only Adopt and Leave change it.
 	Account string
+	// Revocation is the identity's signature that revoked the box, kept for
+	// good and served to whoever asks (PROTOCOL.md §6.3): nil unless State
+	// is Revoked. With Identity it proves itself, so nobody takes this
+	// server's word that the box is revoked.
+	Revocation []byte
 }
 
 // Account is an account's record (PROTOCOL.md §6.5). An account pays,
