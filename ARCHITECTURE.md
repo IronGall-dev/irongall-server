@@ -130,7 +130,7 @@ That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go map
 | Send `POST /v1/<addr>` | The sender's pass, before the body is read; its record for its account (the LRU, or one GetItem); GetItem (the dedupe check), S3 PUT, then one conditional PutItem: the header and the dedupe record are one item (`PROTOCOL-SERVER.md` §7) | Cheapest check first (`PROTOCOL.md` §4.5); the caps read layer 1. No signature on the message is checked: it is inside the ciphertext |
 | Register `PUT /v1/<addr>` | Four signature checks (the certificate and the statement under it, then the pass under it and the certificate again), then DynamoDB PutItem | The box is in use from this one write |
 | New prekey `PUT …/prekey` | The record (the LRU, or one GetItem), the same four checks, DynamoDB UpdateItem | The authority is the statement's own certificate and a pass under it: no pass under the box's current certificate is needed |
-| `/identity` | The LRU; DynamoDB on a miss | Cached briefly at the edge is `PROTOCOL-SERVER.md` §12's plan, NOT built |
+| `/identity` | The LRU; DynamoDB on a miss | Never cached in front of the server: every API answer says `no-store` (`PROTOCOL-SERVER.md` §6.3, §12) |
 
 ```mermaid
 sequenceDiagram

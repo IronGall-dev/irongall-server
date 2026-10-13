@@ -157,7 +157,7 @@ The structure is decided, and not all of it is built: each item says so. Each nu
 
 ## §12. Not yet specified: the items that are this server's alone
 
-- **Caching `/identity` in front of the server:** not done, and every API answer says `no-store` (§6.3). Whether it is ever done, with what lifetime and what purge, is this repo's issue #1.
+- **Nothing in front of the server caches an API answer, `/identity` included: decided, and the server says so itself.** Every answer under `/v1/` carries `Cache-Control: no-store` (§6.3), whatever stands in front is set to do. So there is no lifetime and no purge to specify, and a new prekey, a close or a revocation is seen from the answer to the call that made it (this repo's issue #1, closed).
 - **Legal posture** of an operator that holds only ciphertext.
 
 ## §13. 503 and logging
