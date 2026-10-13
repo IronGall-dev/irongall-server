@@ -35,7 +35,9 @@ type Box struct {
 	Prekey    *protocol.Prekey
 	// The certificate Signature carries, which is the box's current one: its
 	// serial, and the SHA-256 of its bytes. A pass is taken only under it,
-	// and a prekey only under it or a later one (PROTOCOL.md §2b).
+	// and a prekey only under it or a later one (PROTOCOL.md §2b). A box's
+	// statements are ordered by this serial first, and by the prekey's own
+	// second.
 	CertSerial uint64
 	Cert       [32]byte
 	// SenderKeyTypes is what the box declared with its current prekey: the
@@ -56,6 +58,34 @@ type Box struct {
 	// is Revoked. With Identity it proves itself, so nobody takes this
 	// server's word that the box is revoked.
 	Revocation []byte
+	// RevokedCerts is the identity's newest list of the certificates it has
+	// revoked, exactly as it signed it, and RevokedCertsSig its signature
+	// (PROTOCOL.md §6.3a): nil until one is published. The address goes on.
+	// Served with Identity to whoever asks, it proves itself as Revocation
+	// does. It was verified when it was stored, and a later version replaces
+	// it whole.
+	RevokedCerts    []byte
+	RevokedCertsSig []byte
+}
+
+// listed reports whether the box's identity has revoked the certificate of
+// this serial, by the list on record. A box with no list has revoked none.
+func (b *Box) listed(serial uint64) (bool, error) {
+	if len(b.RevokedCerts) == 0 {
+		return false, nil
+	}
+	return listNames(b.RevokedCerts, serial)
+}
+
+// listNames reports whether a stored list of revoked certificates names a
+// serial. The list was verified when it was stored, so one that does not
+// parse is a fault of the record, and no answer.
+func listNames(list []byte, serial uint64) (bool, error) {
+	l, err := protocol.ParseRevokedCertificates(list)
+	if err != nil {
+		return false, fmt.Errorf("the stored list of revoked certificates: %w", err)
+	}
+	return l.Revokes(serial), nil
 }
 
 // Account is an account's record (PROTOCOL.md §6.5). An account pays,
@@ -96,12 +126,16 @@ type Header struct {
 }
 
 // Standing is what checking a box's pass needs of it (PROTOCOL.md §6.1b):
-// its state, its identity's public key, and which certificate is its current
-// one.
+// its state, its identity's public key, which certificate is its current
+// one, and whether its identity has revoked that certificate.
 type Standing struct {
 	State State
 	Key   string   // the identity's key in SSH wire form, of whatever type: what line 2 of its document holds
 	Cert  [32]byte // Box.Cert
+	// Listed is true while the box's current certificate is on its identity's
+	// list of revoked certificates (PROTOCOL.md §6.3a): no pass of the box is
+	// taken until it publishes a prekey under a new certificate.
+	Listed bool
 }
 
 // standing is b's standing.
@@ -110,7 +144,11 @@ func (b *Box) standing() (Standing, error) {
 	if err != nil {
 		return Standing{}, fmt.Errorf("the stored identity: %w", err)
 	}
-	return Standing{State: b.State, Key: key, Cert: b.Cert}, nil
+	listed, err := b.listed(b.CertSerial)
+	if err != nil {
+		return Standing{}, err
+	}
+	return Standing{State: b.State, Key: key, Cert: b.Cert, Listed: listed}, nil
 }
 
 // identityWire is the key of a stored identity document, in SSH wire form:

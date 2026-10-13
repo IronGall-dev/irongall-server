@@ -7,7 +7,9 @@
 #   4. the envelope's optional fields, each client's sent/ record (with the real server's receipt) and aliases, across the clients;
 #   5. a box whose identity is of the optional key type, in each client, and the sender key types a box declares;
 #   6. a box whose clock is off from the server's;
-#   7. revocation: each client revokes a box at the real server, the other checks the proof it is shown, and a record alone revokes.
+#   7. revocation: each client revokes a box at the real server, the other checks the proof it is shown, and a record alone revokes;
+#   8. one certificate revoked: the Go client renews and revokes its earlier certificates, a list made with ssh-keygen alone, and each
+#      client checking the list it is shown, refusing mail under a listed certificate and following a box to its next one.
 # Every script step runs in a FRESH shell (agents run each command in a new one). --no-pq boxes only when the local
 # age is older than 1.3 (it cannot make or send to a post-quantum box); the Go client handles both either way.
 # Needs: go, bash ≥ 4, age, age-keygen, ssh-keygen, curl, jq, sha256sum, base64, od. Run from anywhere:
@@ -197,6 +199,49 @@ jq -c --arg s "$(printf 'revoke it' | base64)" '.revocation = $s' "$work/v5.json
 out=$(recipe "$work/nobox" "ig_revoke $V5A '$work/v5.json'" 2>&1) && [ "$out" = "revoked $V5A" ] && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V5A/identity")" = 410 ] \
   && [ "$(IRONGALL_HOME="$work/nobox2" "$work/irongall" revoke --record "$work/v5.json" "$V5A" 2>&1)" = "revoked $V5A" ] \
   && ok "the Go client's record revokes from the recipe with no box, and again from the Go client with none: 200, nothing changes" || bad "revoke with a record: $out"
+
+# --- 8. one certificate revoked (PROTOCOL.md §6.3a): the identity's list ends what a certificate signed, and the address goes on ---
+W1="$work/w1"; W2="$work/w2"; W3="$work/w3"
+W1L=$(gocli "$W1" init $(nopq_arg)) && W1A=${W1L##*/} && W2L=$(recipe "$W2" "ig_init $(nopq_arg)") && W2A=${W2L##*/} && W3L=$(gocli "$W3" init $(nopq_arg)) && W3A=${W3L##*/} || bad "revoked certificates: the boxes"
+put(){ curl -s -o "$work/put.json" -w '%{http_code}' -X PUT -H 'Content-Type: application/json' --data-binary "@$1" "$IG_BASE/v1/$2/revocations"; }   # <record> <address> → the status; the body is left in put.json
+printf 'under the first certificate\n' > "$work/body8"
+gocli "$W1" send "$W2L" < "$work/body8" > /dev/null 2> "$work/err" && gocli "$W1" send "$W3L" < "$work/body8" > /dev/null 2>> "$work/err" && recipe "$W2" "ig_send $W3L '$work/body8'" 2>> "$work/err" || bad "revoked certificates: the first sends: $(cat "$work/err")"
+# The Go client renews and revokes every certificate before its new one. Each client is shown the list, checks it, and refuses what the old one signed.
+out=$(gocli "$W1" rekey --revoke-earlier 2>&1) && curl -sf "$IG_BASE/v1/$W1A/revocations" | jq -e 'keys == ["identity","revoked_certificates","revoked_certificates_signature"]' > /dev/null \
+  && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$W1A/identity")" = 200 ] \
+  && ok "the Go client renews and revokes its earlier certificates: the server shows the list to anyone, and the address goes on" || bad "rekey --revoke-earlier: $out"
+printf 'under the second certificate\n' > "$work/body8b"
+gocli "$W1" send "$W2L" < "$work/body8b" > /dev/null 2> "$work/err" && gocli "$W1" send "$W3L" < "$work/body8b" > /dev/null 2>> "$work/err" || bad "revoked certificates: the sends after the renewal: $(cat "$work/err")"
+out=$(recipe "$W2" "ig_recv" 2>&1); [ $? -eq 0 ] && [ "$(grep -c ': certificate_revoked: ' <<< "$out")" = 1 ] && grep -q 'under the second certificate' <<< "$out" && ! grep -q 'under the first certificate' <<< "$out" \
+  && curl -sf "$IG_BASE/v1/$W1A/revocations" | jq -r .revoked_certificates | base64 -d | cmp -s - "$W2/peers/$W1A/revoked-certs.txt" && [ ! -e "$W2/peers/$W1A/revoke.sig" ] \
+  && ok "the recipe refuses mail under the certificate the Go box revoked, delivers mail under its new one, and keeps the list it checked" || bad "recipe recv after the list: $out"
+out=$(gocli "$W3" recv 2>&1); [ $? -eq 0 ] && [ "$(grep -c ': certificate_revoked: ' <<< "$out")" = 1 ] && grep -q 'under the second certificate' <<< "$out" && [ "$(grep -c 'under the first certificate' <<< "$out")" = 1 ] \
+  && cmp -s "$W2/peers/$W1A/revoked-certs.txt" "$W3/peers/$W1A/revoked-certs.txt" \
+  && ok "the Go client does the same, and takes the recipe box's mail under a certificate nobody revoked" || bad "Go recv after the list: $out"
+recipe "$W2" "ig_send $W1L '$work/body8'" 2> "$work/err" && gocli "$W3" send "$W1L" < "$work/body8" > /dev/null 2>> "$work/err" && out=$(gocli "$W1" recv 2>&1) && [ "$(grep -c '"body"' <<< "$out")" = 2 ] \
+  && [ "$(cat "$W2/peers/$W1A/serial" "$W2/peers/$W1A/cert-serial" | tr '\n' ' ')" = "2 2 " ] \
+  && ok "both clients write to the box at its second certificate, naming its prekey by both serials" || bad "sends to the renewed box: $(cat "$work/err") $out"
+# A list made with ssh-keygen alone: the recipe makes none, and its box's identity signs like any other.
+mklist(){ printf 'irongall-revoked-certs-v1\n%s\n%s\n%s\n' "$W2A" "$2" "$3" > "$work/$1.list" && ssh-keygen -q -Y sign -n "irongall-revoked-certs-v1:$W2A" -f "$4" < "$work/$1.list" > "$work/$1.sig" \
+  && jq -cn --arg i "$(base64 < "$W2/identity.doc" | tr -d '\n')" --arg l "$(base64 < "$work/$1.list" | tr -d '\n')" --arg g "$(base64 < "$work/$1.sig" | tr -d '\n')" '{identity:$i, revoked_certificates:$l, revoked_certificates_signature:$g}' > "$work/$1.json"; }   # <name> <version> <line> <key>
+recipe "$W2" "ig_send $W3L '$work/body8'" 2> "$work/err" && recipe "$W2" "ig_rekey $(nopq_arg)" 2>> "$work/err" && recipe "$W2" "ig_send $W3L '$work/body8b'" 2>> "$work/err" || bad "revoked certificates: the recipe's renewal: $(cat "$work/err")"
+mklist bywork 1 1 "$W2/work/2-cert.pub" && mklist one 1 1 "$W2/identity" && mklist same 1 1-2 "$W2/identity" && mklist two 2 1-2 "$W2/identity" || bad "revoked certificates: ssh-keygen did not sign a list"
+[ "$(put "$work/bywork.json" "$W2A")" = 400 ] && [ "$(jq -r .code "$work/put.json")" = bad_revocation ] && [ "$(put "$work/one.json" "$W3A")" = 400 ] && [ "$(jq -r .code "$work/put.json")" = identity_mismatch ] \
+  && [ "$(curl -s "$IG_BASE/v1/$W2A/revocations" | jq -r .code)" = not_revoked ] \
+  && ok "the server refuses a list the box's working key signed, and one sent for another address: 400 bad_revocation, 400 identity_mismatch" || bad "junk lists: $(cat "$work/put.json")"
+[ "$(put "$work/one.json" "$W2A")" = 200 ] && [ "$(put "$work/one.json" "$W2A")" = 200 ] && [ "$(put "$work/same.json" "$W2A")" = 409 ] && [ "$(jq -r .code "$work/put.json")" = conflict ] \
+  && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$W2A/identity")" = 200 ] \
+  && ok "a list signed with ssh-keygen alone is taken with no pass: 200, the same again 200, another of that version 409 conflict" || bad "the recipe box's list: $(cat "$work/put.json")"
+out=$(gocli "$W3" recv 2>&1); [ $? -eq 0 ] && [ "$(grep -c ': certificate_revoked: ' <<< "$out")" = 1 ] && grep -q 'under the second certificate' <<< "$out" && ! grep -q 'under the first certificate' <<< "$out" \
+  && cmp -s "$work/one.list" "$W3/peers/$W2A/revoked-certs.txt" \
+  && ok "the Go client refuses the recipe box's mail under the certificate that list names, and delivers its mail under the next" || bad "Go recv after the recipe box's list: $out"
+# A list that names the box's CURRENT certificate: the server takes no pass of the box and no mail for it, until it renews.
+[ "$(put "$work/two.json" "$W2A")" = 200 ] || bad "the second list: $(cat "$work/put.json")"
+out=$(recipe "$W2" "ig_recv" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 401 unauthorized" <<< "$out" && ok "a box whose current certificate is listed has no pass the server takes" || bad "a listed box's recv: $out"
+out=$(gocli "$W3" send "$W2L" < "$work/body8" 2>&1); [ $? -ne 0 ] && grep -q "prekey_expired" <<< "$out" && ls "$W3"/outbox/*.P > /dev/null 2>&1 \
+  && ok "a send to it is 409 prekey_expired, and the message waits in the outbox" || bad "a send to a listed box: $out"
+recipe "$W2" "ig_rekey $(nopq_arg)" 2> "$work/err" && gocli "$W3" flush > /dev/null 2>> "$work/err" && out=$(recipe "$W2" "ig_recv" 2>&1) && grep -q 'under the first certificate' <<< "$out" \
+  && ok "one renewal, under a new certificate, cures both: the box polls again, and the waiting message is delivered" || bad "after the listed box renewed: $(cat "$work/err") $out"
 
 echo "interop: $pass PASS, $fail FAIL"
 [ "$fail" -eq 0 ]

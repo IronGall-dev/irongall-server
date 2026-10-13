@@ -300,6 +300,12 @@ func boxState(b *Box) map[string]types.AttributeValue {
 	if len(b.Revocation) > 0 {
 		st["revocation"] = bin(b.Revocation)
 	}
+	// The identity's list of revoked certificates and its signature: absent
+	// until one is published, then replaced whole by each later version.
+	if len(b.RevokedCerts) > 0 {
+		st["revoked_certs"] = bin(b.RevokedCerts)
+		st["revoked_certs_sig"] = bin(b.RevokedCertsSig)
+	}
 	return st
 }
 
@@ -336,7 +342,21 @@ func decodeStanding(it item) (Standing, uint64, error) {
 	if err != nil {
 		return Standing{}, 0, err
 	}
-	return Standing{State: State(state), Key: key, Cert: cert}, rev, nil
+	st := Standing{State: State(state), Key: key, Cert: cert}
+	if _, ok := it["revoked_certs"]; ok {
+		list, err := it.bytes("revoked_certs")
+		if err != nil {
+			return Standing{}, 0, err
+		}
+		serial, err := it.uint("cert_serial")
+		if err != nil {
+			return Standing{}, 0, err
+		}
+		if st.Listed, err = listNames(list, serial); err != nil {
+			return Standing{}, 0, fmt.Errorf("item: %w", err)
+		}
+	}
+	return st, rev, nil
 }
 
 func decodeBox(it item) (*Box, error) {
@@ -364,6 +384,14 @@ func decodeBox(it item) (*Box, error) {
 	}
 	if _, ok := it["revocation"]; ok {
 		if b.Revocation, err = it.bytes("revocation"); err != nil {
+			return nil, err
+		}
+	}
+	if _, ok := it["revoked_certs"]; ok {
+		if b.RevokedCerts, err = it.bytes("revoked_certs"); err != nil {
+			return nil, err
+		}
+		if b.RevokedCertsSig, err = it.bytes("revoked_certs_sig"); err != nil {
 			return nil, err
 		}
 	}

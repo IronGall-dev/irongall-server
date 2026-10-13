@@ -46,7 +46,7 @@ flowchart LR
 4. **Propagation takes ~1–2 s, which is fine.** With more than one process it opens these windows, each 1–2 s:
    - new mail appears on another process late, and until it does that process answers a fetch or an ack of it `404` from memory (since 2026-10-11 a fetch or an ack reads storage only for a message that memory holds): the client gets it at its next poll;
    - a just-acked message can reappear in a list another process serves. Clients skip ids they've acked and treat a 404 on fetch as already gone;
-   - a pass under a certificate the box has since replaced, and a revoked box's pass, are still taken on the other processes;
+   - a pass under a certificate the box has since replaced or its identity has since revoked, and a revoked box's pass, are still taken on the other processes;
    - a burst of sends can go a few over the per-pair cap;
    - a call naming a box just registered, if it lands on another process before a read there sees the record, is answered `404`, and that process remembers the miss until the stream brings the record.
 5. **Applying a change twice, or late, is harmless:**
@@ -140,7 +140,7 @@ sequenceDiagram
   participant D as DynamoDB
   participant P2 as irongalld (others)
   participant B as recipient
-  A->>P1: POST /v1/B with prekey_serial and ciphertext, carrying A's pass
+  A->>P1: POST /v1/B with prekey_serial, certificate_serial and ciphertext, carrying A's pass
   P1->>P1: check the pass (from memory once seen), parse, stanza check
   P1->>D: GetItem B, id (dedupe)
   P1->>S3: PUT B/id
@@ -258,9 +258,10 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
   lock/                      one consumer per box: a directory, with the Go client's flocked lock/pid inside
   etag                       the poll ETag (the Go client)
   revoked.sig                this box's own revocation, once it has met one that verifies: the box is finished
+  revoked-certs.txt, .sig    this box's own list of revoked certificates and its identity's signature over it, once it has published one
 ```
 
-**`irongall.sh` uses this layout**, with no `etag`, with `peers/<addr>/signers` beside each pinned identity, and with scratch files in the box's root that mean nothing between commands (`*.json`, `msg.*`, `self.*`, `new.doc`, `body.txt`); neither client writes a revocation of its own box unasked, and each keeps one it has verified (`peers/<addr>/revoke.sig`). And `test/interop.sh` runs one box with both clients.
+**`irongall.sh` uses this layout**, with no `etag`, with `peers/<addr>/signers` beside each pinned identity, and with scratch files in the box's root that mean nothing between commands (`*.json`, `msg.*`, `self.*`, `new.doc`, `body.txt`); neither client writes a revocation of its own box unasked, and each keeps one it has verified (`peers/<addr>/revoke.sig`), and the newest list of a peer's revoked certificates it has verified (`peers/<addr>/revoked-certs.txt` and its `.sig`). And `test/interop.sh` runs one box with both clients.
 
 | Client | What it is | Built on |
 |---|---|---|
@@ -279,7 +280,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
    - Take a link, an address or one of the box's aliases as the destination: a name is 1 to 32 of `a-z`, `0-9`, `.`, `_` and `-`, so it is never an address or a link, and a name with two addresses names neither.
    - Build the envelope `{v, from, to, sent_at, msg_id, identity, body}`, with `subject`, `in_reply_to` and `supersedes` when the sender gives them (one that is not a `msg_id` is refused before anything is built). `identity` is the sender's identity document.
    - Sign the envelope's line with the working key, in the recipient's namespace; put the signature after it, pad the two for the prekey's type so that the ciphertext is a whole number of blocks, and encrypt that with age to the prekey (`PROTOCOL.md` §4.3a, §4.4). The outbox keeps the signed line.
-   - Write the result to the outbox, then POST it with the prekey's serial (`prekey_serial`, required: the server takes mail only for the current prekey), carrying the box's pass.
+   - Write the result to the outbox, then POST it with the prekey's two serials, its own and its certificate's (`prekey_serial` and `certificate_serial`, both required: the server takes mail only for the current prekey), carrying the box's pass.
    - On a receipt, keep the envelope and the receipt in `sent/`, and only then delete the outbox entry: a crash in between posts it again, gets the original receipt and records it again. The echo box deletes its own: its state is in memory.
    - A retry re-POSTs the same bytes. A failed entry never blocks the others; one that can never be delivered moves to `outbox/failed/`, and one older than 33 days, the TTL, is never posted (the server would take it; the recipient refuses it).
 3. **Receive.**
@@ -296,7 +297,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
 7. **Say what needs a look.** Refused mail and a failed renewal go to stderr; `recv` exits 3 after a renewal that failed and 0 after refused mail, which any sender can cause; `irongall status` reads the box's own files and lists what needs attention (the client README has the exit statuses). This step is the Go client's: the script has no `status`, and its `recv` never renews.
 
 **Conformance kit:**
-- `testdata/vectors/` (built, stock tools): identity to address, certificates, prekey statements and signatures, a pass, a message and what is encrypted in it, revocation, envelopes, and the refusals of each; `irongall.sh` gets the Go client's verdict on every one (`sh/sh_test.go`). Still to add: problem+json bodies.
+- `testdata/vectors/` (built, stock tools): identity to address, certificates, prekey statements and signatures, a pass, a message and what is encrypted in it, revocation, lists of revoked certificates, envelopes, and the refusals of each; `irongall.sh` gets the Go client's verdict on every one (`sh/sh_test.go`). Still to add: problem+json bodies.
 - **The forging-operator tests are PUBLIC, in irongall-client**: `client/forgery_test.go` and `client/failure_test.go` run the Go client against `internal/fakeserver`, an honest in-memory server a middleware turns hostile, with `go test ./...` and nothing to set up. This repo keeps the tests of what the real server enforces.
 - `irongalld serve --dev` (built): an in-memory store with no AWS, the real server's logic. `test/interop.sh` runs `irongall.sh` and the Go client against it.
 

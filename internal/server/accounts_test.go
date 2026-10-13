@@ -364,7 +364,7 @@ func TestLargeReadsTakeTurns(t *testing.T) {
 	adopt(t, lifted, key)
 	post := func(pass string, size int, wait time.Duration) (int, error) {
 		one := uint64(1)
-		j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, Ciphertext: make([]byte, size)})
+		j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: make([]byte, size)})
 		ctx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String(), bytes.NewReader(j))

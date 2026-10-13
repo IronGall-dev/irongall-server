@@ -515,10 +515,11 @@ func TestPrekeyRenewal(t *testing.T) {
 
 	r.prekey(4, now.Add(time.Hour), r.keys[1])
 	e.want(put(4, 4), 400, protocol.CodeBadKey) // a live retired key
-	r.prekey(3, now.Add(2*time.Hour), nil)
-	e.want(put(3, 3), 409, protocol.CodeConflict) // not above the current serial
-	r.prekey(1, now.Add(2*time.Hour), nil)
-	e.want(put(1, 1), 409, protocol.CodeConflict)
+	// Under the box's current certificate the serial must rise.
+	r.prekeyUnder(current, 3, now.Add(2*time.Hour), nil)
+	e.want(put(3, 2), 409, protocol.CodeConflict)
+	r.prekeyUnder(current, 1, now.Add(2*time.Hour), nil)
+	e.want(put(1, 2), 409, protocol.CodeConflict)
 
 	// A statement must not outlive the certificate it is signed under, and
 	// a certificate that has ended signs nothing.
@@ -534,6 +535,22 @@ func TestPrekeyRenewal(t *testing.T) {
 	r.prekey(5, e.clock.Now().Add(time.Hour), nil)
 	e.want(put(5, 5), 200, "")
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(5)), 200, "")
+
+	// A box's statements are ordered by certificate first. A later
+	// certificate passes any serial under an earlier one: the box moves to
+	// certificate 6 at prekey serial 1, below the 5 it stood at, and the
+	// serial rises from there. An earlier certificate is refused whatever
+	// serial comes under it.
+	r.prekeyUnder(r.certify(6), 1, e.clock.Now().Add(time.Hour), nil)
+	e.want(put(1, 6), 200, "")
+	e.want(e.do("GET", r.path("/messages"), nil, r.pass(6)), 200, "")
+	e.want(e.do("GET", r.path("/messages"), nil, r.pass(5)), 401, protocol.CodeUnauthorized)
+	r.prekeyUnder(r.work[6], 1, e.clock.Now().Add(2*time.Hour), nil)
+	e.want(put(1, 6), 409, protocol.CodeConflict)
+	r.prekeyUnder(r.work[5], 9, e.clock.Now().Add(time.Hour), nil)
+	e.want(put(9, 5), 400, protocol.CodeBadKey)
+	r.prekeyUnder(r.work[6], 2, e.clock.Now().Add(time.Hour), nil)
+	e.want(put(2, 6), 200, "")
 }
 
 func TestSendPipeline(t *testing.T) {
@@ -554,7 +571,7 @@ func TestSendPipeline(t *testing.T) {
 		_, _ = io.WriteString(w, `{"v":1}`)
 		_ = w.Close()
 		one := uint64(1)
-		return protocol.SendRequest{PrekeySerial: &one, Ciphertext: ct.Bytes()}
+		return protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: ct.Bytes()}
 	}
 	to := "/v1/" + b.Address().String()
 	ok := seal(pqRecipient)
@@ -581,6 +598,11 @@ func TestSendPipeline(t *testing.T) {
 	noSerial := ok
 	noSerial.PrekeySerial = nil
 	e.want(e.do("POST", to, noSerial, pass), 400, protocol.CodeBadRequest)
+	// A prekey is named by both serials: its own, and its certificate's.
+	zeroCert, noCert := ok, ok
+	zeroCert.CertificateSerial, noCert.CertificateSerial = &z, nil
+	e.want(e.do("POST", to, zeroCert, pass), 400, protocol.CodeBadRequest)
+	e.want(e.do("POST", to, noCert, pass), 400, protocol.CodeBadRequest)
 	notAge := ok
 	notAge.Ciphertext = []byte("not an age file")
 	e.want(e.do("POST", to, notAge, pass), 400, protocol.CodeNotAge)
@@ -591,6 +613,9 @@ func TestSendPipeline(t *testing.T) {
 	s9 := uint64(9)
 	stale.PrekeySerial = &s9
 	e.want(e.do("POST", to, stale, pass), 409, protocol.CodeStalePrekey)
+	staleCert := ok
+	staleCert.CertificateSerial = &s9
+	e.want(e.do("POST", to, staleCert, pass), 409, protocol.CodeStalePrekey)
 
 	big := relaxed()
 	big.MaxSize = 100
@@ -684,7 +709,7 @@ func TestGreaseIsIgnored(t *testing.T) {
 	_, _ = io.WriteString(w, "x")
 	_ = w.Close()
 	one := uint64(1)
-	req := protocol.SendRequest{PrekeySerial: &one, Ciphertext: ct.Bytes()}
+	req := protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: ct.Bytes()}
 	e.want(e.do("POST", "/v1/"+b.Address().String(), req, e.pass(a)), 201, "")
 }
 
@@ -770,7 +795,7 @@ func TestSendNamesTheCurrentPrekey(t *testing.T) {
 		w, _ := age.Encrypt(&ct, oldRecipient)
 		_, _ = io.WriteString(w, body)
 		_ = w.Close()
-		return protocol.SendRequest{PrekeySerial: &serial, Ciphertext: ct.Bytes()}
+		return protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &serial, Ciphertext: ct.Bytes()}
 	}
 	to := "/v1/" + b.Address().String()
 	e.want(e.do("POST", to, sealOld("named the retired serial", 1), e.pass(a)), 409, protocol.CodeStalePrekey)

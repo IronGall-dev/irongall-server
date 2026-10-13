@@ -97,6 +97,14 @@ func unauthorized(hint, format string, args ...any) *problem {
 	return fail(protocol.CodeUnauthorized, hint, format, args...)
 }
 
+// listedCertificate refuses a pass of a box whose current certificate its
+// identity has revoked (PROTOCOL.md §6.3a). No pass is looked at: one under
+// that certificate is not taken, and the box has no other until it publishes
+// a prekey under a new one, which needs no pass under the old.
+func listedCertificate() *problem {
+	return unauthorized("publish a new prekey, which comes with a new certificate: irongall rekey", "the box's current certificate is one its identity revoked")
+}
+
 // The hints of a 401: what a client does about it.
 const (
 	hintPass    = "send the box's pass in Authorization, signed by its working key (irongall and ig_owner do this)" //nolint:gosec // a hint's words, not a credential
@@ -208,6 +216,8 @@ func (s *Server) owner(r *http.Request) (protocol.Address, error) {
 		return a, noSuchMailbox
 	case st.State == Revoked:
 		return a, revoked()
+	case st.Listed:
+		return a, listedCertificate()
 	}
 	return a, s.checkPass(r, a, st.Key, st.Cert, nil)
 }
@@ -228,6 +238,8 @@ func (s *Server) sender(r *http.Request) (protocol.Address, error) {
 		return a, fail(protocol.CodeUnknownSender, "register your own box first: irongall init", "the box the pass names is not registered, or is closed")
 	case st.State == Revoked:
 		return a, fail(protocol.CodeSenderRevoked, "your box is revoked: make a new one, irongall init", "the sending box is revoked")
+	case st.Listed:
+		return a, listedCertificate()
 	}
 	return a, s.checkPass(r, a, st.Key, st.Cert, p)
 }

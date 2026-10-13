@@ -53,6 +53,7 @@ func cloneBox(b *Box) *Box {
 	c := *b
 	c.Retired = slices.Clone(b.Retired)
 	c.SenderKeyTypes = slices.Clone(b.SenderKeyTypes)
+	c.RevokedCerts, c.RevokedCertsSig = slices.Clone(b.RevokedCerts), slices.Clone(b.RevokedCertsSig)
 	if b.Prekey != nil {
 		p := *b.Prekey
 		c.Prekey = &p

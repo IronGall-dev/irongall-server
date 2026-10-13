@@ -96,6 +96,9 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	if req.PrekeySerial == nil || *req.PrekeySerial < 1 || *req.PrekeySerial > protocol.MaxSerial {
 		return fail(protocol.CodeBadRequest, "name the serial of the prekey the ciphertext is encrypted to: irongall send does", "prekey_serial is missing or not a serial")
 	}
+	if req.CertificateSerial == nil || *req.CertificateSerial < 1 || *req.CertificateSerial > protocol.MaxSerial {
+		return fail(protocol.CodeBadRequest, "name the serial of the certificate that prekey's statement is signed under: irongall send does", "certificate_serial is missing or not a serial")
+	}
 
 	// 4. It is an age file.
 	stanzas, err := stanzasOf(req.Ciphertext)
@@ -116,6 +119,14 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	case rcpt.Prekey.Expired(now):
 		return fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall rekey); retry later", "this box's prekey has expired")
 	}
+	// A prekey under a certificate the box's identity has revoked is one
+	// nobody may encrypt to. The cure is an expired prekey's: the owner
+	// publishes a new one, under a new certificate.
+	if listed, err := rcpt.listed(rcpt.CertSerial); err != nil {
+		return err
+	} else if listed {
+		return fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall rekey); retry later", "this box's prekey is signed under a certificate its identity revoked")
+	}
 	// A box takes mail from a sender whose identity its client can verify:
 	// one on an Ed25519 key always, and otherwise what it declared with its
 	// prekey. Refused here, the sender has an error and no receipt for mail
@@ -126,8 +137,9 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	// 6. The prekey and the stanza.
-	if *req.PrekeySerial != rcpt.Prekey.Serial {
-		return fail(protocol.CodeStalePrekey, "a newer prekey exists: fetch GET /v1/<address>/identity and re-encrypt the same envelope (irongall does this)", "the box's current prekey serial is %d", rcpt.Prekey.Serial)
+	// A prekey is named by both serials: its own, and its certificate's.
+	if *req.PrekeySerial != rcpt.Prekey.Serial || *req.CertificateSerial != rcpt.CertSerial {
+		return fail(protocol.CodeStalePrekey, "a newer prekey exists: fetch GET /v1/<address>/identity and re-encrypt the same envelope (irongall does this)", "the box's current prekey is serial %d, under certificate %d", rcpt.Prekey.Serial, rcpt.CertSerial)
 	}
 	if p := checkStanzas(stanzas, rcpt); p != nil {
 		return p
