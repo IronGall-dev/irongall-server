@@ -135,5 +135,25 @@ out=$(printf 'x\n' | gocli "$GP" send "$GEL" 2>&1); [ $? -ne 0 ] && grep -q "doe
 out=$(recipe "$RP" "ig_send $GEL '$work/body5'" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 403 sender_key_type" <<< "$out" \
   && ok "the server refuses the recipe's P-256 box the same send: 403 sender_key_type, and no receipt" || bad "recipe on P-256 → Ed25519-only box: $out"
 
+# --- 6. a box whose clock is off from the server's (PROTOCOL.md §0) ---
+# The recipe reads one clock, ig_now, which is set apart here; the server and the Go boxes keep the real one. Each Go
+# box is made at that moment, so no certificate is newer than the one its mail is signed under.
+clock(){ echo "ig_now(){ echo \$((\$(date -u +%s) + ($1))); }"; }   # <seconds> → the recipe's clock, that far from the real one
+for c in "-540 9 minutes slow" "2940 49 minutes fast"; do
+  off=${c%% *}; name=${c#* }; d="$work/clock$off"; gf="$work/gf$off"
+  L=$(recipe "$d" "$(clock "$off"); ig_init $(nopq_arg)" 2> "$work/err") && A=${L##*/} && ig_hex "$A" && GFL=$(gocli "$gf" init $(nopq_arg)) && GFA=${GFL##*/} \
+    && printf 'to the box whose clock is off\n' | gocli "$gf" send "$L" > /dev/null \
+    && out=$(recipe "$d" "$(clock "$off"); ig_recv" 2>> "$work/err") && jq -e --arg f "$GFA" '.body == "to the box whose clock is off\n" and .from == $f' <<< "$out" > /dev/null \
+    && printf 'from the box whose clock is off\n' > "$work/body6" && recipe "$d" "$(clock "$off"); ig_send $GFL '$work/body6'" 2>> "$work/err" \
+    && out=$(gocli "$gf" recv 2>> "$work/err") && jq -e --arg f "$A" '.body == "from the box whose clock is off\n" and .from == $f' <<< "$out" > /dev/null \
+    && recipe "$d" "$(clock "$off"); ig_rekey $(nopq_arg)" 2>> "$work/err" \
+    && ok "a recipe box whose clock is $name registers, renews, and exchanges mail with a Go box made that moment" || bad "clock $name: $out $(cat "$work/err")"
+done
+out=$(recipe "$work/clock-late" "$(clock -660); ig_init $(nopq_arg)" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 401 pass_expired" <<< "$out" && grep -q "the server's clock reads" <<< "$out" && grep -q "this machine's clock reads" <<< "$out" \
+  && ok "a recipe box 11 minutes slow is refused at its pass: the server states its clock, and the recipe what its own reads" || bad "clock 11 minutes slow: $out"
+out=$(recipe "$work/clock-early" "$(clock 3660); ig_init $(nopq_arg)" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 400 bad_key" <<< "$out" && grep -q "has not begun; the server's clock reads" <<< "$out" \
+  && L=$(recipe "$work/clock-early" "ig_init $(nopq_arg)" 2> "$work/err") && ig_hex "${L##*/}" \
+  && ok "a recipe box first made 61 minutes fast is refused, the server stating its clock; with the clock right, the same box registers" || bad "clock 61 minutes fast: $out $(cat "$work/err")"
+
 echo "interop: $pass PASS, $fail FAIL"
 [ "$fail" -eq 0 ]

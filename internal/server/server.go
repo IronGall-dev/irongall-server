@@ -127,8 +127,24 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET "+protocol.LinkPath+"{addr}", linkPage())
 	mux.Handle("/v1/", s.whenReady(api))
-	return s.accessLog(mux)
+	return s.accessLog(s.dated(mux))
 }
+
+// dated dates every answer by the server's own clock, the one its checks
+// read. A client whose pass is refused for its time compares that date with
+// its own clock (PROTOCOL.md §0).
+func (s *Server) dated(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Date", s.now().UTC().Format(http.TimeFormat))
+		h.ServeHTTP(w, r)
+	})
+}
+
+// clock is what a refusal for a time says of the server's clock: the caller
+// sets its own beside it. Every check here is exact at this clock, and a
+// client makes what it sends with an hour of room (PROTOCOL.md §0), so a
+// refusal for a time is nearly always a clock that is off.
+func (s *Server) clock() string { return "the server's clock reads " + formatTime(s.now()) }
 
 // whenReady answers 503 until the store's memory is loaded: a poll answered
 // before then could read a count of zero that is not true.

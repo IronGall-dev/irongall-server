@@ -106,15 +106,30 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 
 // checkPrekey verifies a prekey statement: signed by a working key under a
 // certificate of the identity that is valid now, and one that could be
-// published now, not expired and valid for at most 33 days. It returns the
+// published now, not expired and ending at most protocol.MaxPrekeyLifetime
+// from now, which is an hour past what a client asks for. It returns the
 // certificate too.
+//
+// A refusal for a time states what this clock reads: a client makes its
+// certificate and its statement with an hour of room (PROTOCOL.md §0), so
+// one of these is nearly always the caller's clock, and a new statement
+// signed by the same clock would be refused the same way.
 func (s *Server) checkPrekey(id *protocol.Identity, statement, sig []byte) (*protocol.Prekey, *protocol.Certificate, error) {
+	const ahead = "this machine's clock reads more than an hour ahead of the server's: check it, then irongall init for a new box, irongall rekey for one in use"
 	p, cert, err := protocol.VerifyPrekey(id, statement, sig, s.now())
-	if err != nil {
+	switch {
+	case errors.Is(err, protocol.ErrCertificateNotBegun):
+		return nil, nil, fail(protocol.CodeBadKey, "a certificate starts an hour before it is made, so "+ahead, "%v; %s", err, s.clock())
+	case errors.Is(err, protocol.ErrCertificateTime):
+		return nil, nil, fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "%v; %s", err, s.clock())
+	case err != nil:
 		return nil, nil, fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "%v", err)
 	}
 	if err := p.CheckLifetime(s.now()); err != nil {
-		return nil, nil, fail(protocol.CodeBadKey, "a prekey is valid for at most 33 days: irongall rekey", "%v", err)
+		if p.Expired(s.now()) {
+			return nil, nil, fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "%v; %s", err, s.clock())
+		}
+		return nil, nil, fail(protocol.CodeBadKey, "a client signs a prekey for 33 days, so "+ahead, "%v; %s", err, s.clock())
 	}
 	return p, cert, nil
 }

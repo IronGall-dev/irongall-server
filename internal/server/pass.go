@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -128,12 +129,15 @@ func (s *Server) checkPass(r *http.Request, a protocol.Address, key string, cert
 		return unauthorized("call the server by the name in its URL", "this server is not %q, so no pass made for that name is for it", name)
 	}
 	// Run out, or running out too far ahead: either way the box signs another.
+	// A new pass cures neither if the caller's clock is off, so each says
+	// what this clock reads and which way the caller's is likely wrong.
 	if !now.Before(p.NotAfter) {
-		return fail(protocol.CodePassExpired, hintNewPass, "the pass has run out")
+		return fail(protocol.CodePassExpired, fmt.Sprintf("%s; refused again, this machine's clock reads %d minutes or more behind the server's: check it", hintNewPass, protocol.PassLifetime/time.Minute),
+			"the pass has run out; %s", s.clock())
 	}
 	if p.NotAfter.After(now.Add(protocol.MaxPassLifetime)) {
-		return fail(protocol.CodePassExpired, hintNewPass+"; if it is refused again, check this machine's clock",
-			"the pass runs out more than %d minutes from now", protocol.MaxPassLifetime/time.Minute)
+		return fail(protocol.CodePassExpired, fmt.Sprintf("%s; refused again, this machine's clock reads more than %d minutes ahead of the server's: check it", hintNewPass, (protocol.MaxPassLifetime-protocol.PassLifetime)/time.Minute),
+			"the pass runs out more than %d minutes from now; %s", protocol.MaxPassLifetime/time.Minute, s.clock())
 	}
 	// The certificate's hash, then the working key's signature: what
 	// refuses a pass that is not the box's, for one signature check at most.
@@ -141,8 +145,10 @@ func (s *Server) checkPass(r *http.Request, a protocol.Address, key string, cert
 	switch {
 	case errors.Is(err, protocol.ErrCertificate):
 		return unauthorized("sign the pass with the working key of the box's newest prekey; if that key is lost, irongall rekey", "the pass is not under the box's current certificate")
+	case errors.Is(err, protocol.ErrCertificateNotBegun):
+		return unauthorized("a certificate starts an hour before it is made: check this machine's clock, then irongall rekey", "the certificate the pass is signed under has not begun; %s", s.clock())
 	case errors.Is(err, protocol.ErrCertificateTime):
-		return unauthorized("publish a new prekey, which comes with a new certificate: irongall rekey", "the certificate the pass is signed under has ended, or has not begun")
+		return unauthorized("publish a new prekey, which comes with a new certificate: irongall rekey", "the certificate the pass is signed under has ended; %s", s.clock())
 	case err != nil:
 		return unauthorized(hintNewPass, "the pass is not this box's for this server")
 	}
