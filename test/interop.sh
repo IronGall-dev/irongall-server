@@ -203,6 +203,7 @@ out=$(recipe "$work/nobox" "ig_revoke $V5A '$work/v5.json'" 2>&1) && [ "$out" = 
 # --- 8. one certificate revoked (PROTOCOL.md §6.3a): the identity's list ends what a certificate signed, and the address goes on ---
 W1="$work/w1"; W2="$work/w2"; W3="$work/w3"
 W1L=$(gocli "$W1" init $(nopq_arg)) && W1A=${W1L##*/} && W2L=$(recipe "$W2" "ig_init $(nopq_arg)") && W2A=${W2L##*/} && W3L=$(gocli "$W3" init $(nopq_arg)) && W3A=${W3L##*/} || bad "revoked certificates: the boxes"
+kept(){ jq -r .revoked_certificates "$1" | base64 -d; }   # <the record a box keeps a list as> → the list in it
 put(){ curl -s -o "$work/put.json" -w '%{http_code}' -X PUT -H 'Content-Type: application/json' --data-binary "@$1" "$IG_BASE/v1/$2/revocations"; }   # <record> <address> → the status; the body is left in put.json
 printf 'under the first certificate\n' > "$work/body8"
 gocli "$W1" send "$W2L" < "$work/body8" > /dev/null 2> "$work/err" && gocli "$W1" send "$W3L" < "$work/body8" > /dev/null 2>> "$work/err" && recipe "$W2" "ig_send $W3L '$work/body8'" 2>> "$work/err" || bad "revoked certificates: the first sends: $(cat "$work/err")"
@@ -213,10 +214,10 @@ out=$(gocli "$W1" rekey --revoke-earlier 2>&1) && curl -sf "$IG_BASE/v1/$W1A/rev
 printf 'under the second certificate\n' > "$work/body8b"
 gocli "$W1" send "$W2L" < "$work/body8b" > /dev/null 2> "$work/err" && gocli "$W1" send "$W3L" < "$work/body8b" > /dev/null 2>> "$work/err" || bad "revoked certificates: the sends after the renewal: $(cat "$work/err")"
 out=$(recipe "$W2" "ig_recv" 2>&1); [ $? -eq 0 ] && [ "$(grep -c ': certificate_revoked: ' <<< "$out")" = 1 ] && grep -q 'under the second certificate' <<< "$out" && ! grep -q 'under the first certificate' <<< "$out" \
-  && curl -sf "$IG_BASE/v1/$W1A/revocations" | jq -r .revoked_certificates | base64 -d | cmp -s - "$W2/peers/$W1A/revoked-certs.txt" && [ ! -e "$W2/peers/$W1A/revoke.sig" ] \
+  && curl -sf "$IG_BASE/v1/$W1A/revocations" | jq -r .revoked_certificates | base64 -d | cmp -s - <(kept "$W2/peers/$W1A/revoked-certs.json") && [ ! -e "$W2/peers/$W1A/revoke.sig" ] \
   && ok "the recipe refuses mail under the certificate the Go box revoked, delivers mail under its new one, and keeps the list it checked" || bad "recipe recv after the list: $out"
 out=$(gocli "$W3" recv 2>&1); [ $? -eq 0 ] && [ "$(grep -c ': certificate_revoked: ' <<< "$out")" = 1 ] && grep -q 'under the second certificate' <<< "$out" && [ "$(grep -c 'under the first certificate' <<< "$out")" = 1 ] \
-  && cmp -s "$W2/peers/$W1A/revoked-certs.txt" "$W3/peers/$W1A/revoked-certs.txt" \
+  && cmp -s <(kept "$W2/peers/$W1A/revoked-certs.json") <(kept "$W3/peers/$W1A/revoked-certs.json") && [ -s "$W3/peers/$W1A/revoked-certs.json" ] \
   && ok "the Go client does the same, and takes the recipe box's mail under a certificate nobody revoked" || bad "Go recv after the list: $out"
 recipe "$W2" "ig_send $W1L '$work/body8'" 2> "$work/err" && gocli "$W3" send "$W1L" < "$work/body8" > /dev/null 2>> "$work/err" && out=$(gocli "$W1" recv 2>&1) && [ "$(grep -c '"body"' <<< "$out")" = 2 ] \
   && [ "$(cat "$W2/peers/$W1A/serial" "$W2/peers/$W1A/cert-serial" | tr '\n' ' ')" = "2 2 " ] \
@@ -233,7 +234,7 @@ mklist bywork 1 1 "$W2/work/2-cert.pub" && mklist one 1 1 "$W2/identity" && mkli
   && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$W2A/identity")" = 200 ] \
   && ok "a list signed with ssh-keygen alone is taken with no pass: 200, the same again 200, another of that version 409 conflict" || bad "the recipe box's list: $(cat "$work/put.json")"
 out=$(gocli "$W3" recv 2>&1); [ $? -eq 0 ] && [ "$(grep -c ': certificate_revoked: ' <<< "$out")" = 1 ] && grep -q 'under the second certificate' <<< "$out" && ! grep -q 'under the first certificate' <<< "$out" \
-  && cmp -s "$work/one.list" "$W3/peers/$W2A/revoked-certs.txt" \
+  && kept "$W3/peers/$W2A/revoked-certs.json" | cmp -s - "$work/one.list" \
   && ok "the Go client refuses the recipe box's mail under the certificate that list names, and delivers its mail under the next" || bad "Go recv after the recipe box's list: $out"
 # A list that names the box's CURRENT certificate: the server takes no pass of the box and no mail for it, until it renews.
 [ "$(put "$work/two.json" "$W2A")" = 200 ] || bad "the second list: $(cat "$work/put.json")"

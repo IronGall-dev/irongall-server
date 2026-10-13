@@ -258,10 +258,10 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
   lock/                      one consumer per box: a directory, with the Go client's flocked lock/pid inside
   etag                       the poll ETag (the Go client)
   revoked.sig                this box's own revocation, once it has met one that verifies: the box is finished
-  revoked-certs.txt, .sig    this box's own list of revoked certificates and its identity's signature over it, once it has published one
+  revoked-certs.json         this box's own list of revoked certificates, once it has published one: the record that carries it, one line of JSON
 ```
 
-**`irongall.sh` uses this layout**, with no `etag`, with `peers/<addr>/signers` beside each pinned identity, and with scratch files in the box's root that mean nothing between commands (`*.json`, `msg.*`, `self.*`, `new.doc`, `body.txt`); neither client writes a revocation of its own box unasked, and each keeps one it has verified (`peers/<addr>/revoke.sig`), and the newest list of a peer's revoked certificates it has verified (`peers/<addr>/revoked-certs.txt` and its `.sig`). And `test/interop.sh` runs one box with both clients.
+**`irongall.sh` uses this layout**, with no `etag`, with `peers/<addr>/signers` beside each pinned identity, and with scratch files in the box's root that mean nothing between commands (`*.json`, `msg.*`, `self.*`, `new.doc`, `body.txt`); neither client writes a revocation of its own box unasked, and each keeps one it has verified (`peers/<addr>/revoke.sig`), and the newest list of a peer's revoked certificates it has verified (`peers/<addr>/revoked-certs.json`, the record that carries it). And `test/interop.sh` runs one box with both clients.
 
 | Client | What it is | Built on |
 |---|---|---|
