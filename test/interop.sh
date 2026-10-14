@@ -9,7 +9,9 @@
 #   6. a box whose clock is off from the server's;
 #   7. revocation: each client revokes a box at the real server, the other checks the proof it is shown, and a record alone revokes;
 #   8. one certificate revoked: the Go client renews and revokes its earlier certificates, a list made with ssh-keygen alone, and each
-#      client checking the list it is shown, refusing mail under a listed certificate and following a box to its next one.
+#      client checking the list it is shown, refusing mail under a listed certificate and following a box to its next one;
+#   9. a revocation server beside this one, the reference one from the client repo: each client publishes to both, each is shown by it
+#      a revocation this server was never told of, and with it gone mail still goes.
 # Every script step runs in a FRESH shell (agents run each command in a new one). --no-pq boxes only when the local
 # age is older than 1.3 (it cannot make or send to a post-quantum box); the Go client handles both either way.
 # Needs: go, bash ≥ 4, age, age-keygen, ssh-keygen, curl, jq, sha256sum, base64, od. Run from anywhere:
@@ -26,10 +28,11 @@ rm -rf /tmp/irongall-interop; mkdir -p /tmp/irongall-interop; work=/tmp/irongall
 pass=0; fail=0
 ok(){ echo "PASS $*"; pass=$((pass + 1)); }
 bad(){ echo "FAIL $*"; fail=$((fail + 1)); }
-trap '[ -n "${srv:-}" ] && kill "$srv" 2> /dev/null' EXIT
+trap '[ -n "${srv:-}" ] && kill "$srv" 2> /dev/null; [ -n "${rev:-}" ] && kill "$rev" 2> /dev/null' EXIT
 
 export PATH=$PATH:/usr/local/go/bin
-(cd "$repo" && go build -o "$work/irongalld" ./cmd/irongalld && go build -o "$work/irongall" github.com/IronGall-dev/irongall-client/cmd/irongall) || { echo "build failed"; exit 1; }
+(cd "$repo" && go build -o "$work/irongalld" ./cmd/irongalld && go build -o "$work/irongall" github.com/IronGall-dev/irongall-client/cmd/irongall &&
+  go build -o "$work/irongall-revocation-server" github.com/IronGall-dev/irongall-client/cmd/irongall-revocation-server) || { echo "build failed"; exit 1; }
 [ -r "$SCRIPT" ] || { echo "no $SCRIPT"; exit 1; }
 echo "stock client: $SCRIPT ($(grep -c '^ig_[a-z_]*()' "$SCRIPT") functions)"
 
@@ -245,8 +248,53 @@ out=$(gocli "$W3" send "$W2L" < "$work/body8" 2>&1); [ $? -ne 0 ] && grep -q "un
   && ok "a sender asks before it posts: shown the list, it keeps it, seals nothing to a statement under a listed certificate, and the message waits in the outbox" || bad "a send to a listed box: $out"
 recipe "$W2" "ig_rekey $(nopq_arg)" 2> "$work/err" && gocli "$W3" flush > /dev/null 2>> "$work/err" && out=$(recipe "$W2" "ig_recv" 2>&1) && grep -q 'under the first certificate' <<< "$out" \
   && ok "one renewal, under a new certificate, cures both: the box polls again, and the waiting message is delivered" || bad "after the listed box renewed: $(cat "$work/err") $out"
-out=$(gocli "$W3" revoked --ask "$W2L" 2> /dev/null) && [ "$out" = "certificates of $W2A revoked, list version 2" ] && out=$(gocli "$W1" revoked --ask "$W3L" 2> "$work/err") && [ "$out" = "no revocation of $W3A shown" ] && grep -q "the server's word" "$work/err" \
-  && ok "asked at any time, the server shows a box's list, or that it holds nothing, which the client says as the server's word" || bad "revoked --ask: $out $(cat "$work/err")"
+out=$(gocli "$W3" revoked --ask "$W2L" 2> /dev/null) && [ "$out" = "certificates of $W2A revoked, list version 2" ] && out=$(gocli "$W1" revoked --ask "$W3L" 2> "$work/err") && [ "$out" = "no revocation of $W3A shown" ] && grep -q "the word of whoever was asked" "$work/err" \
+  && ok "asked at any time, the server shows a box's list, or that it holds nothing, which the client says as the word of whoever it asked" || bad "revoked --ask: $out $(cat "$work/err")"
+
+# --- 9. a revocation server beside this one (PROTOCOL.md §6.3): the reference one, which holds no box and knows nothing of this server ---
+rport=$((port + 1)); REV="http://127.0.0.1:$rport"
+"$work/irongall-revocation-server" --dir "$work/revocations" --listen "127.0.0.1:$rport" --writes-per-hour -1 2> "$work/revocation-server.log" & rev=$!
+for _ in $(seq 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$REV/")" = 200 ] && break; sleep 0.1; done
+at(){ curl -s -o /dev/null -w '%{http_code}' "$1/v1/$2/revocations"; }   # <server> <address> → the status of a lookup there
+X1="$work/x1"; X2="$work/x2"; X3="$work/x3"; X4="$work/x4"; X5="$work/x5"; X6="$work/x6"
+X1L=$(gocli "$X1" init $(nopq_arg)) && X1A=${X1L##*/} && X2L=$(recipe "$X2" "ig_init $(nopq_arg)") && X2A=${X2L##*/} && X3L=$(gocli "$X3" init $(nopq_arg)) && X3A=${X3L##*/} \
+  && X4L=$(recipe "$X4" "ig_init $(nopq_arg)") && X4A=${X4L##*/} && X5L=$(gocli "$X5" init $(nopq_arg)) && X5A=${X5L##*/} && X6L=$(gocli "$X6" init $(nopq_arg)) && X6A=${X6L##*/} || bad "the revocation server: the boxes"
+for b in "$X1" "$X2" "$X3" "$X4" "$X6"; do echo "$REV" > "$b/revocation-servers"; done      # the one setting, in the box, for whichever client runs it: X5 lists none
+[ "$(at "$REV" "$X1A")" = 404 ] && [ "$(curl -s "$REV/v1/$X1A/revocations" | jq -r .code)" = not_revoked ] && [ "$(gocli "$X1" status | jq -r '.revocation_servers[0]')" = "$REV" ] \
+  && ok "the revocation server answers 404 not_revoked for an address it was never told of, and a box's status names the servers it asks" || bad "the revocation server, before anything"
+# Each client's revocation goes to both servers.
+out=$(gocli "$X1" revoke "$X1A" 2>&1) && [ "$out" = "revoked $X1A" ] && [ "$(at "$IG_BASE" "$X1A")" = 200 ] && [ "$(at "$REV" "$X1A")" = 200 ] \
+  && out2=$(recipe "$X2" "ig_revoke $X2A" 2>&1) && [ "$out2" = "revoked $X2A" ] && [ "$(at "$IG_BASE" "$X2A")" = 200 ] && [ "$(at "$REV" "$X2A")" = 200 ] \
+  && cmp -s <(curl -s "$REV/v1/$X1A/revocations" | jq -S .) <(curl -s "$IG_BASE/v1/$X1A/revocations" | jq -S .) \
+  && ok "each client publishes its revocation at this server and at the revocation server, which then serve the same record" || bad "revoke at both: $out / ${out2:-}"
+# A revocation this server was never told of: the record goes to the revocation server alone, and this server goes on serving the box.
+gocli "$X3" revocation > "$work/x3.json" 2> /dev/null && [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/json' --data-binary "@$work/x3.json" "$REV/v1/$X3A/revocations")" = 201 ] \
+  && [ "$(at "$IG_BASE" "$X3A")" = 404 ] && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$X3A/identity")" = 200 ] || bad "a revocation at the revocation server alone"
+printf 'to an address its owner ended\n' > "$work/body9"
+gocli "$X5" send "$X3L" < "$work/body9" > /dev/null 2> "$work/err" && ok "the control: a box that asks this server alone posts to the revoked address, and this server takes it" || bad "the control: $(cat "$work/err")"
+out=$(gocli "$X6" send "$X3L" < "$work/body9" 2>&1); [ $? -ne 0 ] && grep -q "REVOKED: $X3A is revoked" <<< "$out" && [ -s "$X6/peers/$X3A/revoke.sig" ] && ls "$X6"/outbox/failed/"$X3A".*.P > /dev/null 2>&1 \
+  && out=$(recipe "$X4" "ig_send $X3L '$work/body9'" 2>&1); [ $? -ne 0 ] && grep -q "REVOKED: $X3A is revoked" <<< "$out" && [ -s "$X4/peers/$X3A/revoke.sig" ] \
+  && ok "a revocation this server never held is shown to each client by the revocation server: it is checked and kept, and nothing is posted" || bad "a hidden revocation: $out"
+# The list of revoked certificates goes to both, and a box that never met its owner is shown it by either.
+out=$(gocli "$X6" rekey --revoke-earlier 2>&1) && [ "$(curl -s "$REV/v1/$X6A/revocations" | jq -r 'keys | join(",")')" = "identity,revoked_certificates,revoked_certificates_signature" ] \
+  && cmp -s <(curl -s "$REV/v1/$X6A/revocations" | jq -r .revoked_certificates) <(curl -s "$IG_BASE/v1/$X6A/revocations" | jq -r .revoked_certificates) \
+  && ok "rekey --revoke-earlier publishes the list at both servers" || bad "a list at both: $out"
+# The revocation server gone: mail goes, the owner is told, and a revocation is at this server and reported as not everywhere.
+kill "$rev" 2> /dev/null; wait "$rev" 2> /dev/null; rev=
+out=$(gocli "$X6" send "$X5L" < "$work/body9" 2>&1); [ $? -eq 0 ] && grep -q "the revocation server $REV gave no answer, which changes nothing here" <<< "$out" \
+  && out2=$(recipe "$X4" "ig_send $X5L '$work/body9'" 2>&1); [ $? -eq 0 ] && grep -q "the revocation server $REV gave no answer, which changes nothing here" <<< "$out2" \
+  && [ "$(gocli "$X5" recv 2> /dev/null | jq -r .body | grep -c 'to an address its owner ended')" = 2 ] \
+  && ok "with the revocation server gone, each client says so and its mail goes all the same" || bad "the revocation server gone: $out / ${out2:-}"
+out=$(gocli "$X6" revoke "$X6A" 2>&1); [ $? -eq 1 ] && grep -q "was NOT taken by $REV" <<< "$out" && grep -q "it was taken by $IG_BASE" <<< "$out" && ! grep -q "^revoked " <<< "$out" && [ "$(at "$IG_BASE" "$X6A")" = 200 ] && [ -s "$X6/revoked.sig" ] \
+  && out2=$(recipe "$X4" "ig_revoke $X4A" 2>&1); [ $? -ne 0 ] && grep -q "NOT taken by the revocation server $REV" <<< "$out2" && ! grep -q "^revoked " <<< "$out2" && [ "$(at "$IG_BASE" "$X4A")" = 200 ] && [ -s "$X4/revoked.sig" ] \
+  && ok "a revocation that not every server took is at this server, is kept by its box, and the command fails saying which did not take it" || bad "revoke with the revocation server gone: $out / ${out2:-}"
+# Back on the same directory, it still holds what it took, and the same command again is the cure.
+"$work/irongall-revocation-server" --dir "$work/revocations" --listen "127.0.0.1:$rport" --writes-per-hour -1 2>> "$work/revocation-server.log" & rev=$!
+for _ in $(seq 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$REV/")" = 200 ] && break; sleep 0.1; done
+[ "$(at "$REV" "$X1A")" = 200 ] && [ "$(at "$REV" "$X6A")" = 200 ] && out=$(gocli "$X6" revoke "$X6A" 2>&1) && [ "$out" = "revoked $X6A" ] && curl -s "$REV/v1/$X6A/revocations" | jq -e '.revocation and .revoked_certificates' > /dev/null \
+  && out2=$(recipe "$X4" "ig_revoke $X4A" 2>&1) && [ "$out2" = "revoked $X4A" ] && [ "$(at "$REV" "$X4A")" = 200 ] \
+  && ! grep -q -e "$X5A" -e "GET" "$work/revocation-server.log" \
+  && ok "restarted on its directory the revocation server still holds every record, the same command again publishes what it missed, and its log names no lookup" || bad "after the restart: $out / ${out2:-} / $(tail -n 3 "$work/revocation-server.log")"
 
 echo "interop: $pass PASS, $fail FAIL"
 [ "$fail" -eq 0 ]
