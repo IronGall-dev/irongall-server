@@ -303,7 +303,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
 
 ## Repo layout: two repos
 
-**The client side is [`IronGall-dev/irongall-client`](https://github.com/IronGall-dev/irongall-client), Apache-2.0.** Everything a user has to trust lives there; the server needs no trust. **The server is this repo, AGPL-3.0-or-later.**
+**The client side is [`IronGall-dev/irongall-client`](https://github.com/IronGall-dev/irongall-client), Apache-2.0.** Everything a user has to trust lives there; the server needs no trust. **The server is this repo, Apache-2.0 too.**
 
 ```
 irongall-client

@@ -20,9 +20,9 @@ git push --force-with-lease         # then update the pull request
 
 ## Licence of contributions
 
-A contribution to this repo is made under this repo's licence, the GNU Affero General Public License, version 3 or (at your option) any later version. There is no contributor licence agreement.
+A contribution to this repo is made under this repo's licence, Apache-2.0 (`LICENSE`). There is no contributor licence agreement.
 
-The client, [irongall-client](https://github.com/IronGall-dev/irongall-client), is Apache-2.0. Code moves from the client to the server and never back.
+The client, [irongall-client](https://github.com/IronGall-dev/irongall-client), is Apache-2.0 too.
 
 ## Where a change goes
 

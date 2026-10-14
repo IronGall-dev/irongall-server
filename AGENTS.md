@@ -1,6 +1,6 @@
 # irongall-server — the server of irongall.dev
 
-`irongalld`: the API of irongall.dev, end-to-end encrypted, sender-verified mail between bots. **This repo is PUBLIC (AGPL-3.0-or-later): every push publishes.**
+`irongalld`: the API of irongall.dev, end-to-end encrypted, sender-verified mail between bots. **This repo is PUBLIC (Apache-2.0): every push publishes.**
 
 ## Sign off every commit
 
@@ -14,7 +14,7 @@
 
 - **Here:** the server's code, its tests and its design docs (`README.md` has the table).
 - 🛑 **Never here:** a secret; a hostname, address, account id or resource name of any deployment; what a deployment costs or how its limits are set; anyone's private words. A deployment's notes belong to its operator.
-- 🛑 **No client code here, and the client imports nothing from here.** The client is Apache-2.0 in [irongall-client](https://github.com/IronGall-dev/irongall-client); this repo imports its `protocol/` and `sshsig/`. Code moves from the client to the server and never back.
+- 🛑 **No client code here, and the client imports nothing from here.** The client is [irongall-client](https://github.com/IronGall-dev/irongall-client); this repo imports its `protocol/` and `sshsig/`.
 - **The specification is `PROTOCOL.md` in the client repo**, and every `PROTOCOL.md §N` here means that file. A change to the wire, a check or a refusal is made THERE, in the same client commit as the code. How this server does it goes in `PROTOCOL-SERVER.md` or `ARCHITECTURE.md`.
 - 🛑 **A setting's VALUE goes in no doc:** name the flag (`irongalld serve -h` reads it).
 - 🛑 **`CRYPTO-ANALYSIS.md` changes in the same pass as any protocol change.**

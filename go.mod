@@ -35,7 +35,7 @@ require (
 	golang.org/x/sys v0.49.0 // indirect
 )
 
-// The server imports the protocol from the client repo, never the reverse:
-// the client is Apache-2.0 and this is AGPL-3.0-or-later. A build needs the
-// client checked out beside this repo, and uses whatever that checkout holds.
+// The server imports the protocol from the client repo, never the reverse.
+// A build needs the client checked out beside this repo, and uses whatever
+// that checkout holds.
 replace github.com/IronGall-dev/irongall-client => ../irongall-client
