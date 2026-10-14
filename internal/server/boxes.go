@@ -314,6 +314,21 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	if ok, wait := s.misses.ready(ip, now); !ok {
 		return rateLimited(wait, "too many requests from this address that named no box or carried no revocation")
 	}
+	// What the server already holds was verified when it was stored, so a
+	// body that is byte for byte what is held is answered 200 without paying
+	// for the check again: no signature check, no write, and, for a revoked
+	// box, no further read of its messages. A revocation and a list are both
+	// public, so whoever holds one may send it back as fast as they can post.
+	if req.Revocation != nil && b.State == Revoked && bytes.Equal(req.Revocation, b.Revocation) {
+		writeJSON(w, http.StatusOK, struct{}{})
+		return nil
+	}
+	if hasList && b.State != Revoked && len(b.RevokedCerts) > 0 &&
+		bytes.Equal(req.RevokedCertificates, b.RevokedCerts) &&
+		bytes.Equal(req.RevokedCertificatesSignature, b.RevokedCertsSig) {
+		writeJSON(w, http.StatusOK, struct{}{})
+		return nil
+	}
 	var list *protocol.RevokedCertificates
 	if hasList {
 		if list, err = protocol.VerifyRevokedCertificates(h, req.Identity, req.RevokedCertificates, req.RevokedCertificatesSignature); err != nil {

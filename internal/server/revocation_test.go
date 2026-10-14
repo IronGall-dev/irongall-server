@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/IronGall-dev/irongall-client/client"
 	"github.com/IronGall-dev/irongall-client/protocol"
@@ -236,4 +238,57 @@ func TestARevocationOutlivesTheProcess(t *testing.T) {
 		t.Fatalf("what a later process shows for a revoked box: %v", err)
 	}
 	e2.want(e2.do("PUT", revocationPath(a.Address()), rec, ""), 200, "")
+}
+
+// countingDeletes wraps a Store and counts DeleteMessages, the read of the
+// messages table a revocation draws.
+type countingDeletes struct {
+	Store
+	mu sync.Mutex
+	n  int
+}
+
+func (s *countingDeletes) DeleteMessages(ctx context.Context, a protocol.Address) error {
+	s.mu.Lock()
+	s.n++
+	s.mu.Unlock()
+	return s.Store.DeleteMessages(ctx, a)
+}
+
+func (s *countingDeletes) deletes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.n
+}
+
+// A box's own revocation is public: whoever holds it may send it back. The
+// server verified it when it stored it, so a body that is byte for byte the
+// one held is answered 200 without a second check, a write, or, for a
+// revoked box, another read of its messages.
+func TestASecondRevocationCostsNothing(t *testing.T) {
+	keys, err := NewDevKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk := &clock{t: time.Now().UTC().Truncate(time.Second)}
+	cs := &countingDeletes{Store: NewMemStore(clk.Now)}
+	e := &env{t: t, clock: clk, keys: keys, store: cs}
+	e.server = New(Config{Store: cs, Keys: keys, Limits: relaxed(), Now: clk.Now})
+	e.srv = httptest.NewServer(e.server.Handler())
+	t.Cleanup(e.srv.Close)
+
+	a := e.box(protocol.Classic)
+	rec := record(t, a)
+	path := revocationPath(a.Address())
+
+	// The first revocation ends the box and clears its mail: one read.
+	e.want(e.do("PUT", path, rec, ""), 201, "")
+	if n := cs.deletes(); n != 1 {
+		t.Fatalf("a revocation read the messages table %d times, want 1", n)
+	}
+	// The same revocation again changes nothing, and reads nothing.
+	e.want(e.do("PUT", path, rec, ""), 200, "")
+	if n := cs.deletes(); n != 1 {
+		t.Errorf("a resent revocation read the messages table %d times, want 1", n)
+	}
 }
