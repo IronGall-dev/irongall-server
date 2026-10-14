@@ -314,21 +314,6 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	if ok, wait := s.misses.ready(ip, now); !ok {
 		return rateLimited(wait, "too many requests from this address that named no box or carried no revocation")
 	}
-	// What the server already holds was verified when it was stored, so a
-	// body that is byte for byte what is held is answered 200 without paying
-	// for the check again: no signature check, no write, and, for a revoked
-	// box, no further read of its messages. A revocation and a list are both
-	// public, so whoever holds one may send it back as fast as they can post.
-	if req.Revocation != nil && b.State == Revoked && bytes.Equal(req.Revocation, b.Revocation) {
-		writeJSON(w, http.StatusOK, struct{}{})
-		return nil
-	}
-	if hasList && b.State != Revoked && len(b.RevokedCerts) > 0 &&
-		bytes.Equal(req.RevokedCertificates, b.RevokedCerts) &&
-		bytes.Equal(req.RevokedCertificatesSignature, b.RevokedCertsSig) {
-		writeJSON(w, http.StatusOK, struct{}{})
-		return nil
-	}
 	var list *protocol.RevokedCertificates
 	if hasList {
 		if list, err = protocol.VerifyRevokedCertificates(h, req.Identity, req.RevokedCertificates, req.RevokedCertificatesSignature); err != nil {
@@ -372,12 +357,26 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 	}
-	// After the record says revoked, and again on every retry: mail that
-	// arrived around the write is never served, and this deletes it sooner
-	// than its expiry would.
+	// After the record says revoked: mail that arrived around the write is
+	// never served, and this deletes it sooner than its expiry would. A
+	// revocation of a box already revoked deletes only while memory shows
+	// the box holding mail, as it does when the first delete failed. A
+	// revocation is public and its bytes are not the only ones that verify
+	// (a line feed after the armour, the identity signing again), so one
+	// sent back must not draw a read of the messages table each time.
 	if b.State == Revoked {
-		if err := s.store.DeleteMessages(r.Context(), b.Addr); err != nil {
-			return err
+		held := changed
+		if !held {
+			n, _, err := s.store.Count(r.Context(), b.Addr)
+			if err != nil {
+				return err
+			}
+			held = n > 0
+		}
+		if held {
+			if err := s.store.DeleteMessages(r.Context(), b.Addr); err != nil {
+				return err
+			}
 		}
 	}
 	writeJSON(w, status, struct{}{})
