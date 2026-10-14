@@ -14,17 +14,17 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
-// Revoking one certificate (PROTOCOL.md §6.3a) as this server enforces it:
-// the identity signs a list of its certificates' serials, with no pass, and
-// the address goes on. The server keeps the newest list and serves it, takes
-// no pass and no prekey statement under a listed certificate, and sends
-// nobody to a prekey under one.
+// Revoking certificates (PROTOCOL.md §6.3a) as this server enforces it: the
+// identity signs a revocation of every certificate through a serial, with no
+// pass, and the address goes on. The server keeps the highest one and serves
+// it, takes no pass and no prekey statement under a revoked certificate, and
+// sends nobody to a prekey under one.
 
-// list is a list of r's revoked certificates, signed by its identity, in the
-// record that carries it.
-func (r *raw) list(version uint64, ranges ...protocol.SerialRange) protocol.Revocations {
+// certs is the revocation of r's certificates through a serial, signed by its
+// identity, in the record that carries it.
+func (r *raw) certs(through uint64) protocol.Revocations {
 	r.e.t.Helper()
-	l, err := protocol.NewRevokedCertificates(r.id.Address(), version, ranges)
+	l, err := protocol.NewRevokedCertificates(r.id.Address(), through)
 	if err != nil {
 		r.e.t.Fatal(err)
 	}
@@ -61,10 +61,9 @@ func TestRevokedCertificates(t *testing.T) {
 	r.prekey(2, now.Add(protocol.MaxPrekeyLifetime), nil)
 	e.want(put(2, 2), 200, "") // the box stands at certificate 2, prekey 2
 	path := r.path("/revocations")
-	one, two := protocol.SerialRange{First: 1, Last: 1}, protocol.SerialRange{First: 1, Last: 2}
-	good := r.list(1, one)
+	good := r.certs(1)
 
-	// What is not a list of this box's revoked certificates, each of it well
+	// What is not a revocation of this box's certificates, each of it well
 	// signed by someone.
 	byWork, err := protocol.Sign(r.work[2], good.RevokedCertificates, protocol.RevokedCertsNamespace(r.id.Address()))
 	if err != nil {
@@ -79,18 +78,18 @@ func TestRevokedCertificates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	theirs := other.list(1, one)
+	theirs := other.certs(1)
 	for name, bad := range map[string]struct {
 		body any
 		code protocol.Code
 	}{
-		"a working key of the box, under its certificate":     {protocol.Revocations{Identity: r.id.Document(), RevokedCertificates: good.RevokedCertificates, RevokedCertificatesSignature: byWork}, protocol.CodeBadRevocation},
-		"another box's list, with this box's document":        {protocol.Revocations{Identity: r.id.Document(), RevokedCertificates: theirs.RevokedCertificates, RevokedCertificatesSignature: theirs.RevokedCertificatesSignature}, protocol.CodeBadRevocation},
-		"the identity's signature in another namespace":       {protocol.Revocations{Identity: r.id.Document(), RevokedCertificates: good.RevokedCertificates, RevokedCertificatesSignature: asRevocation}, protocol.CodeBadRevocation},
-		"a list with a blank line, which the identity signed": {protocol.Revocations{Identity: r.id.Document(), RevokedCertificates: blank, RevokedCertificatesSignature: blankSig}, protocol.CodeBadRevocation},
-		"another box's whole record":                          {theirs, protocol.CodeIdentityMismatch},
-		"a list and no signature":                             {[]byte(`{"identity":"` + string(mustJSONBytes(t, r.id.Document())) + `","revoked_certificates":"eA=="}`), protocol.CodeBadRequest},
-		"a signature and no list":                             {[]byte(`{"identity":"` + string(mustJSONBytes(t, r.id.Document())) + `","revoked_certificates_signature":"eA=="}`), protocol.CodeBadRequest},
+		"a working key of the box, under its certificate":  {protocol.Revocations{Identity: r.id.Document(), RevokedCertificates: good.RevokedCertificates, RevokedCertificatesSignature: byWork}, protocol.CodeBadRevocation},
+		"another box's, with this box's document":          {protocol.Revocations{Identity: r.id.Document(), RevokedCertificates: theirs.RevokedCertificates, RevokedCertificatesSignature: theirs.RevokedCertificatesSignature}, protocol.CodeBadRevocation},
+		"the identity's signature in another namespace":    {protocol.Revocations{Identity: r.id.Document(), RevokedCertificates: good.RevokedCertificates, RevokedCertificatesSignature: asRevocation}, protocol.CodeBadRevocation},
+		"a blank line after it, which the identity signed": {protocol.Revocations{Identity: r.id.Document(), RevokedCertificates: blank, RevokedCertificatesSignature: blankSig}, protocol.CodeBadRevocation},
+		"another box's whole record":                       {theirs, protocol.CodeIdentityMismatch},
+		"a statement and no signature":                     {[]byte(`{"identity":"` + string(mustJSONBytes(t, r.id.Document())) + `","revoked_certificates":"eA=="}`), protocol.CodeBadRequest},
+		"a signature and no statement":                     {[]byte(`{"identity":"` + string(mustJSONBytes(t, r.id.Document())) + `","revoked_certificates_signature":"eA=="}`), protocol.CodeBadRequest},
 	} {
 		if got := e.do("PUT", path, bad.body, ""); got.status != 400 || got.code() != bad.code {
 			t.Errorf("%s: %d %s, want 400 %s: %s", name, got.status, got.code(), bad.code, got.body)
@@ -100,11 +99,12 @@ func TestRevokedCertificates(t *testing.T) {
 	e.want(e.do("PUT", path, protocol.Revocations{Identity: r.id.Document(), RevokedCertificates: good.RevokedCertificates, RevokedCertificatesSignature: byWork}, r.pass(2)), 400, protocol.CodeBadRevocation)
 	e.want(e.do("GET", path, nil, ""), 404, protocol.CodeNotRevoked)
 
-	// The list, with no pass: the address goes on, and anyone is shown it.
+	// The revocation, with no pass: the address goes on, and anyone is shown
+	// it.
 	e.want(e.do("PUT", path, good, ""), 200, "")
 	stored, err := e.store.Box(ctx, r.id.Address())
 	if err != nil || stored.State != Active || !bytes.Equal(stored.RevokedCerts, good.RevokedCertificates) || !bytes.Equal(stored.RevokedCertsSig, good.RevokedCertificatesSignature) {
-		t.Fatalf("the record after a list: %+v, %v", stored, err)
+		t.Fatalf("the record after a revocation of certificates: %+v, %v", stored, err)
 	}
 	shown := e.do("GET", path, nil, "")
 	e.want(shown, 200, "")
@@ -112,32 +112,32 @@ func TestRevokedCertificates(t *testing.T) {
 	if err := json.Unmarshal(shown.body, &got); err != nil {
 		t.Fatal(err)
 	}
-	if l, err := protocol.VerifyRevokedCertificates(r.id.Address(), got.Identity, got.RevokedCertificates, got.RevokedCertificatesSignature); err != nil || l.Version != 1 || !l.Revokes(1) || l.Revokes(2) {
-		t.Fatalf("what the server shows for a box with a list does not verify: %+v, %v", l, err)
+	if l, err := protocol.VerifyRevokedCertificates(r.id.Address(), got.Identity, got.RevokedCertificates, got.RevokedCertificatesSignature); err != nil || l.Through != 1 || !l.Revokes(1) || l.Revokes(2) {
+		t.Fatalf("what the server shows for a box with its certificates revoked does not verify: %+v, %v", l, err)
 	}
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(shown.body, &members); err != nil || len(members) != 3 || members["revocation"] != nil {
-		t.Errorf("the record served has %d members, want identity, the list and its signature: %s", len(members), shown.body)
+		t.Errorf("the record served has %d members, want identity, the statement and its signature: %s", len(members), shown.body)
 	}
 	e.want(e.do("GET", r.path("/identity"), nil, ""), 200, "")
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 200, "")
 	e.want(e.sendTo(other, 1, 1, r, 2), 201, "")
 	e.want(e.sendTo(r, 2, 2, other, 1), 201, "")
 
-	// The same list again changes nothing. A list is the whole list each
-	// time and the highest version stands: one that is not above the one
-	// held is refused, whatever it names.
+	// The same one again changes nothing.
 	e.want(e.do("PUT", path, good, ""), 200, "")
-	e.want(e.do("PUT", path, r.list(1, two), ""), 409, protocol.CodeConflict)
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 200, "")
 
-	// A later version names the box's current certificate. No pass of the
-	// box is taken, as an owner or as a sender, though the server took this
-	// very pass a moment ago; nobody is sent to its prekey; and nothing under
-	// that certificate is taken as a prekey, the current statement included.
+	// One through the box's current certificate. No pass of the box is
+	// taken, as an owner or as a sender, though the server took this very
+	// pass a moment ago; nobody is sent to its prekey; and nothing under that
+	// certificate is taken as a prekey, the current statement included.
 	held := r.pass(2)
 	e.want(e.do("GET", r.path("/messages"), nil, held), 200, "")
-	e.want(e.do("PUT", path, r.list(2, two), ""), 200, "")
+	e.want(e.do("PUT", path, r.certs(2), ""), 200, "")
+	// The highest stands: one through a lower serial is refused, so what was
+	// revoked stays revoked.
+	e.want(e.do("PUT", path, good, ""), 409, protocol.CodeConflict)
 	e.want(e.do("GET", r.path("/messages"), nil, held), 401, protocol.CodeUnauthorized)
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 401, protocol.CodeUnauthorized)
 	e.want(e.do("DELETE", r.path(""), nil, r.pass(2)), 401, protocol.CodeUnauthorized)
@@ -148,7 +148,7 @@ func TestRevokedCertificates(t *testing.T) {
 	r.prekeyUnder(current, 3, now.Add(time.Hour), nil)
 	e.want(put(3, 2), 400, protocol.CodeBadKey)
 	if n, _, _ := e.store.Count(ctx, r.id.Address()); n != 1 {
-		t.Errorf("the box holds %d messages after its certificate was listed, want the 1 it had", n)
+		t.Errorf("the box holds %d messages after its certificate was revoked, want the 1 it had", n)
 	}
 	e.want(e.do("GET", r.path("/identity"), nil, ""), 200, "")
 
@@ -161,19 +161,19 @@ func TestRevokedCertificates(t *testing.T) {
 	e.want(e.sendTo(r, 3, 3, other, 1), 201, "")
 	e.want(e.sendTo(other, 1, 1, r, 3), 201, "")
 
-	// A list may name a serial no certificate has yet: none is then taken at
-	// it, and the next one is.
-	e.want(e.do("PUT", path, r.list(3, two, protocol.SerialRange{First: 4, Last: 4}), ""), 200, "")
+	// One may run through a serial no certificate has yet: none at or below
+	// it is then taken, and the next one above is.
+	e.want(e.do("PUT", path, r.certs(4), ""), 200, "")
 	r.prekey(4, now.Add(protocol.MaxPrekeyLifetime), nil)
 	e.want(put(4, 4), 400, protocol.CodeBadKey)
 	r.prekey(5, now.Add(protocol.MaxPrekeyLifetime), nil)
 	e.want(put(5, 5), 200, "")
 
-	// A revocation of the address may come with a list. Everything in a
-	// body is checked before anything is changed: a good list with what is
-	// not a revocation, and a good revocation with what is not a list, each
-	// change nothing.
-	both := other.list(1, one)
+	// A revocation of the address may come with one of its certificates.
+	// Everything in a body is checked before anything is changed: a good
+	// revocation of certificates with what is not a revocation of the
+	// address, and the other way about, each change nothing.
+	both := other.certs(1)
 	if both.Revocation, err = protocol.SignRevocation(other.signer, other.id.Address()); err != nil {
 		t.Fatal(err)
 	}
@@ -186,23 +186,24 @@ func TestRevokedCertificates(t *testing.T) {
 		t.Fatalf("a body that verified in part changed the record: %+v, %v", stored, err)
 	}
 	e.want(e.do("GET", other.path("/revocations"), nil, ""), 404, protocol.CodeNotRevoked)
-	// Whole, both are kept, and both are shown. A revoked box takes no list
-	// alone.
+	// Whole, both are kept, and both are shown. A revoked box takes no
+	// revocation of its certificates alone.
 	e.want(e.do("PUT", other.path("/revocations"), both, ""), 201, "")
 	shown = e.do("GET", other.path("/revocations"), nil, "")
 	e.want(shown, 200, "")
 	members = nil
 	if err := json.Unmarshal(shown.body, &members); err != nil || len(members) != 4 {
-		t.Errorf("the record served for a revoked box that had a list has %d members, want 4: %s", len(members), shown.body)
+		t.Errorf("the record served for a revoked box that had its certificates revoked has %d members, want 4: %s", len(members), shown.body)
 	}
 	e.want(e.do("GET", other.path("/identity"), nil, ""), 410, protocol.CodeRevoked)
-	e.want(e.do("PUT", other.path("/revocations"), other.list(2, one), ""), 410, protocol.CodeRevoked)
+	e.want(e.do("PUT", other.path("/revocations"), other.certs(2), ""), 410, protocol.CodeRevoked)
 	e.want(e.do("PUT", other.path("/revocations"), both, ""), 200, "")
 }
 
-// A body that is not a list costs the server a signature check that nothing
-// has paid for, as one that is not a revocation does.
-func TestJunkListsAreLimited(t *testing.T) {
+// A body that is not a revocation of certificates costs the server a
+// signature check that nothing has paid for, as one that is not a revocation
+// of the address does.
+func TestJunkRevocationsOfCertificatesAreLimited(t *testing.T) {
 	l := relaxed()
 	l.MissesPerMinute = 2
 	e := newEnv(t, l)
@@ -213,12 +214,12 @@ func TestJunkListsAreLimited(t *testing.T) {
 	e.want(e.do("PUT", path, junk, ""), 400, protocol.CodeBadRevocation)
 	e.want(e.do("PUT", path, junk, ""), 429, protocol.CodeRateLimited)
 	e.clock.Add(protocol.MaxSkew) // long past the limit's minute
-	e.want(e.do("PUT", path, r.list(1, protocol.SerialRange{First: 1, Last: 1}), ""), 200, "")
+	e.want(e.do("PUT", path, r.certs(1), ""), 200, "")
 }
 
 // The Go client against this server: a box renews and revokes every
 // certificate before its new one. Mail it sent under the old one is refused
-// by its reader, who is shown the list and checks it; mail under the new one
+// by its reader, who is shown the revocation and checks it; mail under the new one
 // is delivered; and the box, whose working key before the renewal is now
 // worth nothing here, goes on at its address.
 func TestTheClientRevokesItsEarlierCertificates(t *testing.T) {
@@ -232,9 +233,9 @@ func TestTheClientRevokesItsEarlierCertificates(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, second := e.numbers(a.Address())
-	list, err := a.RevokeEarlier(ctx)
-	if err != nil || list == nil || second <= first || !list.Revokes(first) || list.Revokes(second) {
-		t.Fatalf("RevokeEarlier: %+v, %v", list, err)
+	certs, err := a.RevokeEarlier(ctx)
+	if err != nil || certs == nil || second <= first || !certs.Revokes(first) || certs.Revokes(second) {
+		t.Fatalf("RevokeEarlier: %+v, %v", certs, err)
 	}
 	// The working key from before: its pass is refused, and a prekey it
 	// signs at the highest serial there is, is refused too.
@@ -289,14 +290,14 @@ func TestAPrekeyAtTheHighestSerialDoesNotEndTheAddress(t *testing.T) {
 	}
 }
 
-// The list is in the box's record, so a process that starts later serves the
-// same list and refuses the same pass: nothing about a listed certificate
-// lives only in the memory of the process that took the list. AWS only: the
-// in-memory store has one process.
-func TestAListOutlivesTheProcess(t *testing.T) {
+// The revocation of certificates is in the box's record, so a process that
+// starts later serves the same one and refuses the same pass: nothing about a
+// revoked certificate lives only in the memory of the process that took the
+// revocation. AWS only: the in-memory store has one process.
+func TestARevocationOfCertificatesOutlivesTheProcess(t *testing.T) {
 	e, _ := dynamoEnv(t)
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
-	rec := r.list(1, protocol.SerialRange{First: 1, Last: 1})
+	rec := r.certs(1)
 	e.want(e.do("PUT", r.path("/revocations"), rec, ""), 200, "")
 
 	later := startDynamo(t, e.clock.Now) // its memory holds nothing of the box
@@ -313,7 +314,7 @@ func TestAListOutlivesTheProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := protocol.VerifyRevokedCertificates(r.id.Address(), got.Identity, got.RevokedCertificates, got.RevokedCertificatesSignature); err != nil || !bytes.Equal(got.RevokedCertificates, rec.RevokedCertificates) {
-		t.Fatalf("what a later process shows for a box with a list: %v", err)
+		t.Fatalf("what a later process shows for a box with its certificates revoked: %v", err)
 	}
 	e2.want(e2.do("PUT", r.path("/revocations"), rec, ""), 200, "")
 	r2.prekey(2, e.clock.Now().Add(time.Hour), nil)
@@ -324,21 +325,23 @@ func TestAListOutlivesTheProcess(t *testing.T) {
 // What memory holds of a box comes from its record two ways: from the record
 // decoded whole, when a process loads the box, and from the standing read off
 // a stream record, when another process wrote it. Both say the same of a
-// list: whether it names the box's current certificate.
-func TestARecordsStandingKnowsItsList(t *testing.T) {
+// revocation of certificates: whether it covers the box's current one.
+func TestARecordsStandingKnowsItsRevokedCertificates(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t, relaxed())
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
+	r.prekey(3, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(3), r.pass(3)), 200, "") // the box stands at certificate 3
 	for i, c := range []struct {
-		ranges []protocol.SerialRange
-		listed bool
+		through uint64
+		listed  bool
 	}{
-		{nil, false},
-		{[]protocol.SerialRange{{First: 2, Last: 9}}, false},
-		{[]protocol.SerialRange{{First: 1, Last: 1}, {First: 3, Last: 3}}, true},
+		{0, false},
+		{2, false},
+		{3, true},
 	} {
-		if c.ranges != nil {
-			e.want(e.do("PUT", r.path("/revocations"), r.list(uint64(i), c.ranges...), ""), 200, "")
+		if c.through != 0 {
+			e.want(e.do("PUT", r.path("/revocations"), r.certs(c.through), ""), 200, "")
 		}
 		b, err := e.store.Box(ctx, r.id.Address())
 		if err != nil {
@@ -351,15 +354,15 @@ func TestARecordsStandingKnowsItsList(t *testing.T) {
 			t.Errorf("case %d: the standing read off the record says listed %v at rev %d (%v), the box's own says %v at rev %d (%v), want %v, and the two the same throughout", i, st.Listed, rev, err, want.Listed, b.Rev, werr, c.listed)
 		}
 		back, err := decodeBox(it)
-		if err != nil || !bytes.Equal(back.RevokedCerts, b.RevokedCerts) || !bytes.Equal(back.RevokedCertsSig, b.RevokedCertsSig) || (c.ranges != nil) != (len(back.RevokedCerts) > 0) {
-			t.Errorf("case %d: the list does not come back from the record as it went in: %v", i, err)
+		if err != nil || !bytes.Equal(back.RevokedCerts, b.RevokedCerts) || !bytes.Equal(back.RevokedCertsSig, b.RevokedCertsSig) || (c.through != 0) != (len(back.RevokedCerts) > 0) {
+			t.Errorf("case %d: the revocation of certificates does not come back from the record as it went in: %v", i, err)
 		}
 	}
 }
 
 // A holder of a box's working key spends the box's renewals for the day, so
 // the owner's remedy is refused its renewal (rate_limited). It publishes its
-// list all the same, and from then on this server takes nothing more under
+// revocation all the same, and from then on this server takes nothing more under
 // the taken certificate, and counts none of it: the owner's renewal is taken
 // the next UTC day.
 func TestTheRemedyOutlastsATakerWhoSpentTheDaysRenewals(t *testing.T) {
@@ -388,12 +391,12 @@ func TestTheRemedyOutlastsATakerWhoSpentTheDaysRenewals(t *testing.T) {
 		e.want(thief(inUse+uint64(i)+1), 200, "")
 	}
 	r, err := a.RenewAndRevoke(ctx, protocol.Classic)
-	if err != nil || r == nil || client.Code(r.NotRenewed) != protocol.CodeRateLimited || r.List == nil || !r.List.Revokes(inUse) || r.List.Revokes(r.Below) {
+	if err != nil || r == nil || client.Code(r.NotRenewed) != protocol.CodeRateLimited || r.Revoked == nil || !r.Revoked.Revokes(inUse) || r.Revoked.Revokes(r.Below) {
 		t.Fatalf("the owner's remedy after the taker's renewals: %+v, %v", r, err)
 	}
 	e.want(thief(inUse+100), 400, protocol.CodeBadKey)
 	if p, cert := e.numbers(a.Address()); cert != inUse || p != inUse+uint64(l.RenewalsPerDay) {
-		t.Fatalf("the record after the list: prekey %d under certificate %d", p, cert)
+		t.Fatalf("the record after the revocation: prekey %d under certificate %d", p, cert)
 	}
 	e.clock.Add(24 * time.Hour)
 	if _, err := a.Rekey(ctx, protocol.Classic); err != nil {

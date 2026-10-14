@@ -359,17 +359,18 @@ func TestARevocationRetriedAfterAFailedDeleteDeletes(t *testing.T) {
 	}
 }
 
-// A revocation of the address may come with the list the box already holds:
-// the record a server shows for an address carries both. The list is nothing
-// new, and the revocation is taken all the same. Every part of a body is
-// checked whatever the box holds: the revocation it holds, with something
-// beside it that is not a list, is refused.
-func TestARevocationComesWithTheListHeld(t *testing.T) {
+// A revocation of the address may come with the revocation of its
+// certificates the box already holds: the record a server shows for an
+// address carries both. That is nothing new, and the revocation of the
+// address is taken all the same. Every part of a body is checked whatever the
+// box holds: the revocation it holds, with something beside it that is not a
+// revocation of certificates, is refused.
+func TestARevocationComesWithTheCertificatesHeld(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t, relaxed())
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
 	path := r.path("/revocations")
-	both := r.list(1, protocol.SerialRange{First: 7, Last: 7})
+	both := r.certs(7)
 	e.want(e.do("PUT", path, both, ""), 200, "")
 	var err error
 	if both.Revocation, err = protocol.SignRevocation(r.signer, r.id.Address()); err != nil {
@@ -377,9 +378,9 @@ func TestARevocationComesWithTheListHeld(t *testing.T) {
 	}
 	e.want(e.do("PUT", path, both, ""), 201, "")
 	if stored, err := e.store.Box(ctx, r.id.Address()); err != nil || stored.State != Revoked || !bytes.Equal(stored.Revocation, both.Revocation) {
-		t.Fatalf("a revocation that came with the list already held was not taken: %+v, %v", stored, err)
+		t.Fatalf("a revocation that came with the certificates' already held was not taken: %+v, %v", stored, err)
 	}
 	junk := both
-	junk.RevokedCertificates, junk.RevokedCertificatesSignature = []byte("not a list"), []byte("not a signature")
+	junk.RevokedCertificates, junk.RevokedCertificatesSignature = []byte("not a revocation"), []byte("not a signature")
 	e.want(e.do("PUT", path, junk, ""), 400, protocol.CodeBadRevocation)
 }

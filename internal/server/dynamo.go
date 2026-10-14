@@ -300,8 +300,9 @@ func boxState(b *Box) map[string]types.AttributeValue {
 	if len(b.Revocation) > 0 {
 		st["revocation"] = bin(b.Revocation)
 	}
-	// The identity's list of revoked certificates and its signature: absent
-	// until one is published, then replaced whole by each later version.
+	// The identity's revocation of its certificates and its signature: absent
+	// until one is published, then replaced whole by one through a higher
+	// serial.
 	if len(b.RevokedCerts) > 0 {
 		st["revoked_certs"] = bin(b.RevokedCerts)
 		st["revoked_certs_sig"] = bin(b.RevokedCertsSig)

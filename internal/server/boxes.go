@@ -251,10 +251,11 @@ func (s *Server) identity(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// What to do about a body that is not a revocation, or not a list.
+// What to do about a body that is not a revocation of the address, or not
+// one of its certificates.
 const (
 	hintRevocation   = "a revocation is the identity key's own signature over its fixed statement, with the identity document: irongall revocation makes the record"
-	hintRevokedCerts = "a list of revoked certificates is signed by the identity key itself, and sent with the identity document: irongall rekey --revoke-earlier makes and publishes one"
+	hintRevokedCerts = "a revocation of certificates is signed by the identity key itself, and sent with the identity document: irongall rekey --revoke-earlier makes and publishes one"
 )
 
 // revoke is PUT /v1/<address>/revocations: the identity document with what
@@ -269,11 +270,12 @@ const (
 // (revocations). A second revocation of a revoked box is answered 200 and
 // changes nothing.
 //
-// A list of revoked certificates (PROTOCOL.md §6.3a): the address goes on.
-// It is the whole list each time, and the highest version stands: a list
-// that is not above the one held is refused, and the same list again changes
-// nothing. From then on no pass and no prekey statement under a listed
-// certificate is taken, and nobody is told to encrypt to a prekey under one.
+// A revocation of certificates (PROTOCOL.md §6.3a): the address goes on.
+// It revokes every certificate through a serial, and the highest stands: one
+// through a lower serial than the one held is refused, and the same one again
+// changes nothing. From then on no pass and no prekey statement under a
+// revoked certificate is taken, and nobody is told to encrypt to a prekey
+// under one.
 //
 // A body may carry both. Everything in it is checked before anything is
 // changed. A body that does not verify counts against the caller's address
@@ -291,8 +293,8 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	if err := required("identity", req.Identity); err != nil {
 		return err
 	}
-	hasList := req.RevokedCertificates != nil || req.RevokedCertificatesSignature != nil
-	if hasList {
+	hasCerts := req.RevokedCertificates != nil || req.RevokedCertificatesSignature != nil
+	if hasCerts {
 		err = required("revoked_certificates", req.RevokedCertificates, "revoked_certificates_signature", req.RevokedCertificatesSignature)
 	} else {
 		err = required("revocation", req.Revocation)
@@ -314,11 +316,11 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	if ok, wait := s.misses.ready(ip, now); !ok {
 		return rateLimited(wait, "too many requests from this address that named no box or carried no revocation")
 	}
-	var list *protocol.RevokedCertificates
-	if hasList {
-		if list, err = protocol.VerifyRevokedCertificates(h, req.Identity, req.RevokedCertificates, req.RevokedCertificatesSignature); err != nil {
+	var certs *protocol.RevokedCertificates
+	if hasCerts {
+		if certs, err = protocol.VerifyRevokedCertificates(h, req.Identity, req.RevokedCertificates, req.RevokedCertificatesSignature); err != nil {
 			s.misses.take(ip, now)
-			return fail(protocol.CodeBadRevocation, hintRevokedCerts, "this is not a list of this address's revoked certificates")
+			return fail(protocol.CodeBadRevocation, hintRevokedCerts, "this is not a revocation of this address's certificates")
 		}
 	}
 	if req.Revocation != nil {
@@ -327,20 +329,20 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 			return fail(protocol.CodeBadRevocation, hintRevocation, "this is not a revocation of this address")
 		}
 	}
-	// A revoked box takes no list: its address is ended, and the list says
-	// which of its certificates still stand.
+	// A revoked box takes no revocation of its certificates: its address is
+	// ended, and that says which of its certificates still stand.
 	if b.State == Revoked && req.Revocation == nil {
 		return revoked()
 	}
 	status, changed := http.StatusOK, false
-	if list != nil && b.State != Revoked && !bytes.Equal(req.RevokedCertificates, b.RevokedCerts) {
+	if certs != nil && b.State != Revoked && !bytes.Equal(req.RevokedCertificates, b.RevokedCerts) {
 		if len(b.RevokedCerts) > 0 {
 			held, err := protocol.ParseRevokedCertificates(b.RevokedCerts)
 			if err != nil {
-				return fmt.Errorf("the stored list of revoked certificates: %w", err)
+				return fmt.Errorf("the stored revocation of certificates: %w", err)
 			}
-			if list.Version <= held.Version {
-				return fail(protocol.CodeConflict, "sign the whole list again under a version above the one held", "a list of version %d is held, and a later one must be above it", held.Version)
+			if certs.Through <= held.Through {
+				return fail(protocol.CodeConflict, "GET the same path for the one held: it covers every certificate yours does", "a revocation of this address's certificates through serial %d is held, and nothing revokes fewer", held.Through)
 			}
 		}
 		b.RevokedCerts, b.RevokedCertsSig, changed = req.RevokedCertificates, req.RevokedCertificatesSignature, true
@@ -384,8 +386,8 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 }
 
 // revocations is GET /v1/<address>/revocations: what this server holds that
-// the address's identity signed about it, which is its revocation, its list
-// of revoked certificates, both or neither. It asks for no pass and tells
+// the address's identity signed about it, which is its revocation, its
+// revocation of its certificates, both or neither. It asks for no pass and tells
 // nothing a 410 or a refused pass does not already tell; what it adds is the
 // proof.
 func (s *Server) revocations(w http.ResponseWriter, r *http.Request) error {

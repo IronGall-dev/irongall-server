@@ -58,18 +58,18 @@ type Box struct {
 	// is Revoked. With Identity it proves itself, so nobody takes this
 	// server's word that the box is revoked.
 	Revocation []byte
-	// RevokedCerts is the identity's newest list of the certificates it has
-	// revoked, exactly as it signed it, and RevokedCertsSig its signature
+	// RevokedCerts is the identity's highest revocation of its certificates,
+	// exactly as it signed it, and RevokedCertsSig its signature
 	// (PROTOCOL.md §6.3a): nil until one is published. The address goes on.
 	// Served with Identity to whoever asks, it proves itself as Revocation
-	// does. It was verified when it was stored, and a later version replaces
-	// it whole.
+	// does. It was verified when it was stored, and only one through a higher
+	// serial replaces it.
 	RevokedCerts    []byte
 	RevokedCertsSig []byte
 }
 
 // listed reports whether the box's identity has revoked the certificate of
-// this serial, by the list on record. A box with no list has revoked none.
+// this serial, by the revocation on record. A box with none has revoked none.
 func (b *Box) listed(serial uint64) (bool, error) {
 	if len(b.RevokedCerts) == 0 {
 		return false, nil
@@ -77,15 +77,15 @@ func (b *Box) listed(serial uint64) (bool, error) {
 	return listNames(b.RevokedCerts, serial)
 }
 
-// listNames reports whether a stored list of revoked certificates names a
-// serial. The list was verified when it was stored, so one that does not
-// parse is a fault of the record, and no answer.
-func listNames(list []byte, serial uint64) (bool, error) {
-	l, err := protocol.ParseRevokedCertificates(list)
+// listNames reports whether a stored revocation of certificates covers a
+// serial. It was verified when it was stored, so one that does not parse is
+// a fault of the record, and no answer.
+func listNames(statement []byte, serial uint64) (bool, error) {
+	r, err := protocol.ParseRevokedCertificates(statement)
 	if err != nil {
-		return false, fmt.Errorf("the stored list of revoked certificates: %w", err)
+		return false, fmt.Errorf("the stored revocation of certificates: %w", err)
 	}
-	return l.Revokes(serial), nil
+	return r.Revokes(serial), nil
 }
 
 // Account is an account's record (PROTOCOL.md §6.5). An account pays,
@@ -132,9 +132,9 @@ type Standing struct {
 	State State
 	Key   string   // the identity's key in SSH wire form, of whatever type: what line 2 of its document holds
 	Cert  [32]byte // Box.Cert
-	// Listed is true while the box's current certificate is on its identity's
-	// list of revoked certificates (PROTOCOL.md §6.3a): no pass of the box is
-	// taken until it publishes a prekey under a new certificate.
+	// Listed is true while the box's current certificate is one its identity
+	// has revoked (PROTOCOL.md §6.3a): no pass of the box is taken until it
+	// publishes a prekey under a new certificate.
 	Listed bool
 }
 

@@ -258,10 +258,10 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
   lock/                      one consumer per box: a directory, with the Go client's flocked lock/pid inside
   etag                       the poll ETag (the Go client)
   revoked.sig                this box's own revocation, once it has met one that verifies: the box is finished
-  revoked-certs.json         this box's own list of revoked certificates, once it has published one: the record that carries it, one line of JSON
+  revoked-certs.json         this box's own revocation of its certificates, once it has published one: the record that carries it, one line of JSON
 ```
 
-**`irongall.sh` uses this layout**, with no `etag`, with `peers/<addr>/signers` beside each pinned identity, and with scratch files in the box's root that mean nothing between commands (`*.json`, `msg.*`, `self.*`, `new.doc`, `body.txt`); neither client writes a revocation of its own box unasked, and each keeps one it has verified (`peers/<addr>/revoke.sig`), and the newest list of a peer's revoked certificates it has verified (`peers/<addr>/revoked-certs.json`, the record that carries it). And `test/interop.sh` runs one box with both clients.
+**`irongall.sh` uses this layout**, with no `etag`, with `peers/<addr>/signers` beside each pinned identity, and with scratch files in the box's root that mean nothing between commands (`*.json`, `msg.*`, `self.*`, `new.doc`, `body.txt`); neither client writes a revocation of its own box unasked, and each keeps one it has verified (`peers/<addr>/revoke.sig`), and the highest revocation of a peer's certificates it has verified (`peers/<addr>/revoked-certs.json`, the record that carries it). And `test/interop.sh` runs one box with both clients.
 
 | Client | What it is | Built on |
 |---|---|---|
@@ -297,7 +297,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
 7. **Say what needs a look.** Refused mail and a failed renewal go to stderr; `recv` exits 3 after a renewal that failed and 0 after refused mail, which any sender can cause; `irongall status` reads the box's own files and lists what needs attention (the client README has the exit statuses). This step is the Go client's: the script has no `status`, and its `recv` never renews.
 
 **Conformance kit:**
-- `testdata/vectors/` (built, stock tools): identity to address, certificates, prekey statements and signatures, a pass, a message and what is encrypted in it, revocation, lists of revoked certificates, envelopes, and the refusals of each; `irongall.sh` gets the Go client's verdict on every one (`sh/sh_test.go`). Still to add: problem+json bodies.
+- `testdata/vectors/` (built, stock tools): identity to address, certificates, prekey statements and signatures, a pass, a message and what is encrypted in it, revocations of an address and of certificates, envelopes, and the refusals of each; `irongall.sh` gets the Go client's verdict on every one (`sh/sh_test.go`). Still to add: problem+json bodies.
 - **The forging-operator tests are PUBLIC, in irongall-client**: `client/forgery_test.go` and `client/failure_test.go` run the Go client against `internal/fakeserver`, an honest in-memory server a middleware turns hostile, with `go test ./...` and nothing to set up. This repo keeps the tests of what the real server enforces.
 - `irongalld serve --dev` (built): an in-memory store with no AWS, the real server's logic. `test/interop.sh` runs `irongall.sh` and the Go client against it.
 
