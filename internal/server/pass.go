@@ -118,6 +118,10 @@ const (
 // and otherwise nil.
 func (s *Server) checkPass(r *http.Request, a protocol.Address, key string, cert [32]byte, p *protocol.Pass) error {
 	auth := r.Header.Get("Authorization")
+	if len(auth) > protocol.MaxPassAuthorization {
+		// Longer than any pass can be: refused before it is hashed or parsed.
+		return unauthorized(hintPass, "no pass, or not a pass")
+	}
 	now := s.now()
 	sum := sha256.Sum256([]byte(auth))
 	if s.passes.has(a, sum, cert, now) {

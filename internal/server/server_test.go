@@ -245,6 +245,39 @@ func (r *raw) register(d time.Duration) *raw {
 	return r
 }
 
+// A signature is at most protocol.MaxSignature bytes as it arrives (PROTOCOL.md
+// §3), what follows its END line included, and is kept and served as it was
+// sent (§4.5). A pass is at most protocol.MaxPassAuthorization.
+func TestASignatureIsBounded(t *testing.T) {
+	e := newEnv(t, relaxed())
+	now := e.clock.Now()
+	pad := func(sig []byte, to int) []byte {
+		return append(append([]byte{}, sig...), bytes.Repeat([]byte{'.'}, to-len(sig))...)
+	}
+
+	r := e.raw()
+	r.prekey(1, now.Add(protocol.PrekeyLifetime), nil)
+	r.sig[1] = pad(r.sig[1], protocol.MaxSignature)
+	e.want(e.do("PUT", r.path(""), r.registration(1), r.pass(1)), 201, "")
+	var got protocol.IdentityResponse
+	if err := json.Unmarshal(e.do("GET", r.path("/identity"), nil, "").body, &got); err != nil || !bytes.Equal(got.PrekeySignature, r.sig[1]) {
+		t.Errorf("the signature is not served as it was sent: %v", err)
+	}
+
+	over := e.raw()
+	over.prekey(1, now.Add(protocol.PrekeyLifetime), nil)
+	pass := over.pass(1)
+	over.sig[1] = pad(over.sig[1], protocol.MaxSignature+1)
+	e.want(e.do("PUT", over.path(""), over.registration(1), pass), 400, protocol.CodeBadKey)
+
+	// A renewal is held to it too.
+	r.prekey(2, now.Add(protocol.PrekeyLifetime), nil)
+	r.sig[2] = pad(r.sig[2], protocol.MaxSignature+1)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(2), r.pass(2)), 400, protocol.CodeBadKey)
+
+	e.want(e.do("GET", r.path("/messages"), nil, strings.Repeat("x", protocol.MaxPassAuthorization+1)), 401, protocol.CodeUnauthorized)
+}
+
 func TestRegistration(t *testing.T) {
 	e := newEnv(t, relaxed())
 	now := e.clock.Now()

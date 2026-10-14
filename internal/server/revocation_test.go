@@ -64,6 +64,7 @@ func TestRevocation(t *testing.T) {
 		"B's revocation, with A's document":         {protocol.Revocations{Identity: docA, Revocation: ofB.Revocation}, protocol.CodeBadRevocation},
 		"a working key of A, as a prekey statement": {protocol.Revocations{Identity: docA, Revocation: sign(a, a.Address(), protocol.PrekeyNamespace(a.Address()))}, protocol.CodeBadRevocation},
 		"not a signature":                           {protocol.Revocations{Identity: docA, Revocation: []byte("revoke it")}, protocol.CodeBadRevocation},
+		"A's own, over the bound":                   {protocol.Revocations{Identity: docA, Revocation: append(append([]byte{}, rec.Revocation...), bytes.Repeat([]byte{'.'}, protocol.MaxSignature+1-len(rec.Revocation))...)}, protocol.CodeBadRevocation},
 		"B's document":                              {protocol.Revocations{Identity: docB, Revocation: rec.Revocation}, protocol.CodeIdentityMismatch},
 		"B's whole record":                          {ofB, protocol.CodeIdentityMismatch},
 		"no signature":                              {[]byte(`{"identity":"` + string(mustJSONBytes(t, docA)) + `"}`), protocol.CodeBadRequest},
