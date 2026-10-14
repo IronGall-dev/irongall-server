@@ -356,3 +356,50 @@ func TestARecordsStandingKnowsItsList(t *testing.T) {
 		}
 	}
 }
+
+// A holder of a box's working key spends the box's renewals for the day, so
+// the owner's remedy is refused its renewal (rate_limited). It publishes its
+// list all the same, and from then on this server takes nothing more under
+// the taken certificate, and counts none of it: the owner's renewal is taken
+// the next UTC day.
+func TestTheRemedyOutlastsATakerWhoSpentTheDaysRenewals(t *testing.T) {
+	ctx := context.Background()
+	l := relaxed()
+	l.RenewalsPerDay = DefaultLimits().RenewalsPerDay
+	e := newEnv(t, l)
+	now := e.clock.Now()
+	e.clock.Add(now.Truncate(24 * time.Hour).Add(25 * time.Hour).Sub(now)) // 01:00 UTC, far from a day's end
+	a := e.box(protocol.Classic)
+	taken := worker(t, a)
+	_, inUse := e.numbers(a.Address())
+	thief := func(serial uint64) reply {
+		key, err := age.GenerateX25519Identity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := &protocol.Prekey{Address: a.Address(), Serial: serial, Key: key.Recipient().String(), NotAfter: e.clock.Now().Add(time.Hour)}
+		sig, err := protocol.Sign(taken, p.Statement(), protocol.PrekeyNamespace(a.Address()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e.do("PUT", "/v1/"+a.Address().String()+"/prekey", protocol.PrekeyRequest{Prekey: p.Statement(), PrekeySignature: sig}, e.passFor(taken, a.Address(), e.name()))
+	}
+	for i := range l.RenewalsPerDay {
+		e.want(thief(inUse+uint64(i)+1), 200, "")
+	}
+	r, err := a.RenewAndRevoke(ctx, protocol.Classic)
+	if err != nil || r == nil || client.Code(r.NotRenewed) != protocol.CodeRateLimited || r.List == nil || !r.List.Revokes(inUse) || r.List.Revokes(r.Below) {
+		t.Fatalf("the owner's remedy after the taker's renewals: %+v, %v", r, err)
+	}
+	e.want(thief(inUse+100), 400, protocol.CodeBadKey)
+	if p, cert := e.numbers(a.Address()); cert != inUse || p != inUse+uint64(l.RenewalsPerDay) {
+		t.Fatalf("the record after the list: prekey %d under certificate %d", p, cert)
+	}
+	e.clock.Add(24 * time.Hour)
+	if _, err := a.Rekey(ctx, protocol.Classic); err != nil {
+		t.Fatalf("the owner's renewal the next UTC day: %v", err)
+	}
+	if _, cert := e.numbers(a.Address()); cert != r.Below {
+		t.Fatalf("the box stands at certificate %d, not the one the remedy made, %d", cert, r.Below)
+	}
+}
