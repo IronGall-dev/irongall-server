@@ -227,11 +227,13 @@ func TestTheClientRevokesItsEarlierCertificates(t *testing.T) {
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	send(t, a, b, "under A's first certificate")
 	taken, old := worker(t, a), e.pass(a)
+	_, first := e.numbers(a.Address())
 	if _, err := a.Rekey(ctx, protocol.Classic); err != nil {
 		t.Fatal(err)
 	}
+	_, second := e.numbers(a.Address())
 	list, err := a.RevokeEarlier(ctx)
-	if err != nil || list == nil || !list.Revokes(1) || list.Revokes(2) {
+	if err != nil || list == nil || second <= first || !list.Revokes(first) || list.Revokes(second) {
 		t.Fatalf("RevokeEarlier: %+v, %v", list, err)
 	}
 	// The working key from before: its pass is refused, and a prekey it
@@ -264,6 +266,7 @@ func TestAPrekeyAtTheHighestSerialDoesNotEndTheAddress(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	taken := worker(t, a)
+	_, first := e.numbers(a.Address())
 	key, _ := age.GenerateX25519Identity()
 	top := &protocol.Prekey{Address: a.Address(), Serial: protocol.MaxSerial, Key: key.Recipient().String(), NotAfter: e.clock.Now().Add(time.Hour)}
 	sig, err := protocol.Sign(taken, top.Statement(), protocol.PrekeyNamespace(a.Address()))
@@ -276,7 +279,7 @@ func TestAPrekeyAtTheHighestSerialDoesNotEndTheAddress(t *testing.T) {
 		t.Fatalf("a renewal after a prekey at the highest serial: %v", err)
 	}
 	stored, err := e.store.Box(ctx, a.Address())
-	if err != nil || stored.CertSerial != 2 || stored.Prekey.Serial != 2 {
+	if err != nil || stored.CertSerial <= first || stored.Prekey.Serial != stored.CertSerial || stored.Prekey.Serial >= protocol.MaxSerial {
 		t.Fatalf("the record after the renewal: certificate %d, prekey %d, %v", stored.CertSerial, stored.Prekey.Serial, err)
 	}
 	send(t, b, a, "to the box's own prekey again")

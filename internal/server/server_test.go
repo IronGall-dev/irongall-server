@@ -106,6 +106,18 @@ func (e *env) passFor(signer ssh.Signer, a protocol.Address, name string) string
 	return auth
 }
 
+// numbers returns the serials a box stands at in the store: its prekey's and
+// its certificate's. A client takes them from its clock, so a test reads
+// them and never assumes one.
+func (e *env) numbers(a protocol.Address) (prekey, cert uint64) {
+	e.t.Helper()
+	b, err := e.store.Box(context.Background(), a)
+	if err != nil || b == nil {
+		e.t.Fatalf("the box's record: %v", err)
+	}
+	return b.Prekey.Serial, b.CertSerial
+}
+
 // worker loads the working key of a client's box, under its certificate:
 // the one made with the prekey it published last.
 func worker(t *testing.T, b *client.Box) ssh.Signer {
@@ -570,8 +582,8 @@ func TestSendPipeline(t *testing.T) {
 		}
 		_, _ = io.WriteString(w, `{"v":1}`)
 		_ = w.Close()
-		one := uint64(1)
-		return protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: ct.Bytes()}
+		serial, under := e.numbers(b.Address())
+		return protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &under, Ciphertext: ct.Bytes()}
 	}
 	to := "/v1/" + b.Address().String()
 	ok := seal(pqRecipient)
@@ -708,8 +720,8 @@ func TestGreaseIsIgnored(t *testing.T) {
 	}
 	_, _ = io.WriteString(w, "x")
 	_ = w.Close()
-	one := uint64(1)
-	req := protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: ct.Bytes()}
+	serial, under := e.numbers(b.Address())
+	req := protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &under, Ciphertext: ct.Bytes()}
 	e.want(e.do("POST", "/v1/"+b.Address().String(), req, e.pass(a)), 201, "")
 }
 
@@ -798,8 +810,9 @@ func TestSendNamesTheCurrentPrekey(t *testing.T) {
 		return protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &serial, Ciphertext: ct.Bytes()}
 	}
 	to := "/v1/" + b.Address().String()
-	e.want(e.do("POST", to, sealOld("named the retired serial", 1), e.pass(a)), 409, protocol.CodeStalePrekey)
-	e.want(e.do("POST", to, sealOld("sealed to the retired key", 2), e.pass(a)), 400, protocol.CodeWrongRecipientType)
+	current, _ := e.numbers(b.Address())
+	e.want(e.do("POST", to, sealOld("named the retired serial", old.Prekey.Serial), e.pass(a)), 409, protocol.CodeStalePrekey)
+	e.want(e.do("POST", to, sealOld("sealed to the retired key", current), e.pass(a)), 400, protocol.CodeWrongRecipientType)
 	send(t, a, b, "after the switch") // to the post-quantum key
 	if res := receive(t, b); len(res.Delivered) != 1 {
 		t.Fatalf("delivered %d, want 1", len(res.Delivered))
@@ -818,10 +831,13 @@ func TestRenewalLimits(t *testing.T) {
 	now := e.clock.Now()
 	e.clock.Add(now.Truncate(24 * time.Hour).Add(25 * time.Hour).Sub(now)) // 01:00 UTC, far from a day's end
 	b := e.box(protocol.Classic)
+	var renewed []uint64
 	for i := range 3 {
-		if _, err := b.Rekey(ctx, ""); err != nil {
+		p, err := b.Rekey(ctx, "")
+		if err != nil {
 			t.Fatalf("renewal %d: %v", i+1, err)
 		}
+		renewed = append(renewed, p.Serial)
 	}
 	_, err := b.Rekey(ctx, "")
 	var ae *client.APIError
@@ -833,7 +849,8 @@ func TestRenewalLimits(t *testing.T) {
 	if len(cur.Retired) != 2 {
 		t.Fatalf("the record keeps %d retired prekeys, want 2", len(cur.Retired))
 	}
-	for i, serial := range []string{"2", "3"} {
+	for i, n := range renewed[:2] { // the first two renewals: the third is current
+		serial := strconv.FormatUint(n, 10)
 		st, err := os.ReadFile(filepath.Join(b.Dir(), "prekeys", serial+".txt"))
 		if err != nil {
 			t.Fatal(err)

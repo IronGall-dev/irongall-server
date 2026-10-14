@@ -99,13 +99,14 @@ The key is of a type the protocol defines, in that type's one exact form, and pa
 - **Nobody can vouch for when a signature was made,** so a certificate must be valid when it is checked and must outlast what it signed: at most 66 days, twice the 33 days mail may wait, and a client signs no mail with 33 days or less left.
 - **Every check of a time is exact at the checker's own clock, and whoever makes a time-limited thing leaves an hour of room.** A client dates a certificate from an hour before it is made and asks for a day under its ceiling, a server takes a prekey statement that ends up to an hour past the 33 days a client asks for, and a reader takes a `sent_at` up to an hour ahead. The hour is the width of the clocks the pass admits: a mailbox is taken while its clock is less than 10 minutes behind the server's or up to 50 ahead, and one further off is refused at its pass, before it fetches mail it would judge by that clock. A client posts no envelope dated ahead of its own clock, reports how far its clock is from the server's as the server's word, and never adopts it (`PROTOCOL.md` §0; the systems it follows are in `PRECEDENTS.md` § Clocks).
 - **Both clients make a new working key, with a new certificate, each time they make a new prekey.** The server keeps the serial of a mailbox's current certificate and takes nothing under an older one.
+- **A client takes a certificate's serial from its own clock,** in seconds, or one above the highest serial it knows of when the clock gives nothing higher, and the prekey made with it shares the number. An identity is a key and keeps no record of what it signed: a mailbox restored from its identity alone knows only what the server shows it. By the clock its next certificate is above every one made before, so a list of the serials below it names them all, one a lost machine made and never published among them. A verifier never reads a serial as a time: it compares two. It rests on the clock of whoever holds the identity (`PROTOCOL.md` §2b; `PRECEDENTS.md` § 2a).
 
 **Prekey statement** — five lines, signed by the working key under its certificate, with the SSHSIG namespace `irongall-prekey-v1:<address>`:
 
 ```
 irongall-prekey-v1
 <address>
-<serial: strictly increasing, first = 1>
+<serial: strictly increasing under one certificate; a client gives it its certificate's number>
 <age1pq1… (post-quantum, default) | age1… (X25519 only, `--no-pq`)>
 <not_after: RFC 3339 UTC; a client asks for 33 days, and a server takes up to an hour more>
 ```

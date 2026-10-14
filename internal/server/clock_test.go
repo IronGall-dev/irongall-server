@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -152,7 +153,8 @@ func TestABoxWhoseClockGoesBackFetchesNothing(t *testing.T) {
 	}
 	// Control: at that clock the mail would be refused, so the stop above is
 	// what kept it. The certificate it is signed under has not begun.
-	sig, rerr := os.ReadFile(filepath.Join(sender.Dir(), "prekeys", "1.txt.sig")) //nolint:gosec // a test's own file
+	first, _ := e.numbers(sender.Address())
+	sig, rerr := os.ReadFile(filepath.Join(sender.Dir(), "prekeys", strconv.FormatUint(first, 10)+".txt.sig")) //nolint:gosec // a test's own file
 	if rerr != nil {
 		t.Fatal(rerr)
 	}

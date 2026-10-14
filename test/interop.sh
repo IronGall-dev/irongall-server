@@ -223,13 +223,15 @@ out=$(gocli "$W3" recv 2>&1); [ $? -eq 0 ] && [ "$(grep -c ': certificate_revoke
   && cmp -s <(kept "$W2/peers/$W1A/revoked-certs.json") <(kept "$W3/peers/$W1A/revoked-certs.json") && [ -s "$W3/peers/$W1A/revoked-certs.json" ] \
   && ok "the Go client does the same, and takes the recipe box's mail under a certificate nobody revoked" || bad "Go recv after the list: $out"
 recipe "$W2" "ig_send $W1L '$work/body8'" 2> "$work/err" && gocli "$W3" send "$W1L" < "$work/body8" > /dev/null 2>> "$work/err" && out=$(gocli "$W1" recv 2>&1) && [ "$(grep -c '"body"' <<< "$out")" = 2 ] \
-  && [ "$(cat "$W2/peers/$W1A/serial" "$W2/peers/$W1A/cert-serial" | tr '\n' ' ')" = "2 2 " ] \
+  && [ "$(cat "$W2/peers/$W1A/serial" "$W2/peers/$W1A/cert-serial" | tr '\n' ' ')" = "$(cat "$W1/serial") $(cat "$W1/serial") " ] \
   && ok "both clients write to the box at its second certificate, naming its prekey by both serials" || bad "sends to the renewed box: $(cat "$work/err") $out"
 # A list made with ssh-keygen alone: the recipe makes none, and its box's identity signs like any other.
 mklist(){ printf 'irongall-revoked-certs-v1\n%s\n%s\n%s\n' "$W2A" "$2" "$3" > "$work/$1.list" && ssh-keygen -q -Y sign -n "irongall-revoked-certs-v1:$W2A" -f "$4" < "$work/$1.list" > "$work/$1.sig" \
   && jq -cn --arg i "$(base64 < "$W2/identity.doc" | tr -d '\n')" --arg l "$(base64 < "$work/$1.list" | tr -d '\n')" --arg g "$(base64 < "$work/$1.sig" | tr -d '\n')" '{identity:$i, revoked_certificates:$l, revoked_certificates_signature:$g}' > "$work/$1.json"; }   # <name> <version> <line> <key>
+w2a=$(cat "$W2/serial")   # a box takes each number from its clock: the recipe box's first, and after its renewal its second
 recipe "$W2" "ig_send $W3L '$work/body8'" 2> "$work/err" && recipe "$W2" "ig_rekey $(nopq_arg)" 2>> "$work/err" && recipe "$W2" "ig_send $W3L '$work/body8b'" 2>> "$work/err" || bad "revoked certificates: the recipe's renewal: $(cat "$work/err")"
-mklist bywork 1 1 "$W2/work/2-cert.pub" && mklist one 1 1 "$W2/identity" && mklist same 1 1-2 "$W2/identity" && mklist two 2 1-2 "$W2/identity" || bad "revoked certificates: ssh-keygen did not sign a list"
+w2b=$(cat "$W2/serial"); [ "$w2b" -gt "$w2a" ] || bad "revoked certificates: the recipe's renewal took no later number: $w2a, then $w2b"
+mklist bywork 1 "$w2a" "$W2/work/$w2b-cert.pub" && mklist one 1 "$w2a" "$W2/identity" && mklist same 1 "$w2a-$w2b" "$W2/identity" && mklist two 2 "$w2a-$w2b" "$W2/identity" || bad "revoked certificates: ssh-keygen did not sign a list"
 [ "$(put "$work/bywork.json" "$W2A")" = 400 ] && [ "$(jq -r .code "$work/put.json")" = bad_revocation ] && [ "$(put "$work/one.json" "$W3A")" = 400 ] && [ "$(jq -r .code "$work/put.json")" = identity_mismatch ] \
   && [ "$(curl -s "$IG_BASE/v1/$W2A/revocations" | jq -r .code)" = not_revoked ] \
   && ok "the server refuses a list the box's working key signed, and one sent for another address: 400 bad_revocation, 400 identity_mismatch" || bad "junk lists: $(cat "$work/put.json")"
