@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/IronGall-dev/irongall-client/client"
 	"github.com/IronGall-dev/irongall-client/protocol"
@@ -236,4 +239,141 @@ func TestARevocationOutlivesTheProcess(t *testing.T) {
 		t.Fatalf("what a later process shows for a revoked box: %v", err)
 	}
 	e2.want(e2.do("PUT", revocationPath(a.Address()), rec, ""), 200, "")
+}
+
+// countingDeletes wraps a Store and counts DeleteMessages, the read of the
+// messages table a revocation draws. Its next fail calls fail before the
+// store is asked, as a store that is down for a moment does.
+type countingDeletes struct {
+	Store
+	mu   sync.Mutex
+	n    int
+	fail int
+}
+
+func (s *countingDeletes) DeleteMessages(ctx context.Context, a protocol.Address) error {
+	s.mu.Lock()
+	s.n++
+	failing := s.fail > 0
+	if failing {
+		s.fail--
+	}
+	s.mu.Unlock()
+	if failing {
+		return errors.New("the delete failed")
+	}
+	return s.Store.DeleteMessages(ctx, a)
+}
+
+func (s *countingDeletes) deletes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.n
+}
+
+// countingEnv is an env whose store counts DeleteMessages.
+func countingEnv(t *testing.T) (*env, *countingDeletes) {
+	t.Helper()
+	keys, err := NewDevKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk := &clock{t: time.Now().UTC().Truncate(time.Second)}
+	inner, ready := newTestStore(t, clk.Now)
+	cs := &countingDeletes{Store: inner}
+	e := &env{t: t, clock: clk, keys: keys, store: cs}
+	e.server = New(Config{Store: cs, Keys: keys, Limits: relaxed(), Now: clk.Now, Ready: ready})
+	e.srv = httptest.NewServer(e.server.Handler())
+	t.Cleanup(e.srv.Close)
+	return e, cs
+}
+
+// A box's own revocation is public: whoever holds it may send it back, as it
+// is or as the same signature in other bytes that verify. Each is checked
+// and answered 200, and none draws another read of the box's messages: the
+// box holds none.
+func TestASecondRevocationReadsNoMail(t *testing.T) {
+	e, cs := countingEnv(t)
+	a := e.box(protocol.Classic)
+	rec := record(t, a)
+	path := revocationPath(a.Address())
+
+	// The first revocation ends the box and clears its mail: one read.
+	e.want(e.do("PUT", path, rec, ""), 201, "")
+	if n := cs.deletes(); n != 1 {
+		t.Fatalf("a revocation read the messages table %d times, want 1", n)
+	}
+	// The same revocation again changes nothing, and reads nothing.
+	e.want(e.do("PUT", path, rec, ""), 200, "")
+	if n := cs.deletes(); n != 1 {
+		t.Errorf("a resent revocation read the messages table %d times, want 1", n)
+	}
+	// Nor does the same signature in other bytes: a line feed after its
+	// armour, which anyone can add.
+	other := *rec
+	other.Revocation = append(bytes.Clone(rec.Revocation), '\n')
+	e.want(e.do("PUT", path, other, ""), 200, "")
+	if n := cs.deletes(); n != 1 {
+		t.Errorf("a revocation resent in other bytes read the messages table %d times, want 1", n)
+	}
+}
+
+// The record is written before the mail is deleted, so a delete that fails
+// leaves a revoked box holding mail. The caller is told it failed, and the
+// same revocation again finishes it: memory shows the box holding mail, and
+// that is what a second delete is for.
+func TestARevocationRetriedAfterAFailedDeleteDeletes(t *testing.T) {
+	ctx := context.Background()
+	e, cs := countingEnv(t)
+	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
+	send(t, b, a, "waiting in A's box when it is revoked")
+	rec := record(t, a)
+	path := revocationPath(a.Address())
+
+	cs.mu.Lock()
+	cs.fail = 1
+	cs.mu.Unlock()
+	if r := e.do("PUT", path, rec, ""); r.status < 500 {
+		t.Fatalf("a revocation whose delete failed was answered %d: %s", r.status, r.body)
+	}
+	if stored, err := e.store.Box(ctx, a.Address()); err != nil || stored.State != Revoked {
+		t.Fatalf("after a revocation whose delete failed the box is %+v, %v", stored, err)
+	}
+	if n, _, err := e.store.Count(ctx, a.Address()); err != nil || n != 1 {
+		t.Fatalf("after a revocation whose delete failed the box holds %d messages (%v), want the 1 it had", n, err)
+	}
+	e.want(e.do("PUT", path, rec, ""), 200, "")
+	if n, _, err := e.store.Count(ctx, a.Address()); err != nil || n != 0 {
+		t.Errorf("after the retry the revoked box holds %d messages (%v), want none", n, err)
+	}
+	// With the box empty, one more reads nothing.
+	e.want(e.do("PUT", path, rec, ""), 200, "")
+	if n := cs.deletes(); n != 2 {
+		t.Errorf("a revocation, its retry and one more read the messages table %d times, want 2", n)
+	}
+}
+
+// A revocation of the address may come with the list the box already holds:
+// the record a server shows for an address carries both. The list is nothing
+// new, and the revocation is taken all the same. Every part of a body is
+// checked whatever the box holds: the revocation it holds, with something
+// beside it that is not a list, is refused.
+func TestARevocationComesWithTheListHeld(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, relaxed())
+	r := e.raw().register(protocol.MaxPrekeyLifetime)
+	path := r.path("/revocations")
+	both := r.list(1, protocol.SerialRange{First: 7, Last: 7})
+	e.want(e.do("PUT", path, both, ""), 200, "")
+	var err error
+	if both.Revocation, err = protocol.SignRevocation(r.signer, r.id.Address()); err != nil {
+		t.Fatal(err)
+	}
+	e.want(e.do("PUT", path, both, ""), 201, "")
+	if stored, err := e.store.Box(ctx, r.id.Address()); err != nil || stored.State != Revoked || !bytes.Equal(stored.Revocation, both.Revocation) {
+		t.Fatalf("a revocation that came with the list already held was not taken: %+v, %v", stored, err)
+	}
+	junk := both
+	junk.RevokedCertificates, junk.RevokedCertificatesSignature = []byte("not a list"), []byte("not a signature")
+	e.want(e.do("PUT", path, junk, ""), 400, protocol.CodeBadRevocation)
 }

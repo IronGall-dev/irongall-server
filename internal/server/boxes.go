@@ -357,12 +357,26 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 	}
-	// After the record says revoked, and again on every retry: mail that
-	// arrived around the write is never served, and this deletes it sooner
-	// than its expiry would.
+	// After the record says revoked: mail that arrived around the write is
+	// never served, and this deletes it sooner than its expiry would. A
+	// revocation of a box already revoked deletes only while memory shows
+	// the box holding mail, as it does when the first delete failed. A
+	// revocation is public and its bytes are not the only ones that verify
+	// (a line feed after the armour, the identity signing again), so one
+	// sent back must not draw a read of the messages table each time.
 	if b.State == Revoked {
-		if err := s.store.DeleteMessages(r.Context(), b.Addr); err != nil {
-			return err
+		held := changed
+		if !held {
+			n, _, err := s.store.Count(r.Context(), b.Addr)
+			if err != nil {
+				return err
+			}
+			held = n > 0
+		}
+		if held {
+			if err := s.store.DeleteMessages(r.Context(), b.Addr); err != nil {
+				return err
+			}
 		}
 	}
 	writeJSON(w, status, struct{}{})
