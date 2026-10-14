@@ -3,11 +3,9 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -249,21 +247,19 @@ func readProblem(err error, limit int64) error {
 	return fail(protocol.CodeBadRequest, "", "the request body could not be read")
 }
 
-// decodeJSON reads a JSON body into v: exactly one object, no unknown
-// fields.
+// decodeJSON reads a JSON body into v as every reader of the protocol reads
+// one (protocol.UnmarshalRequest, PROTOCOL.md §0b): one I-JSON object, names
+// matched exactly, nested at most protocol.MaxDepth deep, and no member v
+// does not name.
 func decodeJSON(data []byte, v any) error {
-	d := json.NewDecoder(bytes.NewReader(data))
-	d.DisallowUnknownFields()
-	if err := d.Decode(v); err != nil {
-		if errors.Is(err, protocol.ErrNotBase64) {
-			return fail(protocol.CodeBadEncoding, "base64 of the exact file bytes", "%v", err)
-		}
+	switch err := protocol.UnmarshalRequest(data, v); {
+	case err == nil:
+		return nil
+	case errors.Is(err, protocol.ErrNotBase64):
+		return fail(protocol.CodeBadEncoding, "base64 of the exact file bytes", "%v", err)
+	default:
 		return fail(protocol.CodeBadRequest, "", "the body is not the JSON object expected: %v", err)
 	}
-	if d.More() {
-		return fail(protocol.CodeBadRequest, "", "the body holds more than one JSON value")
-	}
-	return nil
 }
 
 // required checks every named byte field is present.

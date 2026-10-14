@@ -50,7 +50,7 @@ On a pull request the DCO app checks every commit, and `main` requires its check
 - 🛑 **A new pass is checked in three steps, in this order** (`checkPass`; `PROTOCOL-SERVER.md` §6.1b): the certificate it carries against the hash of the box's current one, the working key's signature, then the identity's signature on the certificate with every rule of a certificate. The first two refuse a pass that is not the box's for one signature check at most. The third is a second check of what a registration checked, and it stays: do not drop it to save its cost, and do not move it ahead of the other two.
 - 🛑 **Keyed hashing is HMAC or HKDF only, never `hash(secret ‖ …)`.**
 - **Go. Every API path under `/v1/`.**
-- 🛑 **INDUSTRY-standard API shapes, never something clever.** JSON in and out; every byte field is standard base64 of the exact file bytes (`PROTOCOL.md` §4.5).
+- 🛑 **INDUSTRY-standard API shapes, never something clever.** JSON in and out; every byte field is standard base64 of the exact file bytes, in its one encoding, and every JSON text is read by one set of rules, I-JSON among them, by every reader (`PROTOCOL.md` §4.5, §0b).
 - 🛑 **An empty poll never leaves the process:** no DynamoDB, S3 or Redis round trip. Polls × mailboxes is THE load. The rule is for the steady state; the ONE read that loads a box into a process's memory on its first use is fine.
 - **Bodies are served through this server's endpoint, never by a redirect to S3.**
 - **Bot-first.** Every error carries a machine code plus a `hint` naming the client command that fixes it, never a raw command line the server could alter.

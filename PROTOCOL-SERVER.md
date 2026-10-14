@@ -11,6 +11,11 @@
 - **Header:** three different things. The **header item** is the per-message DynamoDB item (§7); the **age header** is the text head of an age file (§4.3); **HTTP headers** are HTTP headers.
 - **The live prekey** is the current one: the server checks a message's stanza TYPE against its type (§4 step 6). The server keeps the newest retired prekeys' key hashes (`-retired-kept` of them, a service limit) only to refuse a key that comes back.
 
+## §0b. A body is read as every reader reads JSON
+
+- **Every request body goes through `decodeJSON`** (`internal/server/server.go`), which is the client repo's `protocol.UnmarshalRequest`: the same code the clients read answers with, on Go's `encoding/json/v2`. So the server and the clients hold one set of rules (`PROTOCOL.md` §0b) by one implementation. A byte field not in its one encoding is `bad_encoding`; anything else that breaks a rule is `bad_request`, and an unknown member is named in the `detail`, in the caller's own words.
+- **What it costs:** the text is read twice, once for the rules `encoding/json/v2` leaves to its caller and once to decode it. Measured on one core here (Go 1.27.2): a send of 3 KiB of ciphertext, about 30 µs against 25 µs for the decoder it replaced; one of 1 MiB, about 8.2 ms against 7.0 ms.
+
 ## §3. Registration: steps 5 to 9 as this server does them
 
 - **Step 4, the key's type:** `protocol.ParseIdentity` answers for the document's form, for a key type the protocol does not define, and for the key's checks. A key type that is not on this server's list is then answered `unsupported_key_type`, with the list in the detail. The list is of what the server can verify: it checks the identity's signature on every certificate it puts on record.
@@ -154,7 +159,7 @@ The structure is decided, and not all of it is built: each item says so. Each nu
 
 ## §11. Tested: what ran here
 
-- The `base64` that ran is the uutils coreutils one; Go's `encoding/base64` decodes wrapped base64 exactly (`bench/crypto/base64_test.go`). The µs figures re-run from `bench/`.
+- The `base64` that ran is the uutils coreutils one; Go's `encoding/base64` decodes wrapped base64 exactly (`bench/crypto/base64_test.go`), but the server takes none: a byte field is base64 in its one encoding (§0b). The µs figures re-run from `bench/`.
 
 ✅ **Against a real server, 2026-10-10:** `test/interop.sh` runs `irongall.sh` with its real `ig_api` (curl) against `irongalld serve --dev` with the Go client on the other side: mail both ways, across renewals, one box run by both clients, and a script box whose clock is set 9 minutes behind the server's or 49 ahead (further off, it is refused and told the server's clock). **All PASS, last on 2026-10-13 with post-quantum script boxes (age 1.3.2), on the in-memory store and on DynamoDB with S3 Express** (its last line prints the count). The server's own tests (`internal/server/`) cover problem+json bodies against §13, the pass (another box's, another server's, run out, running out too far ahead, under a certificate that is not the box's current one, and one remembered across a renewal), registration and renewal under a certificate, the per-IP send limit, close and reopen, the stanza parser and grease, a type switch at renewal, and ETags. The tests of a client against a forging operator are in the client repo.
 

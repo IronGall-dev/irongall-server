@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -291,6 +292,32 @@ func TestRegistration(t *testing.T) {
 	e.want(e.do("PUT", r.path(""), []byte(`{"identity":"","prekey":"","prekey_signature":null}`), pass), 400, protocol.CodeBadRequest)
 	e.want(e.do("PUT", r.path(""), []byte(`{"identity":"not base64!","prekey":"","prekey_signature":""}`), pass), 400, protocol.CodeBadEncoding)
 	e.want(e.do("PUT", r.path(""), []byte(`not json`), pass), 400, protocol.CodeBadRequest)
+	// A body is read as every reader reads JSON (PROTOCOL.md §0b): names
+	// exactly, none twice, one value, and each byte field in its one
+	// encoding.
+	rj, _ := json.Marshal(reg)
+	for name, body := range map[string][]byte{
+		"a name in another case": bytes.Replace(rj, []byte(`"identity"`), []byte(`"IDENTITY"`), 1),
+		"a long s for an s":      bytes.Replace(rj, []byte(`"prekey_signature"`), []byte(`"prekey_\u017fignature"`), 1),
+		"a name twice":           bytes.Replace(rj, []byte(`{`), []byte(`{"identity":"",`), 1),
+		"a bracket after it":     append(append([]byte{}, rj...), ']'),
+		"a brace after it":       append(append([]byte{}, rj...), '}'),
+		"a byte-order mark":      append([]byte("\xef\xbb\xbf"), rj...),
+		"NaN beside it":          bytes.Replace(rj, []byte(`{`), []byte(`{"x":NaN,`), 1),
+	} {
+		if got := e.do("PUT", r.path(""), body, pass); got.status != 400 || got.code() != protocol.CodeBadRequest {
+			t.Errorf("%s: %d %s, want 400 %s", name, got.status, got.code(), protocol.CodeBadRequest)
+		}
+	}
+	for name, body := range map[string][]byte{
+		"base64 with no padding": bytes.Replace(rj, []byte(`="`), []byte(`"`), 1),
+		"base64 wrapped":         bytes.Replace(rj, []byte(`","prekey"`), []byte(`\n","prekey"`), 1),
+		"its unused bits set":    unusedBitsSet(t, rj),
+	} {
+		if got := e.do("PUT", r.path(""), body, pass); got.status != 400 || got.code() != protocol.CodeBadEncoding {
+			t.Errorf("%s: %d %s, want 400 %s", name, got.status, got.code(), protocol.CodeBadEncoding)
+		}
+	}
 
 	other := e.raw()
 	e.want(e.do("PUT", other.path(""), reg, pass), 400, protocol.CodeIdentityMismatch)
@@ -635,6 +662,22 @@ func TestSendPipeline(t *testing.T) {
 	for _, member := range []string{`"from":"` + a.Address().String() + `",`, `"signature":"",`} {
 		e.want(e.do("POST", to, append([]byte("{"+member), j[1:]...), pass), 400, protocol.CodeBadRequest)
 	}
+	// Read as every reader reads JSON (PROTOCOL.md §0b), its serials no more
+	// than 2^53 - 1 and written as integers.
+	serial := regexp.MustCompile(`"prekey_serial":[0-9]+`)
+	for name, body := range map[string][]byte{
+		"a name in another case":   bytes.Replace(j, []byte(`"ciphertext"`), []byte(`"Ciphertext"`), 1),
+		"a name twice":             bytes.Replace(j, []byte(`{`), []byte(`{"prekey_serial":1,`), 1),
+		"a bracket after it":       append(append([]byte{}, j...), ']'),
+		"a serial above 2^53 - 1":  serial.ReplaceAll(j, []byte(`"prekey_serial":9007199254740992`)),
+		"a serial with a fraction": serial.ReplaceAllFunc(j, func(b []byte) []byte { return append(append([]byte{}, b...), ".0"...) }),
+		"a serial as a string":     serial.ReplaceAllFunc(j, func(b []byte) []byte { return []byte(`"prekey_serial":"` + string(b[16:]) + `"`) }),
+	} {
+		if got := e.do("POST", to, body, pass); got.status != 400 || got.code() != protocol.CodeBadRequest {
+			t.Errorf("%s: %d %s, want 400 %s", name, got.status, got.code(), protocol.CodeBadRequest)
+		}
+	}
+	e.want(e.do("POST", to, unusedBitsSet(t, j), pass), 400, protocol.CodeBadEncoding)
 	e.want(e.do("POST", "/v1/nope", ok, pass), 400, protocol.CodeBadAddress)
 	zero := ok
 	var z uint64
@@ -897,4 +940,26 @@ func TestRenewalLimits(t *testing.T) {
 	if _, err := b.Rekey(ctx, ""); err != nil {
 		t.Fatalf("a renewal the next day: %v", err)
 	}
+}
+
+// unusedBitsSet returns body with the unused bits of its last base64 field
+// that has padding set: the same bytes to a lax decoder, and not base64 in
+// its one encoding.
+func unusedBitsSet(t *testing.T, body []byte) []byte {
+	t.Helper()
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	i := bytes.LastIndex(body, []byte(`="`))
+	for i > 0 && body[i-1] == '=' {
+		i--
+	}
+	if i < 1 {
+		t.Fatal("no base64 field with padding in the body")
+	}
+	c := strings.IndexByte(alphabet, body[i-1])
+	if c < 0 || c%4 != 0 {
+		t.Fatalf("the last base64 field is not in its one encoding: %q", body[i-1])
+	}
+	out := append([]byte{}, body...)
+	out[i-1] = alphabet[c+1]
+	return out
 }

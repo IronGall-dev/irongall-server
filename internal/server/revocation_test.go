@@ -56,6 +56,7 @@ func TestRevocation(t *testing.T) {
 		return sig
 	}
 	ofB := record(t, b)
+	recJSON, _ := json.Marshal(rec)
 	for name, bad := range map[string]struct {
 		body any
 		code protocol.Code
@@ -71,6 +72,10 @@ func TestRevocation(t *testing.T) {
 		"no document":                               {[]byte(`{"revocation":"eA=="}`), protocol.CodeBadRequest},
 		"a member the body does not have":           {[]byte(`{"identity":"eA==","revocation":"eA==","reason":"lost"}`), protocol.CodeBadRequest},
 		"not JSON":                                  {[]byte(`revoke`), protocol.CodeBadRequest},
+		"a name in another case":                    {bytes.Replace(recJSON, []byte(`"revocation"`), []byte(`"Revocation"`), 1), protocol.CodeBadRequest},
+		"a name twice":                              {bytes.Replace(recJSON, []byte(`{`), []byte(`{"revocation":"eA==",`), 1), protocol.CodeBadRequest},
+		"a second value after it":                   {append(append([]byte{}, recJSON...), "{}"...), protocol.CodeBadRequest},
+		"base64 with its unused bits set":           {unusedBitsSet(t, recJSON), protocol.CodeBadEncoding},
 	} {
 		if r := e.do("PUT", path, bad.body, ""); r.status != 400 || r.code() != bad.code {
 			t.Errorf("%s: %d %s, want 400 %s: %s", name, r.status, r.code(), bad.code, r.body)

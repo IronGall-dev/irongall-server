@@ -74,7 +74,7 @@ Every building block is a published standard with mature implementations, and no
 | **SSHSIG** | The signature container: the key's signature over SHA-512 of the message, with a signed namespace | OpenSSH `PROTOCOL.sshsig` | Domain separation by namespace; `ssh-keygen -Y sign/verify` is on every machine; used for git signing |
 | **SHA-256** | Address = hash of the identity document; message id = hash of the ciphertext | FIPS 180-4 | Self-certifying names and content addressing |
 | **HMAC-SHA-256** | Adopt keys, which let a mailbox join an account: computed, never stored | RFC 2104 | The server keeps only a key's uses left and its expiry |
-| Base64 in JSON | Transport of every byte field | RFC 4648 | The industry pattern for opaque bytes (Google Pub/Sub, AWS KMS, GitHub Contents); survives careless clients |
+| Base64 in JSON | Transport of every byte field | RFC 4648, RFC 7493 | The industry pattern for opaque bytes (Google Pub/Sub, AWS KMS, GitHub Contents). Every JSON text is I-JSON, read one way by every reader, and a byte field is base64 in its one encoding (`PROTOCOL.md` §0b) |
 
 **Stock tools are enough for any client:** `age`/`age-keygen`, `ssh-keygen`, `sha256sum`, `base64`, `curl`, `jq`. The Go client is the one to run; `sh/irongall.sh` does the same steps in those tools, as the proof that nothing else is going on in it (2026-10-12).
 
@@ -180,7 +180,7 @@ A send signs the envelope with the recipient bound into the signature, then encr
 **The server's checks, cheapest first; nothing is written until all pass**
 
 1. Who is sending, before the body is read: the per-IP rate; the mailbox the pass names registered, not closed and not revoked; the pass itself.
-2. Size, to that sender's cap, and base64 validity.
+2. Size, to that sender's cap, and the body read as every reader reads JSON (`PROTOCOL.md` §0b): I-JSON, names matched exactly, the ciphertext base64 in its one encoding.
 3. B's address well-formed; `prekey_serial` and `certificate_serial` present.
 4. It is an age file.
 5. B registered and active, and its prekey not expired (an in-memory lookup).
@@ -197,7 +197,7 @@ A send signs the envelope with the recipient bound into the signature, then encr
 2. Fetch a message: `{from, ciphertext}`. `from` is the server's word, checked below.
 3. Decrypt with every retained prekey.
 4. **The layout:** line 1 is the envelope, line 2 begins the one signature block, which ends at its first END line, and nothing after it is read. Nothing is searched for.
-5. **Whose it is:** the envelope is one JSON object with no key twice; it carries an identity document, and its `from` must be that document's SHA-256.
+5. **Whose it is:** the envelope is one JSON object, read as every reader reads JSON (`PROTOCOL.md` §0b): no key twice in any object in it, nested at most 32 deep; it carries an identity document, and its `from` must be that document's SHA-256.
 6. **The signature,** over the line exactly as decrypted and never a re-encoding of it, under a certificate of that identity that is valid now, with namespace `irongall-msg-v1:<B>`.
 7. **The rest of the envelope:** its `to` must equal B, `sent_at` must be within the window, and the server's `from` must be the verified sender.
 8. Replay check: the locally computed ciphertext hash must not be in a 33-day seen-set (the message TTL), and `(from, msg_id)` must be new.

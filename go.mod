@@ -1,16 +1,16 @@
 module github.com/IronGall-dev/irongall-server
 
-go 1.26.0
+go 1.27.0
 
 require (
 	filippo.io/age v1.3.2
+	github.com/IronGall-dev/irongall-client v0.0.0
 	github.com/aws/aws-sdk-go-v2 v1.47.3
 	github.com/aws/aws-sdk-go-v2/config v1.33.9
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.70.3
 	github.com/aws/aws-sdk-go-v2/service/dynamodbstreams v1.45.1
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.3
 	github.com/aws/smithy-go v1.28.5
-	github.com/IronGall-dev/irongall-client v0.0.0
 	golang.org/x/crypto v0.58.0
 )
 
