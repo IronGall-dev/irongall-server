@@ -34,8 +34,8 @@ func TestIndex(t *testing.T) {
 	var box protocol.Address
 	box[0] = 7
 	const now = 1_000_000
-	k1 := mark{id: 1, from: 10, exp: now + 500}
-	k2 := mark{id: 2, from: 10, exp: now + 900}
+	k1 := mark{tag: 1, id: 1, from: 10, exp: now + 500}
+	k2 := mark{tag: 2, id: 2, from: 10, exp: now + 900}
 
 	t.Run("a set: inserts twice count once", func(t *testing.T) {
 		x := loaded(t, box, boxRead{})
@@ -56,12 +56,12 @@ func TestIndex(t *testing.T) {
 	t.Run("a late insert does not bring back an ack", func(t *testing.T) {
 		x := loaded(t, box, boxRead{})
 		x.insert(box, k1, now)
-		x.remove(box, k1.id, k1.exp, now, false) // our ack
-		x.insert(box, k1, now)                   // the stream's late insert
+		x.remove(box, k1.tag, k1.exp, now, false) // our ack
+		x.insert(box, k1, now)                    // the stream's late insert
 		if n, _ := x.count(box, now); n != 0 {
 			t.Fatal("the acked message came back")
 		}
-		x.remove(box, k1.id, k1.exp, now, true) // the removal's echo clears the tomb
+		x.remove(box, k1.tag, k1.exp, now, true) // the removal's echo clears the tomb
 		if x.tombs(box) != 0 {
 			t.Fatal("the tomb outlived its echo")
 		}
@@ -69,7 +69,7 @@ func TestIndex(t *testing.T) {
 
 	t.Run("an ack of a message the stream has not shown yet", func(t *testing.T) {
 		x := loaded(t, box, boxRead{})
-		x.remove(box, k1.id, k1.exp, now, false)
+		x.remove(box, k1.tag, k1.exp, now, false)
 		x.insert(box, k1, now)
 		if n, _ := x.count(box, now); n != 0 {
 			t.Fatal("the acked message came back")
@@ -79,8 +79,8 @@ func TestIndex(t *testing.T) {
 	t.Run("a tomb whose echo came first dies at its expiry", func(t *testing.T) {
 		x := loaded(t, box, boxRead{})
 		x.insert(box, k1, now)
-		x.remove(box, k1.id, k1.exp, now, true)  // the echo, first
-		x.remove(box, k1.id, k1.exp, now, false) // then our own apply
+		x.remove(box, k1.tag, k1.exp, now, true)  // the echo, first
+		x.remove(box, k1.tag, k1.exp, now, false) // then our own apply
 		x.count(box, k1.exp)
 		if x.tombs(box) != 0 {
 			t.Fatal("the tomb outlived the message's expiry")
@@ -97,7 +97,7 @@ func TestIndex(t *testing.T) {
 		if n, v := x.count(box, k1.exp); n != 1 || v != 2 {
 			t.Fatalf("at expiry: %d, version %d", n, v)
 		}
-		x.insert(box, mark{id: 3, exp: now}, now)
+		x.insert(box, mark{tag: 3, id: 3, exp: now}, now)
 		if n, _ := x.count(box, now); n != 1 {
 			t.Fatal("an expired insert counted")
 		}
@@ -107,9 +107,9 @@ func TestIndex(t *testing.T) {
 		// The same ciphertext, resent after the first expired: the late TTL
 		// removal of the first must not remove the second.
 		x := loaded(t, box, boxRead{})
-		again := mark{id: k1.id, from: k1.from, exp: k1.exp + 1000}
+		again := mark{tag: k1.tag, id: k1.id, from: k1.from, exp: k1.exp + 1000}
 		x.insert(box, again, k1.exp)
-		x.remove(box, k1.id, k1.exp, k1.exp, true)
+		x.remove(box, k1.tag, k1.exp, k1.exp, true)
 		if n, _ := x.count(box, k1.exp); n != 1 {
 			t.Fatal("the resent message was removed")
 		}
@@ -144,8 +144,8 @@ func TestIndexLoad(t *testing.T) {
 	var box protocol.Address
 	box[0] = 7
 	const now = 1_000_000
-	k1 := mark{id: 1, from: 10, exp: now + 500}
-	k2 := mark{id: 2, from: 10, exp: now + 900}
+	k1 := mark{tag: 1, id: 1, from: 10, exp: now + 500}
+	k2 := mark{tag: 2, id: 2, from: 10, exp: now + 900}
 	ctx := context.Background()
 
 	t.Run("a change to a box memory does not hold is dropped", func(t *testing.T) {
@@ -181,8 +181,8 @@ func TestIndexLoad(t *testing.T) {
 		if n, _ := x.count(box, now); n != 0 {
 			t.Fatal("counted while loading")
 		}
-		x.remove(box, k1.id, k1.exp, now, true) // acked meanwhile
-		x.insert(box, k2, now)                  // and a new message
+		x.remove(box, k1.tag, k1.exp, now, true) // acked meanwhile
+		x.insert(box, k2, now)                   // and a new message
 		x.setStanding(box, Standing{State: Active, Cert: [32]byte{1}}, 2)
 		close(release)
 		if err := <-done; err != nil {

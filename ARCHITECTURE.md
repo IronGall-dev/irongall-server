@@ -72,20 +72,21 @@ flowchart LR
 
 | Layer | Holds | Size (estimate) | Used for | Under memory pressure |
 |---|---|---|---|---|
-| **1. Counts** — always resident | For each box WITH mail, one 32-byte mark per live message (id, sender, expiry, a count of its fetches) | 32 to 51 B per live message, plus 271 B per loaded box on an Ed25519 identity (measured 2026-10-13) | **Every poll:** the exact count, the ETag, the per-pair and box caps | Never shed: it IS the poll. If it doesn't fit, that's capacity, because every process holds all of it |
+| **1. Counts** — always resident | For each box WITH mail, one 40-byte mark per live message (a keyed tag, id, sender, expiry, a count of its fetches) | 32 to 51 B per live message, plus 271 B per loaded box on an Ed25519 identity (measured 2026-10-13, before the tag); the tag adds 8 B a mark (not measured) | **Every poll:** the exact count, the ETag, the per-pair and box caps | Never shed: it IS the poll. If it doesn't fit, that's capacity, because every process holds all of it |
 | **2. Listings** — optional | Full metadata for recently listed boxes: id, sender, size, received_at | ~100 B per message | Serving a list from memory | Shrinks first (an LRU under a byte budget), down to off; lists then come from DynamoDB |
 
 ```go
 type mark struct { // layer 1
-	id   uint64 // first 8 bytes of the message id, which is already a SHA-256
+	tag  uint64 // first 8 bytes of HMAC-SHA-256 of the whole id, under a key derived from the server's keys: what the mark is known by
+	id   uint64 // first 8 bytes of the message id, for the list's order within a millisecond only
 	from uint64 // first 8 bytes of the sender's address, for the per-pair cap
 	exp  uint64 // expiry in unix ms: received_at + the TTL (33 days), so it also gives the header's key (PROTOCOL-SERVER.md §7)
-	n    uint8  // fetches of it this process has served: a second one is a repeat (PROTOCOL.md §5.7); 32 B with it, measured
+	n    uint8  // fetches of it this process has served: a second one is a repeat (PROTOCOL.md §5.7); 40 B in all
 }
 
 type Mailbox struct { // layer 1, a sketch: the marks of a box with mail. A loaded box with none holds only its standing
 	marks   []mark // live messages only
-	version uint64 // XOR of the id marks: the ETag, identical on every process
+	version uint64 // XOR of the tags: with the count, the ETag, identical on every process
 }
 
 type Listing struct { // layer 2: optional, LRU under a byte budget
@@ -99,7 +100,7 @@ type Listing struct { // layer 2: optional, LRU under a byte budget
 - messages expire with no event at all.
 
 A set keyed by message id absorbs all three. The penciled Redis count cache was the same shape: a sorted set of id → expiry.
-- Eight bytes of a SHA-256 id are enough. A collision takes 2^32 work, and it can only merge two of the attacker's own messages in a count.
+- **A mark is known by a keyed tag, not by its id's first eight bytes.** The id is the SHA-256 of a ciphertext its sender chose, so those bytes are the sender's to steer: XOR is linear, and among 65 messages a sender finds a subset whose prefixes XOR to zero by elimination, with no hashing work, which made a full box's version an empty one's; and an id that only shared a held message's prefix passed for it, so a forged ack wrote to storage (this repo's #10). The tag is HMAC-SHA-256 of the whole id under a key derived from the server's keys (HKDF), which nobody outside the server can compute, and the ETag carries the count beside the version. A new current key changes every box's version once, and a client lists again.
 - The same marks give the per-pair cap (`from`) and the ETag (`version`), so the poll needs nothing else.
 
 **How the listing layer stays honest:**
@@ -361,7 +362,7 @@ Decided 2026-10-10 and gone from this list: DynamoDB Streams as the change log (
 
 - **Estimates:**
   - ~1–2 s stream propagation;
-  - ~32 B per mark and ~100 B per listed message;
+  - ~40 B per mark and ~100 B per listed message;
   - ~4 read units per page Query;
   - ~300 lines of shard following.
 - **Measured:** the poll cost (33 to 34 µs with a pass the server remembers), a new pass's check (about 180 µs), memory per box, and the compression table.

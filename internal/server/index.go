@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"slices"
 	"sync"
@@ -22,6 +24,8 @@ import (
 // and a standing only moves to a newer rev.
 type index struct {
 	shards [256]indexShard // by the address's first byte
+	// key tags each mark (markTag): set once, before the index is used.
+	key [32]byte
 }
 
 type indexShard struct {
@@ -30,8 +34,17 @@ type indexShard struct {
 }
 
 // mark is one live message (ARCHITECTURE.md § Memory).
+//
+// A message is known by its tag, which nobody outside the server can choose
+// or compute: the id is the SHA-256 of a ciphertext its sender chose, so 8
+// bytes of it are the sender's to steer. A version that is the XOR of plain
+// prefixes can be forced to that of an empty box, and an id that only shares
+// a held message's prefix would pass for it (IronGall-dev/irongall-server#10).
+// The plain prefix stays for one thing: ordering two messages of one
+// millisecond as the list orders them.
 type mark struct {
-	id   uint64 // first 8 bytes of the message id, which is already a SHA-256
+	tag  uint64 // markTag of the message id: what the mark is known by, and what the version is made of
+	id   uint64 // first 8 bytes of the message id, for the list's order within a millisecond only
 	from uint64 // first 8 bytes of the sender's address, for the per-pair cap
 	exp  uint64 // expiry in unix ms: received_at + TTL
 	n    uint8  // fetches of it this process has served, to 255: a second one is a repeat
@@ -79,8 +92,19 @@ func (x *index) shard(a protocol.Address) *indexShard { return &x.shards[a[0]] }
 
 func prefix8(b []byte) uint64 { return binary.BigEndian.Uint64(b[:8]) }
 
-func newMark(id [32]byte, from protocol.Address, exp uint64) mark {
-	return mark{id: prefix8(id[:]), from: prefix8(from[:]), exp: exp}
+// markTag is how memory knows a message: the first 8 bytes of
+// HMAC-SHA-256, under key, of its whole id.
+func markTag(key *[32]byte, id [32]byte) uint64 {
+	m := hmac.New(sha256.New, key[:])
+	m.Write(id[:])
+	return prefix8(m.Sum(nil))
+}
+
+// tagOf is markTag under this index's key.
+func (x *index) tagOf(id [32]byte) uint64 { return markTag(&x.key, id) }
+
+func (x *index) newMark(id [32]byte, from protocol.Address, exp uint64) mark {
+	return mark{tag: x.tagOf(id), id: prefix8(id[:]), from: prefix8(from[:]), exp: exp}
 }
 
 // ensure loads box a unless memory holds it. read runs once however many
@@ -154,7 +178,7 @@ func (m *boxMem) prune(now uint64) {
 	m.tombs = slices.DeleteFunc(m.tombs, func(k mark) bool { return k.exp <= now })
 }
 
-func same(a, b mark) bool { return a.id == b.id && a.exp == b.exp }
+func same(a, b mark) bool { return a.tag == b.tag && a.exp == b.exp }
 
 // insert adds a live message, from this process's write or the stream. A
 // message with a tomb stays removed.
@@ -174,10 +198,10 @@ func (x *index) insert(box protocol.Address, k mark, now uint64) {
 
 // remove removes a message. A removal by this process leaves a tomb until
 // the stream echoes it (echo true) or the message would have expired.
-func (x *index) remove(box protocol.Address, id, exp, now uint64, echo bool) {
+func (x *index) remove(box protocol.Address, tag, exp, now uint64, echo bool) {
 	x.apply(box, func(m *boxMem) {
 		m.prune(now)
-		k := mark{id: id, exp: exp}
+		k := mark{tag: tag, exp: exp}
 		m.marks = slices.DeleteFunc(m.marks, func(t mark) bool { return same(t, k) })
 		switch {
 		case echo:
@@ -189,7 +213,7 @@ func (x *index) remove(box protocol.Address, id, exp, now uint64, echo bool) {
 }
 
 // count returns the number of live messages in a box and its version: the
-// XOR of their id marks, identical on every process.
+// XOR of their tags, identical on every process.
 func (x *index) count(box protocol.Address, now uint64) (n int, version uint64) {
 	sh := x.shard(box)
 	sh.mu.Lock()
@@ -200,7 +224,7 @@ func (x *index) count(box protocol.Address, now uint64) (n int, version uint64) 
 	}
 	m.prune(now)
 	for _, k := range m.marks {
-		version ^= k.id
+		version ^= k.tag
 	}
 	return len(m.marks), version
 }
@@ -246,8 +270,8 @@ func (x *index) after(box protocol.Address, exp, id, now uint64) (n int) {
 	return n
 }
 
-// holds reports whether a box holds a live message whose id starts with id.
-func (x *index) holds(box protocol.Address, id, now uint64) bool {
+// holds reports whether a box holds a live message of this tag.
+func (x *index) holds(box protocol.Address, tag, now uint64) bool {
 	sh := x.shard(box)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -256,12 +280,12 @@ func (x *index) holds(box protocol.Address, id, now uint64) bool {
 		return false
 	}
 	m.prune(now)
-	return slices.ContainsFunc(m.marks, func(k mark) bool { return k.id == id })
+	return slices.ContainsFunc(m.marks, func(k mark) bool { return k.tag == tag })
 }
 
 // fetched is holds for a fetch: it also reports whether this process has
 // served the message before, and counts this serving.
-func (x *index) fetched(box protocol.Address, id, now uint64) (held, again bool) {
+func (x *index) fetched(box protocol.Address, tag, now uint64) (held, again bool) {
 	sh := x.shard(box)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -271,7 +295,7 @@ func (x *index) fetched(box protocol.Address, id, now uint64) (held, again bool)
 	}
 	m.prune(now)
 	for i := range m.marks {
-		if k := &m.marks[i]; k.id == id {
+		if k := &m.marks[i]; k.tag == tag {
 			again = k.n > 0
 			if k.n < 255 {
 				k.n++

@@ -600,7 +600,7 @@ func (s *DynamoStore) readBox(ctx context.Context, a protocol.Address) (boxRead,
 			if err != nil {
 				return r, err
 			}
-			r.marks = append(r.marks, newMark(h.ID, h.From, ms(h.ReceivedAt)+ttlMs))
+			r.marks = append(r.marks, s.idx.newMark(h.ID, h.From, ms(h.ReceivedAt)+ttlMs))
 		}
 	}
 	return r, nil
@@ -786,7 +786,7 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 	if err != nil {
 		return nil, err
 	}
-	s.idx.insert(box, newMark(h.ID, h.From, ms(h.ReceivedAt)+ttlMs), now)
+	s.idx.insert(box, s.idx.newMark(h.ID, h.From, ms(h.ReceivedAt)+ttlMs), now)
 	return nil, nil
 }
 
@@ -817,7 +817,7 @@ func (s *DynamoStore) retire(ctx context.Context, box protocol.Address, id [32]b
 	if err != nil {
 		return err
 	}
-	s.idx.remove(box, prefix8(id[:]), recv+ttlMs, now, false)
+	s.idx.remove(box, s.idx.tagOf(id), recv+ttlMs, now, false)
 	return nil
 }
 
@@ -950,6 +950,9 @@ func (s *DynamoStore) List(ctx context.Context, box protocol.Address, after *Cur
 	return hs, nil
 }
 
+// UseMarkKey implements Store.
+func (s *DynamoStore) UseMarkKey(key [32]byte) { s.idx.key = key }
+
 // Count implements Store: from memory, after the box's load on its first
 // use.
 func (s *DynamoStore) Count(ctx context.Context, box protocol.Address) (int, uint64, error) {
@@ -987,7 +990,7 @@ func (s *DynamoStore) Holds(ctx context.Context, box protocol.Address, id [32]by
 	if err := s.ensure(ctx, box); err != nil {
 		return false, err
 	}
-	return s.idx.holds(box, prefix8(id[:]), s.nowMs()), nil
+	return s.idx.holds(box, s.idx.tagOf(id), s.nowMs()), nil
 }
 
 // Fetched implements Store, from memory as Holds does.
@@ -995,7 +998,7 @@ func (s *DynamoStore) Fetched(ctx context.Context, box protocol.Address, id [32]
 	if err := s.ensure(ctx, box); err != nil {
 		return false, false, err
 	}
-	held, again = s.idx.fetched(box, prefix8(id[:]), s.nowMs())
+	held, again = s.idx.fetched(box, s.idx.tagOf(id), s.nowMs())
 	return held, again, nil
 }
 
@@ -1048,8 +1051,8 @@ func (s *DynamoStore) applyMsgImage(it item) {
 	}
 	exp := ms(h.ReceivedAt) + ttlMs
 	if live {
-		s.idx.insert(box, newMark(h.ID, h.From, exp), s.nowMs())
+		s.idx.insert(box, s.idx.newMark(h.ID, h.From, exp), s.nowMs())
 		return
 	}
-	s.idx.remove(box, prefix8(h.ID[:]), exp, s.nowMs(), true)
+	s.idx.remove(box, s.idx.tagOf(h.ID), exp, s.nowMs(), true)
 }

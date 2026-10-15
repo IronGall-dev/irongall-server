@@ -35,6 +35,14 @@ type Limits struct {
 	PublicBurst        int           // per IP: calls with no pass [tunable]
 	PublicRefill       time.Duration // [tunable]
 	IdentityActsPerDay int           // per box, per UTC day: renewals under a later certificate and raises of the floor (decided: 10, as renewals)
+
+	// How long a body may take: BodyTimeout, and one second more for each
+	// BodyMinRate bytes received, as Apache's RequestReadTimeout counts; a
+	// response the same, for the bytes it writes. A body that stops coming
+	// is cut off after BodyTimeout. It is also the longest a send waits for
+	// the one large read.
+	BodyTimeout time.Duration // [tunable]
+	BodyMinRate int           // bytes a second [tunable]
 }
 
 // DefaultLimits are the decided numbers, and the proposed values of the
@@ -59,6 +67,8 @@ func DefaultLimits() Limits {
 		PublicBurst:          10,
 		PublicRefill:         50 * time.Second,
 		IdentityActsPerDay:   10,
+		BodyTimeout:          20 * time.Second,
+		BodyMinRate:          500,
 	}
 }
 

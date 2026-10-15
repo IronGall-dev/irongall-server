@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -340,36 +341,40 @@ func (s slowPut) PutMessage(ctx context.Context, box protocol.Address, h *Header
 	return s.Store.PutMessage(ctx, box, h, body)
 }
 
-// A sender's daily count is taken before the write: sends in flight at once
-// cannot all pass on one count (IronGall-dev/irongall-server#4).
-func TestDailySendsAreTakenBeforeTheWrite(t *testing.T) {
-	l := relaxed()
-	l.SendsPerDay, l.PairCap, l.BoxCap = 5, 0, 0
-	e := newEnv(t, l)
-	from, to := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+// concurrently posts n sends at once from each of froms to to, through a
+// server whose message writes each take a while, and returns how many were
+// stored.
+func concurrently(t *testing.T, e *env, l Limits, to *raw, froms []*raw, n int) int {
+	t.Helper()
 	srv := httptest.NewServer(New(Config{Store: slowPut{e.store, 50 * time.Millisecond}, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler())
 	t.Cleanup(srv.Close)
 	e2 := &env{t: t, clock: e.clock, srv: srv}
-	pass := e2.passFor(from.work[1], from.id.Address(), e2.name())
-	var bodies [][]byte
-	for range 20 {
-		var ct bytes.Buffer
-		w, _ := age.Encrypt(&ct, to.keys[1].Recipient())
-		_, _ = io.WriteString(w, `{"v":1}`)
-		_ = w.Close()
-		one := uint64(1)
-		j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: ct.Bytes()})
-		bodies = append(bodies, j)
+	type post struct {
+		body []byte
+		pass string
+	}
+	var posts []post
+	for _, from := range froms {
+		pass := e2.passFor(from.work[1], from.id.Address(), e2.name())
+		for range n {
+			var ct bytes.Buffer
+			w, _ := age.Encrypt(&ct, to.keys[1].Recipient())
+			_, _ = io.WriteString(w, `{"v":1}`)
+			_ = w.Close()
+			one := uint64(1)
+			j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: ct.Bytes()})
+			posts = append(posts, post{j, pass})
+		}
 	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	stored := 0
-	for _, body := range bodies {
+	for _, p := range posts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req, _ := http.NewRequest(http.MethodPost, srv.URL+to.path(""), bytes.NewReader(body))
-			req.Header.Set("Authorization", pass)
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+to.path(""), bytes.NewReader(p.body))
+			req.Header.Set("Authorization", p.pass)
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				return
@@ -383,7 +388,87 @@ func TestDailySendsAreTakenBeforeTheWrite(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if stored != 5 {
+	return stored
+}
+
+// A sender's daily count is taken before the write: sends in flight at once
+// cannot all pass on one count (IronGall-dev/irongall-server#4).
+func TestDailySendsAreTakenBeforeTheWrite(t *testing.T) {
+	l := relaxed()
+	l.SendsPerDay, l.PairCap, l.BoxCap = 5, 0, 0
+	e := newEnv(t, l)
+	from, to := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+	if stored := concurrently(t, e, l, to, []*raw{from}, 20); stored != 5 {
 		t.Fatalf("%d of 20 concurrent sends stored, with 5 a day", stored)
+	}
+}
+
+// The pair and box caps count the sends in flight too, so sends made at once
+// cannot all pass on the same counts (IronGall-dev/irongall-server#4).
+func TestTheCapsCountSendsInFlight(t *testing.T) {
+	l := relaxed()
+	l.PairCap, l.BoxCap = 3, 0
+	e := newEnv(t, l)
+	from, to := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+	if stored := concurrently(t, e, l, to, []*raw{from}, 20); stored != 3 {
+		t.Fatalf("%d of 20 concurrent sends from one sender stored, with a pair cap of 3", stored)
+	}
+	l.PairCap, l.BoxCap = 0, 7
+	e = newEnv(t, l)
+	to = e.raw().register(protocol.MaxPrekeyLifetime)
+	froms := []*raw{e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)}
+	if stored := concurrently(t, e, l, to, froms, 5); stored != 7 {
+		t.Fatalf("%d of 15 concurrent sends stored, with a box cap of 7", stored)
+	}
+}
+
+// slowBox counts reads of box records, and holds each a while, as a read of
+// the table does.
+type slowBox struct {
+	Store
+	reads *atomic.Int64
+}
+
+func (s slowBox) Box(ctx context.Context, a protocol.Address) (*Box, error) {
+	s.reads.Add(1)
+	time.Sleep(50 * time.Millisecond)
+	return s.Store.Box(ctx, a)
+}
+
+// Lookups of one cold address at once share one read, and only its caller
+// is counted for it (IronGall-dev/irongall-server#6): twenty lookups of a box
+// that does not exist, from an address with one miss to spend, are each
+// answered 404, from one read.
+func TestLookupsOfOneAddressShareARead(t *testing.T) {
+	l := relaxed()
+	l.MissesPerMinute = 1
+	e := newEnv(t, l)
+	var n atomic.Int64
+	srv := httptest.NewServer(New(Config{Store: slowBox{e.store, &n}, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler())
+	t.Cleanup(srv.Close)
+	var nobody protocol.Address
+	nobody[0] = 9
+	var wg sync.WaitGroup
+	codes := make([]int, 20)
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Get(srv.URL + "/v1/" + nobody.String() + "/identity")
+			if err != nil {
+				return
+			}
+			_ = resp.Body.Close()
+			codes[i] = resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != http.StatusNotFound {
+			t.Fatalf("lookup %d: %d, want 404 (all: %v)", i, c, codes)
+		}
+	}
+	if got := n.Load(); got != 1 {
+		t.Fatalf("%d reads for twenty lookups of one address at once", got)
 	}
 }

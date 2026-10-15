@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"slices"
 	"sync"
 	"time"
@@ -14,7 +13,8 @@ import (
 // MemStore is the dev server's store: everything in memory, nothing
 // persisted. Expired messages and dedupe records vanish at their ExpiresAt.
 type MemStore struct {
-	now func() time.Time
+	now     func() time.Time
+	markKey [32]byte // set once, before use (UseMarkKey)
 
 	mu       sync.Mutex
 	boxes    map[protocol.Address]*Box
@@ -226,6 +226,9 @@ func (s *MemStore) DeleteMessages(_ context.Context, box protocol.Address) error
 	return nil
 }
 
+// UseMarkKey implements Store.
+func (s *MemStore) UseMarkKey(key [32]byte) { s.markKey = key }
+
 // Count implements Store.
 func (s *MemStore) Count(_ context.Context, box protocol.Address) (int, uint64, error) {
 	s.mu.Lock()
@@ -233,7 +236,7 @@ func (s *MemStore) Count(_ context.Context, box protocol.Address) (int, uint64, 
 	var v uint64
 	m := s.live(box)
 	for id := range m {
-		v ^= binary.BigEndian.Uint64(id[:8])
+		v ^= markTag(&s.markKey, id)
 	}
 	return len(m), v, nil
 }

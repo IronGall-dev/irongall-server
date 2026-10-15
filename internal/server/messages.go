@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
@@ -32,7 +33,8 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 		return fail(protocol.CodeBadRequest, "", "the only query parameter is cursor")
 	}
 	var after *Cursor
-	more := 0 // live messages past the cursor
+	more := 0          // live messages past the cursor
+	continues := false // the cursor is the one this process handed the box last
 	if cursor != "" {
 		if after, err = parseCursor(cursor); err != nil {
 			return err
@@ -40,8 +42,13 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 		if more, err = s.store.After(r.Context(), box, after); err != nil {
 			return err
 		}
+		continues = s.drains.take(box, cursor)
 	}
-	if more == 0 {
+	// A page after the first is a continuation only when it presents the
+	// cursor of the page served last: a made-up, replayed or retried cursor
+	// is answered all the same, and charged as a poll
+	// (IronGall-dev/irongall-server#5).
+	if more == 0 || !continues {
 		if ok, wait := s.polls.take(box.String(), s.now()); !ok {
 			return rateLimited(wait, "poll at most once a minute (poll_after)")
 		}
@@ -52,7 +59,9 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	etag := fmt.Sprintf(`"%016x"`, version)
+	// The count is in the ETag too, so no box that holds mail can have an
+	// empty one's, whatever its version.
+	etag := fmt.Sprintf(`"%d-%016x"`, n, version)
 	w.Header().Set("ETag", etag)
 	if cursor == "" && etagMatch(r.Header.Get("If-None-Match"), etag) {
 		w.WriteHeader(http.StatusNotModified)
@@ -71,6 +80,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 		page = page[:pageSize]
 		next := formatCursor(page[pageSize-1])
 		resp.NextCursor = &next
+		s.drains.put(box, next)
 	}
 	for _, h := range page {
 		resp.Messages = append(resp.Messages, protocol.MessageInfo{
@@ -83,6 +93,37 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeJSON(w, http.StatusOK, resp)
 	return nil
+}
+
+// drains remembers, for each box with a drain open, the one next_cursor this
+// process last handed it. Serving that cursor's page replaces it with the
+// next, and the last page of a drain clears it. It is this process's alone,
+// as every count is: a page that lands on another process is charged as a
+// poll there.
+type drains struct {
+	mu   sync.Mutex
+	next map[protocol.Address]string
+}
+
+// take reports whether cursor is the one box a was handed last, and spends it.
+func (d *drains) take(a protocol.Address, cursor string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ok := d.next[a] == cursor
+	if ok {
+		delete(d.next, a)
+	}
+	return ok
+}
+
+// put remembers the cursor just handed to box a.
+func (d *drains) put(a protocol.Address, cursor string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.next == nil {
+		d.next = map[protocol.Address]string{}
+	}
+	d.next[a] = cursor
 }
 
 // etagMatch is If-None-Match's comparison (RFC 9110 §13.1.2).

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -400,5 +402,71 @@ func TestLargeReadsTakeTurns(t *testing.T) {
 	}
 	if len(e.server.largeRead) != 0 {
 		t.Fatal("the allowance was not given back")
+	}
+}
+
+// A large body that stops coming is cut off by its deadline, and gives the
+// one large read back (IronGall-dev/irongall-server#7): a large send after it
+// is read at once, not after the stalled one's peer gives up.
+func TestAStalledBodyGivesTheLargeReadBack(t *testing.T) {
+	l := relaxed()
+	l.MaxSize, l.AccountMaxSize = 16<<10, 64<<10 // bodies read at once up to ~25 KB, at most ~91 KB
+	l.BodyTimeout, l.BodyMinRate = 300*time.Millisecond, 1<<20
+	e := newEnv(t, l)
+	_, key := accountEnv(t, e, true, 1)
+	lifted, to := e.box(protocol.Classic), e.box(protocol.Classic)
+	adopt(t, lifted, key)
+	addr := strings.TrimPrefix(e.srv.URL, "http://")
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, _ = io.WriteString(conn, "POST /v1/"+to.Address().String()+" HTTP/1.1\r\nHost: "+addr+"\r\nAuthorization: "+e.pass(lifted)+
+		"\r\nContent-Type: application/json\r\nContent-Length: 60000\r\n\r\n"+strings.Repeat("a", 30000)) // past the free size, then nothing
+	time.Sleep(50 * time.Millisecond) // the stalled send holds the large read
+	one := uint64(1)
+	j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: make([]byte, 30000)})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String(), bytes.NewReader(j))
+	req.Header.Set("Authorization", e.pass(lifted))
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("a large send behind a stalled one: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || time.Since(start) > 2*time.Second { // read, then not_age
+		t.Fatalf("a large send behind a stalled one: %d after %s, want 400 at once", resp.StatusCode, time.Since(start))
+	}
+}
+
+// A send waiting for the one large read gives up after the body timeout, with
+// 503 and Retry-After, and does not wait on its own client.
+func TestAWaitForTheLargeReadIsBounded(t *testing.T) {
+	l := relaxed()
+	l.MaxSize, l.AccountMaxSize = 16<<10, 64<<10
+	l.BodyTimeout = 200 * time.Millisecond
+	e := newEnv(t, l)
+	_, key := accountEnv(t, e, true, 1)
+	lifted, to := e.box(protocol.Classic), e.box(protocol.Classic)
+	adopt(t, lifted, key)
+	e.server.largeRead <- struct{}{} // another large send is being read
+	defer func() { <-e.server.largeRead }()
+	one := uint64(1)
+	j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: make([]byte, 30000)})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String(), bytes.NewReader(j))
+	req.Header.Set("Authorization", e.pass(lifted))
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("the wait for the large read did not end: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || time.Since(start) > 2*time.Second || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("the wait for the large read: %d after %s, Retry-After %q", resp.StatusCode, time.Since(start), resp.Header.Get("Retry-After"))
 	}
 }

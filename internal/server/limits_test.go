@@ -112,39 +112,70 @@ func TestCursorIsNoWayAroundThePollRate(t *testing.T) {
 		t.Fatalf("%d storage calls for lists of an empty box", n)
 	}
 
-	// Mail after the cursor: a continuation, twice at once.
+	// Mail after the cursor, and a cursor this process never handed out: a
+	// poll, answered with the page all the same.
 	for _, body := range []string{"1", "2", "3"} {
 		send(t, a, b, body)
 	}
-	for i := range 2 {
+	e.clock.Add(3 * l.PollRefill)
+	for i := range 3 {
 		r := list(start)
 		if got := listOf(t, r); r.status != http.StatusOK || got.Count != 3 || len(got.Messages) != 3 {
-			t.Fatalf("continuation %d: %d %s", i, r.status, r.body)
+			t.Fatalf("made-up cursor %d: %d %s", i, r.status, r.body)
 		}
 	}
 	r := list(start)
 	e2.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
-	if !strings.Contains(string(r.body), "too many list pages") {
-		t.Fatalf("a third continuation at once: %s", r.body)
-	}
-	if n := cs.reads.Load(); n != 2 {
-		t.Fatalf("%d storage calls for two continuations", n)
+	if !strings.Contains(string(r.body), "poll at most once a minute") {
+		t.Fatalf("a made-up cursor past the polls: %s", r.body)
 	}
 
-	// Nothing after the cursor: a poll again, and none is left.
-	e2.want(list(end), http.StatusTooManyRequests, protocol.CodeRateLimited)
+	// Nothing after the cursor: a poll too, read from memory.
 	e.clock.Add(l.PollRefill)
+	before := cs.reads.Load()
 	r = list(end)
 	if got := listOf(t, r); r.status != http.StatusOK || got.Count != 3 || len(got.Messages) != 0 || got.NextCursor != nil {
 		t.Fatalf("a cursor past the last message: %d %s", r.status, r.body)
 	}
 	e2.want(list(end), http.StatusTooManyRequests, protocol.CodeRateLimited)
-	if n := cs.reads.Load(); n != 2 {
-		t.Fatalf("%d storage calls: a list with nothing to return read storage", n)
+	if n := cs.reads.Load(); n != before {
+		t.Fatalf("%d storage calls: a list with nothing to return read storage", n-before)
 	}
-	// The poll interval that gave a poll back gave a continuation back too.
-	if r := list(start); r.status != http.StatusOK {
-		t.Fatalf("a continuation after a poll interval: %d %s", r.status, r.body)
+}
+
+// A page after the first is a continuation only with the cursor this process
+// handed the box last (IronGall-dev/irongall-server#5): a drain's pages come
+// from the page allowance, and the same cursor again is a poll.
+func TestAContinuationIsTheCursorHandedOutLast(t *testing.T) {
+	l := relaxed()
+	l.PairCap, l.BoxCap = 0, 0
+	l.PollBurst, l.PollRefill = 2, 50*time.Second
+	e := newEnv(t, l)
+	from, to := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+	for range pageSize + 1 {
+		e.want(e.sendTo(to, 1, 1, from, 1), http.StatusCreated, "")
+	}
+	pass := to.pass(1)
+	page := func(cursor string) reply {
+		path := to.path("/messages")
+		if cursor != "" {
+			path += "?cursor=" + cursor
+		}
+		return e.do(http.MethodGet, path, nil, pass)
+	}
+	first := listOf(t, page(""))
+	if len(first.Messages) != pageSize || first.NextCursor == nil {
+		t.Fatalf("the first page: %d messages, next %v", len(first.Messages), first.NextCursor)
+	}
+	c := *first.NextCursor
+	if second := listOf(t, page(c)); len(second.Messages) != 1 || second.NextCursor != nil {
+		t.Fatalf("the continuation: %d messages, next %v", len(second.Messages), second.NextCursor)
+	}
+	e.want(page(c), http.StatusOK, "") // the same cursor again: the box's second poll
+	r := page(c)
+	e.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
+	if !strings.Contains(string(r.body), "poll at most once a minute") {
+		t.Fatalf("a replayed cursor past the polls: %s", r.body)
 	}
 }
 
@@ -318,7 +349,7 @@ func TestIndexCountsFetches(t *testing.T) {
 	box[0] = 3
 	now := uint64(1000)
 	if err := x.ensure(context.Background(), box, func() (boxRead, error) {
-		return boxRead{exists: true, marks: []mark{{id: 7, from: 1, exp: now + 1}, {id: 8, from: 1, exp: now + 1}}}, nil
+		return boxRead{exists: true, marks: []mark{{tag: 7, id: 7, from: 1, exp: now + 1}, {tag: 8, id: 8, from: 1, exp: now + 1}}}, nil
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -72,6 +73,24 @@ func LoadKeys(path string) (*Keys, error) {
 		return nil, fmt.Errorf("%s: no keys", path)
 	}
 	return k, nil
+}
+
+// markInfo is HKDF's info for the key that tags a box's live messages in
+// memory (markTag).
+const markInfo = "irongall-mark-v1"
+
+// markKey derives, from the current key, the key that tags each live message
+// in memory: one key on every process, as the keys file is, so a box's
+// version is the same on each. A new current key changes every box's version
+// once, and a client that kept one lists again.
+func (k *Keys) markKey() ([32]byte, error) {
+	var out [32]byte
+	key, err := hkdf.Key(sha256.New, k.keys[k.Current], nil, markInfo, len(out))
+	if err != nil {
+		return out, err
+	}
+	copy(out[:], key)
+	return out, nil
 }
 
 // An adopt key (PROTOCOL.md §6.5) lets a box join an account. It is

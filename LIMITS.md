@@ -18,21 +18,23 @@ Every limit `irongalld` enforces, what it protects, who pays for it, when it is 
 | Limit | Flags | Paid by | What it bounds | When it is taken | Refused with |
 |---|---|---|---|---|---|
 | Polls | `-poll-burst`, `-poll-refill` | the box | every list without a cursor, and one whose cursor has nothing after it; an empty poll is answered from memory and still moves bytes | before the list | `429 rate_limited` |
-| List pages after the first | from `-box-cap` and `-poll-refill` | the box | continuations of a drain, sized so a full box always drains | before the page | `429 rate_limited` |
+| List pages after the first | from `-box-cap` and `-poll-refill` | the box | continuations of a drain, sized so a full box always drains. A page is a continuation only with the cursor this process handed the box last; any other cursor (made up, replayed, a retried page) is charged as a poll and answered all the same | before the page | `429 rate_limited` |
 | Repeat fetches | the poll's two flags | the box | a fetch of a message the box has fetched before; a first fetch is paid for by the receive | before the read | `429 rate_limited` |
 | Calls | `-call-burst`, `-call-refill` | the box | every call with its pass that no other budget counts: a send, a retry included; a lookup with its pass; a renewal; close, adopt, leave; a fetch or an ack of an id it does not hold | after the pass, before anything else | `429 rate_limited` |
 | New mail received | `-receive-burst`, `-receive-refill` | the recipient | how fast a box takes mail, however many boxes send to it | reserved before the write, given back if nothing is stored | `429 mailbox_busy` |
 | Sends a day | `-sends-per-day` | the sender | volume; counted only for sends that carried the sender's pass | reserved before the write, given back if nothing is stored | `429 rate_limited` |
-| Unacked per pair, per box | `-pair-cap`, `-box-cap` | the pair, the box | storage, a box's item collection and the pages of a drain | before the write, from memory | `429 pair_full`, `429 mailbox_full` |
+| Unacked per pair, per box | `-pair-cap`, `-box-cap` | the pair, the box | storage, a box's item collection and the pages of a drain | read with the sends in flight under one lock, and counted in before the write | `429 pair_full`, `429 mailbox_full` |
 | Renewals a day | `-renewals-per-day` | the box | renewals under its current certificate, which a holder of its working key can make; boxes-table writes | after the statement and its pass are checked | `429 rate_limited` |
 | The identity's acts a day | `-identity-acts-per-day` | the box | a renewal under a later certificate, and a raise of its revocation of certificates, which only its identity can make. The revocation of the address is never counted | after the signatures are checked | `429 rate_limited` |
 | Retired prekeys kept | `-retired-kept` | the box | the size of its record | at each renewal | none: the oldest goes |
 | Registrations | `-registrations-per-hour` | the address | new boxes, and the signature checks of a registration, which it is taken before | before any signature check | `429 rate_limited` |
 | Calls with no pass | `-public-burst`, `-public-refill` | the address | a lookup with no pass, a registration, `PUT …/revocations`, the link page | first | `429 rate_limited` |
-| Misses and failed checks | `-misses-per-minute` | the address | a read of the boxes table that finds no box; a new pass, a prekey statement or a revocation that does not verify | reserved before the read or the check, kept if it fails | `429 rate_limited` |
+| Misses and failed checks | `-misses-per-minute` | the address | a read of the boxes table that finds no box; a new pass, a prekey statement or a revocation that does not verify. Lookups of one address at once share one read, counted for its caller alone | reserved before the read or the check, kept if it fails | `429 rate_limited` |
 | Sends before their pass | `-sends-per-minute-per-ip` | the address | a send, before its pass is read; off unless set | first | `429 rate_limited` |
 | Size | `-max-size`, `-account-max-size` | the sender | the body read, to the sender's own cap | before the body is read past it | `413 too_large` |
-| One large read at a time | none | the process | memory: one body of the largest cap, plus the free-size buffers of those waiting | while a body past the free size is read | `503 unavailable` when the caller gives up |
+| One large read at a time | none | the process | memory: one body of the largest cap, plus the free-size buffers of those waiting | while a body past the free size is read; a send waits for it at most `-body-timeout` | `503 unavailable` |
+| A body's and a response's time | `-body-timeout`, `-body-min-rate` | the connection | how long a body may take to arrive, and a response to be taken: the timeout, and a second more for each `-body-min-rate` bytes moved, as Apache's `RequestReadTimeout` counts. A body that stops is cut off, and gives back the large read it holds | as the bytes move | the connection is closed |
+| Idle connections | `-idle-timeout` | the connection | an idle keep-alive connection; above the 60 s nginx keeps idle upstream connections, so nginx closes first | while idle | the connection is closed |
 
 ## The order of checks
 
@@ -51,16 +53,14 @@ Every limit `irongalld` enforces, what it protects, who pays for it, when it is 
 
 ## Known weaknesses: read these first
 
-1. **Every budget and count is per process,** in memory. With N processes a box can spend N times each, and a restart starts every box afresh (the daily counts included). Only the pair and box caps are shared, through the stream, a second or two behind. Routing each box to one process, or sharing the counts, is not built.
+1. **Every budget and count is per process,** in memory, and so are the cursor each box was handed last and the sends in flight. With N processes a box can spend N times each, and a restart starts every box afresh (the daily counts included). Only the pair and box caps are shared, through the stream, a second or two behind. Routing each box to one process, or sharing the counts, is not built.
 2. **The budget of new mail is shared by every sender.** Enough senders can spend a box's, and delay everyone else's mail to it; the mail waits in the senders' outboxes and is sent again. Every sender's own counts bound how much each spends. A box's `allow` list, not built, is the cure.
 3. **An address is a coarse key.** Honest boxes behind one address (a NAT, a cloud's egress) share its calls with no pass and its misses. Their calls with a pass are their own. An address that has spent its misses has its next new pass refused until one comes back; a pass the process has seen is unaffected.
-4. **No deadline on a request body, and no idle timeout:** one slow body past the free size holds the one large read (this repo's issue #7).
-5. **The pair and box caps are read, not reserved,** so sends in flight at once can pass them by as many as are in flight (#4; sends a day are reserved).
-6. **A cursor can be replayed:** a list with a made-up or old cursor that has mail after it is charged as a page, not a poll (#5).
-7. **Memory keeps 8 bytes of a message's id, unkeyed:** a sender can make a full box's ETag that of an empty one, and an owner can make a forged ack write to storage (#10).
-8. **A request that matches no route** is answered by the router with no budget, as is a connection that never completes a request. A flood of those is for whatever stands in front.
-9. **A pass is checked once in each process,** at two signature checks; after that it is a lookup in memory.
+4. **A request that matches no route** is answered by the router with no budget, as is a connection that never completes a request. A flood of those is for whatever stands in front.
+5. **A pass is checked once in each process,** at two signature checks; after that it is a lookup in memory.
+6. **The one large read can still be held for as long as a body takes at the minimum rate:** for a body of the largest cap, hours. Only a box whose account lifts its cap can take it, and a send waiting for it gives up after `-body-timeout`.
+7. **Nothing bounds how many sends wait for the large read,** and each holds the free size it has read while it waits.
 
 ## Tested
 
-`internal/server/budgets_test.go` holds each budget and each order above, `limits_test.go` the polls, pages, repeats and misses, and `server_test.go` the renewals. They run on the in-memory store, and on DynamoDB with the test tables set (`AGENTS.md`).
+`internal/server/budgets_test.go` holds each budget and each order above, `limits_test.go` the polls, pages, repeats and misses, `marks_test.go` the tags that memory knows messages by, `accounts_test.go` the large read, and `server_test.go` the renewals. They run on the in-memory store, and on DynamoDB with the test tables set (`AGENTS.md`).

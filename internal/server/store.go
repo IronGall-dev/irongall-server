@@ -260,8 +260,11 @@ type Store interface {
 	// It clears b.Account and bumps b.Rev.
 	Leave(ctx context.Context, b *Box) error
 
+	// UseMarkKey sets the key a store tags each live message with in memory
+	// (markTag), before it is first used: New calls it with the server's.
+	UseMarkKey(key [32]byte)
 	// Count returns the number of live messages in a box and its version:
-	// the XOR of the first 8 bytes of their ids, identical on every process.
+	// the XOR of their tags (markTag), identical on every process.
 	// Count and PairCount answer from memory: a store with memory loads the
 	// box on its first use, then answers from memory.
 	Count(ctx context.Context, box protocol.Address) (n int, version uint64, err error)

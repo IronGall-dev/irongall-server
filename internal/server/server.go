@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
@@ -74,6 +76,13 @@ type Server struct {
 	sends    daily    // per sender
 	renewals daily    // per box
 	acts     daily    // per box: what only its identity can do
+	// inFlight counts the sends let past the pair and box caps and not yet
+	// stored, by the recipient's first byte (reserveCaps).
+	inFlight [256]inFlight
+	// drains is the cursor each box was handed last (list).
+	drains drains
+	// reads are the reads of box records in flight (lookup).
+	reads reads
 	// largeRead is the one allowance for reading a send past the free
 	// cap's size, held until the send is answered. Only a sender whose own
 	// cap is larger ever asks for it.
@@ -109,6 +118,18 @@ func New(c Config) *Server {
 	}
 	if s.now == nil {
 		s.now = time.Now
+	}
+	// What memory tags each live message with: from the server's keys, so
+	// it is the same on every process; with none, random, and this
+	// process's alone.
+	var mk [32]byte
+	if c.Keys != nil {
+		mk, _ = c.Keys.markKey()
+	} else {
+		_, _ = rand.Read(mk[:])
+	}
+	if c.Store != nil {
+		c.Store.UseMarkKey(mk)
 	}
 	if len(s.identityTypes) == 0 {
 		s.identityTypes = protocol.IdentityTypes()
@@ -205,6 +226,7 @@ const retryLater = time.Minute
 // handle adapts a handler that returns its error as a problem.
 func (s *Server) handle(h func(http.ResponseWriter, *http.Request) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w, r = s.paced(w, r)
 		err := h(w, r)
 		if err == nil {
 			return
@@ -224,6 +246,60 @@ func (s *Server) handle(h func(http.ResponseWriter, *http.Request) error) http.H
 		writeProblem(w, p)
 	}
 }
+
+// paced holds a call's body and its response to Limits.BodyTimeout and
+// Limits.BodyMinRate (IronGall-dev/irongall-server#7): a deadline that
+// starts at BodyTimeout and grows a second for each BodyMinRate bytes
+// moved, so a slow link that keeps sending is let through, and a peer that
+// stops is cut off. Off when either is zero.
+func (s *Server) paced(w http.ResponseWriter, r *http.Request) (http.ResponseWriter, *http.Request) {
+	if s.limits.BodyTimeout <= 0 || s.limits.BodyMinRate <= 0 {
+		return w, r
+	}
+	rc := http.NewResponseController(w)
+	start := time.Now()
+	if r.Body != nil && r.Body != http.NoBody {
+		_ = rc.SetReadDeadline(start.Add(s.limits.BodyTimeout))
+		r.Body = &pacedBody{ReadCloser: r.Body, rc: rc, start: start, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate)}
+	}
+	return &pacedWriter{ResponseWriter: w, rc: rc, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate)}, r
+}
+
+// pacedBody moves the read deadline on as a body's bytes arrive.
+type pacedBody struct {
+	io.ReadCloser
+	rc      *http.ResponseController
+	start   time.Time
+	got     int64
+	timeout time.Duration
+	rate    int64
+}
+
+func (p *pacedBody) Read(b []byte) (int, error) {
+	n, err := p.ReadCloser.Read(b)
+	if n > 0 {
+		p.got += int64(n)
+		_ = p.rc.SetReadDeadline(p.start.Add(p.timeout + time.Duration(p.got/p.rate)*time.Second))
+	}
+	return n, err
+}
+
+// pacedWriter sets the write deadline before each write, for the bytes it
+// writes.
+type pacedWriter struct {
+	http.ResponseWriter
+	rc      *http.ResponseController
+	timeout time.Duration
+	rate    int64
+}
+
+func (p *pacedWriter) Write(b []byte) (int, error) {
+	_ = p.rc.SetWriteDeadline(time.Now().Add(p.timeout + time.Duration(int64(len(b))/p.rate)*time.Second))
+	return p.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.ResponseController reach the connection.
+func (p *pacedWriter) Unwrap() http.ResponseWriter { return p.ResponseWriter }
 
 // pathAddr reads the address in the URL path: 64 hex characters, folded to
 // lowercase.
@@ -293,22 +369,97 @@ func (s *Server) box(ctx context.Context, a protocol.Address) (*Box, error) {
 // box's record, or that a read found no such box a moment ago. Anything else
 // costs a read of the boxes table, and that read is what
 // Limits.MissesPerMinute guards: the caller's address reserves a count before
-// it, and keeps it only if the read finds no box (s.miss).
+// it, and keeps it only if the read finds no box (s.miss). Lookups of one
+// address made while its read is in flight share that read, and are counted
+// for nothing: it costs no more for them.
 func (s *Server) lookup(r *http.Request, a protocol.Address) (*Box, error) {
-	if b, ok := s.store.Known(a); ok {
-		return b, nil
+	for {
+		if b, ok := s.store.Known(a); ok {
+			return b, nil
+		}
+		f, lead := s.reads.start(a)
+		if !lead {
+			b, err := f.wait(r.Context())
+			if errors.Is(err, errReadNotMade) {
+				continue // its caller was refused before reading: try for ourselves
+			}
+			return b, err
+		}
+		m, err := s.miss(r)
+		if err != nil {
+			s.reads.finish(a, f, nil, errReadNotMade)
+			return nil, err
+		}
+		b, err := s.box(r.Context(), a)
+		s.reads.finish(a, f, b, err)
+		if err == nil && b == nil {
+			m.keep()
+		} else {
+			m.release(s.now())
+		}
+		return b, err
 	}
-	m, err := s.miss(r)
-	if err != nil {
-		return nil, err
+}
+
+// errReadNotMade is what a shared read tells those waiting on it when its
+// caller was refused before reading: each then asks for itself.
+var errReadNotMade = errors.New("the read was not made")
+
+// reads are the reads of box records in flight, by address, so that lookups
+// of one address at once make one read (IronGall-dev/irongall-server#6).
+type reads struct {
+	mu sync.Mutex
+	in map[protocol.Address]*read
+}
+
+// read is one read of a box's record, and what it found.
+type read struct {
+	done chan struct{}
+	b    *Box
+	err  error
+}
+
+// start begins the read of a, or returns the one already in flight with
+// lead false.
+func (rs *reads) start(a protocol.Address) (f *read, lead bool) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if f := rs.in[a]; f != nil {
+		return f, false
 	}
-	b, err := s.box(r.Context(), a)
-	if err == nil && b == nil {
-		m.keep()
-	} else {
-		m.release(s.now())
+	if rs.in == nil {
+		rs.in = map[protocol.Address]*read{}
 	}
-	return b, err
+	f = &read{done: make(chan struct{})}
+	rs.in[a] = f
+	return f, true
+}
+
+// finish records what the read of a found, for those waiting on it: a copy
+// of its own, since the read's caller may change the one it has.
+func (rs *reads) finish(a protocol.Address, f *read, b *Box, err error) {
+	rs.mu.Lock()
+	delete(rs.in, a)
+	rs.mu.Unlock()
+	if b != nil {
+		b = cloneBox(b)
+	}
+	f.b, f.err = b, err
+	close(f.done)
+}
+
+// wait returns what the read found, each waiter a copy of its own, or the
+// caller's context's end.
+func (f *read) wait(ctx context.Context) (*Box, error) {
+	select {
+	case <-f.done:
+		if f.b == nil {
+			return nil, f.err
+		}
+		return cloneBox(f.b), f.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // miss reserves a count of the caller's address under Limits.MissesPerMinute,
@@ -459,6 +610,9 @@ func (w *statusWriter) WriteHeader(status int) {
 	w.status = status
 	w.ResponseWriter.WriteHeader(status)
 }
+
+// Unwrap lets http.ResponseController reach the connection through the log.
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // accessLog logs method, redacted path, status and duration. Never a pass,
 // never a body.

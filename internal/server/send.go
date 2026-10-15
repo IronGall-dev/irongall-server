@@ -2,11 +2,13 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"io"
 	"net/http"
 	"regexp"
+	"sync"
 	"time"
 
 	"filippo.io/age"
@@ -69,9 +71,22 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return readProblem(err)
 	}
 	if int64(len(data)) > free {
+		// The wait is bounded as a body is: a send that holds the one large
+		// read is cut off by its own deadline (paced), and one waiting for
+		// it gives up after BodyTimeout.
+		var wait <-chan time.Time // nil, so never, with no bound set
+		if s.limits.BodyTimeout > 0 {
+			tm := time.NewTimer(s.limits.BodyTimeout)
+			defer tm.Stop()
+			wait = tm.C
+		}
 		select {
 		case s.largeRead <- struct{}{}:
 			defer func() { <-s.largeRead }()
+		case <-wait:
+			p := fail(protocol.CodeUnavailable, "retry later", "another large send is being read")
+			p.retryAfter = retryLater
+			return p
 		case <-ctx.Done():
 			p := fail(protocol.CodeUnavailable, "retry later", "another large send is being read")
 			p.retryAfter = retryLater
@@ -175,29 +190,14 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 			s.sends.give(from, now, lim.SendsPerDay)
 		}
 	}()
-	if s.limits.PairCap > 0 {
-		n, oldest, err := s.store.PairCount(ctx, to, from)
-		if err != nil {
-			return err
-		}
-		if n >= s.limits.PairCap {
-			p := fail(protocol.CodePairFull, "the box holds the most unacked mail it takes from you: retry after it reads some", "%d unacked messages from this sender", n)
-			p.retryAfter = time.Duration(s.limits.PollAfter) * time.Second
-			p.unacked, p.oldest = &n, oldest
-			return p
-		}
+	release, p, err := s.reserveCaps(ctx, to, from)
+	if err != nil {
+		return err
 	}
-	if s.limits.BoxCap > 0 {
-		n, _, err := s.store.Count(ctx, to)
-		if err != nil {
-			return err
-		}
-		if n >= s.limits.BoxCap {
-			p := fail(protocol.CodeMailboxFull, "the box is full: retry later", "the box holds %d messages", n)
-			p.retryAfter = time.Duration(s.limits.PollAfter) * time.Second
-			return p
-		}
+	if p != nil {
+		return p
 	}
+	defer release()
 	// The box's own budget for new mail, from every sender together: what
 	// keeps one box from taking mail at any rate however many boxes send.
 	rlim, err := s.limitsFor(ctx, rcpt)
@@ -238,6 +238,74 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	stored = true
 	writeJSON(w, http.StatusCreated, receipt(h))
 	return nil
+}
+
+// inFlight is, for each box, the sends this process has let past the pair
+// and box caps and not yet stored, kept beside the store's counts and read
+// with them under one lock, so sends in flight at once cannot all pass on
+// the same counts (IronGall-dev/irongall-server#4). It is this process's
+// alone, as every count is (LIMITS.md).
+type inFlight struct {
+	mu   sync.Mutex
+	box  map[protocol.Address]int
+	pair map[[2]protocol.Address]int
+}
+
+// reserveCaps checks the pair and box caps for one more message from from
+// to box to, counting the sends in flight, and counts this one in. release
+// takes it out once the send is over: by then a stored message is in the
+// store's counts, so a send checked between the two sees both and is
+// refused one early, never let past. A refusal is p.
+func (s *Server) reserveCaps(ctx context.Context, to, from protocol.Address) (release func(), p *problem, err error) {
+	if s.limits.PairCap == 0 && s.limits.BoxCap == 0 {
+		return func() {}, nil, nil
+	}
+	// Load the box first, so what is read under the lock is memory.
+	if _, _, err := s.store.Count(ctx, to); err != nil {
+		return nil, nil, err
+	}
+	f := &s.inFlight[to[0]]
+	pair := [2]protocol.Address{to, from}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if s.limits.PairCap > 0 {
+		n, oldest, err := s.store.PairCount(ctx, to, from)
+		if err != nil {
+			return nil, nil, err
+		}
+		if n += f.pair[pair]; n >= s.limits.PairCap {
+			p := fail(protocol.CodePairFull, "the box holds the most unacked mail it takes from you: retry after it reads some", "%d unacked messages from this sender", n)
+			p.retryAfter = time.Duration(s.limits.PollAfter) * time.Second
+			p.unacked, p.oldest = &n, oldest
+			return nil, p, nil
+		}
+	}
+	if s.limits.BoxCap > 0 {
+		n, _, err := s.store.Count(ctx, to)
+		if err != nil {
+			return nil, nil, err
+		}
+		if n += f.box[to]; n >= s.limits.BoxCap {
+			p := fail(protocol.CodeMailboxFull, "the box is full: retry later", "the box holds %d messages", n)
+			p.retryAfter = time.Duration(s.limits.PollAfter) * time.Second
+			return nil, p, nil
+		}
+	}
+	if f.box == nil {
+		f.box, f.pair = map[protocol.Address]int{}, map[[2]protocol.Address]int{}
+	}
+	f.box[to]++
+	f.pair[pair]++
+	return func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.box[to]--; f.box[to] <= 0 {
+			delete(f.box, to)
+		}
+		if f.pair[pair]--; f.pair[pair] <= 0 {
+			delete(f.pair, pair)
+		}
+	}, nil, nil
 }
 
 // readLimit is the request body that carries a ciphertext of size bytes:

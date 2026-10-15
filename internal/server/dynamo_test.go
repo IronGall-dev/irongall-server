@@ -353,6 +353,11 @@ func TestRestartLoadsLazily(t *testing.T) {
 	}
 
 	fresh := startDynamo(t, e.clock.Now)
+	mk, err := e.keys.markKey() // a restart reads the same keys file: the same tags, the same versions
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh.UseMarkKey(mk)
 	if !fresh.Ready() || fresh.loads.Load() != 0 {
 		t.Fatalf("ready %v after %d loads: want ready with none", fresh.Ready(), fresh.loads.Load())
 	}
