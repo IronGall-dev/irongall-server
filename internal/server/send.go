@@ -276,7 +276,8 @@ func (s *Server) reserveCaps(ctx context.Context, to, from protocol.Address) (re
 		if n += f.pair[pair]; n >= s.limits.PairCap {
 			p := fail(protocol.CodePairFull, "the box holds the most unacked mail it takes from you: retry after it reads some", "%d unacked messages from this sender", n)
 			p.retryAfter = time.Duration(s.limits.PollAfter) * time.Second
-			p.unacked, p.oldest = &n, oldest
+			unacked := int64(n)
+			p.unacked, p.oldest = &unacked, oldest
 			return nil, p, nil
 		}
 	}

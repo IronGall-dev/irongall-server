@@ -52,7 +52,7 @@ type problem struct {
 	hint       string
 	retryAfter time.Duration // 429 and 503
 	// pair_full only
-	unacked *int
+	unacked *int64
 	oldest  time.Time
 }
 
@@ -67,7 +67,7 @@ func writeProblem(w http.ResponseWriter, p *problem) {
 	body := protocol.Problem{
 		Type:   p.code.TypeURI(),
 		Title:  titles[p.code],
-		Status: status,
+		Status: int64(status),
 		Detail: p.detail,
 		Code:   p.code,
 		Hint:   p.hint,

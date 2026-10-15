@@ -67,7 +67,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 		w.WriteHeader(http.StatusNotModified)
 		return nil
 	}
-	resp := protocol.MessageList{Count: n, Messages: []protocol.MessageInfo{}, PollAfter: s.limits.PollAfter}
+	resp := protocol.MessageList{Count: int64(n), Messages: []protocol.MessageInfo{}, PollAfter: int64(s.limits.PollAfter)}
 	if n == 0 || (after != nil && more == 0) {
 		writeJSON(w, http.StatusOK, resp)
 		return nil
@@ -86,7 +86,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 		resp.Messages = append(resp.Messages, protocol.MessageInfo{
 			ID:         hexID(h.ID),
 			From:       h.From.String(),
-			Size:       h.Size,
+			Size:       int64(h.Size),
 			ReceivedAt: formatTime(h.ReceivedAt),
 			ExpiresAt:  formatTime(h.ExpiresAt),
 		})

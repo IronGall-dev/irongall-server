@@ -110,7 +110,7 @@ func TestASenderCannotForgeAnEmptyBox(t *testing.T) {
 	var list protocol.MessageList
 	_ = json.NewDecoder(resp.Body).Decode(&list)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || list.Count != len(subset) {
+	if resp.StatusCode != http.StatusOK || list.Count != int64(len(subset)) {
 		t.Fatalf("a poll with the empty box's ETag: %d, count %d, want 200 and %d", resp.StatusCode, list.Count, len(subset))
 	}
 }

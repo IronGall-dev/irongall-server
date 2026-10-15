@@ -76,7 +76,7 @@ func (e *env) doAs(host, method, path string, body any, pass string) reply {
 	if resp.StatusCode >= 400 {
 		var p protocol.Problem
 		if err := json.Unmarshal(b, &p); err != nil || resp.Header.Get("Content-Type") != protocol.ProblemContentType ||
-			p.Status != resp.StatusCode || p.Type != p.Code.TypeURI() || p.Code.Status() != resp.StatusCode {
+			p.Status != int64(resp.StatusCode) || p.Type != p.Code.TypeURI() || p.Code.Status() != resp.StatusCode {
 			e.t.Fatalf("%s %s: %d is not a problem+json body matching the status map: %s", method, path, resp.StatusCode, b)
 		}
 		if got := resp.Header.Get("WWW-Authenticate"); (got == protocol.PassScheme) != (resp.StatusCode == http.StatusUnauthorized) {
