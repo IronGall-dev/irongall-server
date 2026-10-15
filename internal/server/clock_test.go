@@ -40,6 +40,7 @@ func TestABoxWhoseClockIsOffByLessThanThePassAllows(t *testing.T) {
 			t.Errorf("a clock %v off: init: %v", off, err)
 			continue
 		}
+		landAll(t, b)
 		fresh := e.box(protocol.Classic) // made this moment, on the server's clock: no certificate is newer
 		if _, err := fresh.Send(ctx, b.Address(), "under a certificate made this moment"); err != nil {
 			t.Errorf("a clock %v off: mail to it: %v", off, err)
@@ -69,10 +70,12 @@ func TestTheTwoClocksFurthestApart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	landAll(t, f)
 	s, err := client.Init(ctx, t.TempDir(), e.skewed(&slow), protocol.Classic)
 	if err != nil {
 		t.Fatal(err)
 	}
+	landAll(t, s)
 	send(t, f, s, "from the fast box to the slow one")
 	send(t, s, f, "from the slow box to the fast one")
 	for _, b := range []*client.Box{f, s} {
@@ -136,6 +139,7 @@ func TestABoxWhoseClockGoesBackFetchesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	landAll(t, b)
 	if res := receive(t, b); len(res.Delivered) != 0 { // the pass is in the box now, and the server remembers it
 		t.Fatal(res)
 	}
@@ -144,6 +148,7 @@ func TestABoxWhoseClockGoesBackFetchesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	landAll(t, sender)
 	send(t, sender, b, "under a certificate that starts 11 minutes back")
 
 	off = -12 * time.Minute

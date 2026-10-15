@@ -149,6 +149,8 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("PUT /v1/{addr}/prekey", s.handle(s.prekey))
 	api.HandleFunc("PUT /v1/{addr}/revocations", s.handle(s.revoke))
 	api.HandleFunc("GET /v1/{addr}/revocations", s.handle(s.revocations))
+	api.HandleFunc("PUT /v1/{addr}/acl", s.handle(s.putACL))
+	api.HandleFunc("GET /v1/{addr}/acl", s.handle(s.getACL))
 	api.HandleFunc("PUT /v1/{addr}/account", s.handle(s.adopt))
 	api.HandleFunc("DELETE /v1/{addr}/account", s.handle(s.leave))
 	api.HandleFunc("GET /v1/{addr}/messages", s.handle(s.list))

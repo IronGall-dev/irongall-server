@@ -97,6 +97,7 @@ func serve(args []string) error {
 	fs.IntVar(&l.PublicBurst, "public-burst", l.PublicBurst, "calls with no pass per IPv4 address or IPv6 /64, at once (0: off)")
 	fs.DurationVar(&l.PublicRefill, "public-refill", l.PublicRefill, "one more such call each")
 	fs.IntVar(&l.IdentityActsPerDay, "identity-acts-per-day", l.IdentityActsPerDay, "per box per UTC day: renewals under a later certificate, and raises of the revocation of certificates (0: off)")
+	fs.IntVar(&l.ACLEntries, "acl-entries", l.ACLEntries, "the most entries a box's ACL holds, its two lists together (0: off)")
 	fs.DurationVar(&l.BodyTimeout, "body-timeout", l.BodyTimeout, "how long a request body, or a response, may take before one more second for each -body-min-rate bytes moved; also the longest wait for the one large read (0: off)")
 	fs.IntVar(&l.BodyMinRate, "body-min-rate", l.BodyMinRate, "bytes a second a body must keep up, as Apache's RequestReadTimeout MinRate (0: off)")
 	idle := fs.Duration("idle-timeout", 75*time.Second, "how long an idle keep-alive connection stays open (nginx's default; above the 60 s nginx keeps idle upstream connections)")

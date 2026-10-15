@@ -54,10 +54,22 @@ func cloneBox(b *Box) *Box {
 	c.Retired = slices.Clone(b.Retired)
 	c.SenderKeyTypes = slices.Clone(b.SenderKeyTypes)
 	c.RevokedCerts, c.RevokedCertsSig = slices.Clone(b.RevokedCerts), slices.Clone(b.RevokedCertsSig)
+	c.ACL = cloneACL(b.ACL)
 	if b.Prekey != nil {
 		p := *b.Prekey
 		c.Prekey = &p
 	}
+	return &c
+}
+
+// cloneACL copies an ACL, which a box record holds and nothing changes in
+// place: it is replaced whole.
+func cloneACL(a *protocol.ACL) *protocol.ACL {
+	if a == nil {
+		return nil
+	}
+	c := *a
+	c.Allow.Addrs, c.Deny.Addrs = slices.Clone(a.Allow.Addrs), slices.Clone(a.Deny.Addrs)
 	return &c
 }
 
@@ -219,10 +231,23 @@ func (s *MemStore) DeleteMessage(_ context.Context, box protocol.Address, id [32
 }
 
 // DeleteMessages implements Store.
-func (s *MemStore) DeleteMessages(_ context.Context, box protocol.Address) error {
+func (s *MemStore) DeleteMessages(ctx context.Context, box protocol.Address) error {
+	return s.DeleteFrom(ctx, box, func(protocol.Address) bool { return true })
+}
+
+// DeleteFrom implements Store.
+func (s *MemStore) DeleteFrom(_ context.Context, box protocol.Address, from func(protocol.Address) bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.messages, box)
+	m := s.messages[box]
+	for id, msg := range m {
+		if from(msg.h.From) {
+			delete(m, id)
+		}
+	}
+	if len(m) == 0 {
+		delete(s.messages, box)
+	}
 	return nil
 }
 

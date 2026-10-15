@@ -66,6 +66,11 @@ type Box struct {
 	// serial replaces it.
 	RevokedCerts    []byte
 	RevokedCertsSig []byte
+	// ACL is the box's sender ACL (PROTOCOL.md §6.2): who may send to it,
+	// deny read first and then allow. nil until the box puts one, and a box
+	// with none takes mail from everyone. It is replaced whole, only by one
+	// of a higher version, and never removed.
+	ACL *protocol.ACL
 }
 
 // listed reports whether the box's identity has revoked the certificate of
@@ -243,6 +248,10 @@ type Store interface {
 	DeleteMessage(ctx context.Context, box protocol.Address, id [32]byte) error
 	// DeleteMessages deletes every live message in a box (close).
 	DeleteMessages(ctx context.Context, box protocol.Address) error
+	// DeleteFrom deletes every live message in a box whose sender from
+	// matches, as acks do: what an ACL's deny list now refuses (PROTOCOL.md
+	// §6.2). A message already gone is no error.
+	DeleteFrom(ctx context.Context, box protocol.Address, from func(protocol.Address) bool) error
 
 	// Account returns an account's record, or ErrNotFound. A store with
 	// memory reads it on its first use, then answers from memory.

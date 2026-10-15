@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -307,6 +308,14 @@ func boxState(b *Box) map[string]types.AttributeValue {
 		st["revoked_certs"] = bin(b.RevokedCerts)
 		st["revoked_certs_sig"] = bin(b.RevokedCertsSig)
 	}
+	// The box's ACL, as the document GET answers: absent until the box puts
+	// one, then replaced whole. No route removes it, and UpdateBox only sets.
+	if b.ACL != nil {
+		doc, err := json.Marshal(b.ACL.Document())
+		if err == nil { // a document of strings and a number always marshals
+			st["acl"] = bin(doc)
+		}
+	}
 	return st
 }
 
@@ -367,6 +376,24 @@ func decodeStanding(it item) (Standing, uint64, error) {
 	return st, rev, nil
 }
 
+// decodeACL reads a box record's ACL. It was checked when it was stored, so
+// one that does not read is a fault of the record.
+func decodeACL(it item) (*protocol.ACL, error) {
+	doc, err := it.bytes("acl")
+	if err != nil {
+		return nil, err
+	}
+	var d protocol.ACLDocument
+	if err := protocol.Unmarshal(doc, &d); err != nil {
+		return nil, fmt.Errorf("item: the stored ACL: %w", err)
+	}
+	acl, err := protocol.CheckACL(&d, 0)
+	if err != nil {
+		return nil, fmt.Errorf("item: the stored ACL: %w", err)
+	}
+	return acl, nil
+}
+
 func decodeBox(it item) (*Box, error) {
 	a, err := it.hash("addr")
 	if err != nil {
@@ -400,6 +427,11 @@ func decodeBox(it item) (*Box, error) {
 			return nil, err
 		}
 		if b.RevokedCertsSig, err = it.bytes("revoked_certs_sig"); err != nil {
+			return nil, err
+		}
+	}
+	if _, ok := it["acl"]; ok {
+		if b.ACL, err = decodeACL(it); err != nil {
 			return nil, err
 		}
 	}
@@ -874,6 +906,13 @@ func (s *DynamoStore) DeleteMessage(ctx context.Context, box protocol.Address, i
 // DeleteMessages implements Store (close): every live message in the box, as
 // acks: bodies first, then each item leaves the list.
 func (s *DynamoStore) DeleteMessages(ctx context.Context, box protocol.Address) error {
+	return s.DeleteFrom(ctx, box, func(protocol.Address) bool { return true })
+}
+
+// DeleteFrom implements Store: the live messages in the box whose sender
+// matches, as DeleteMessages deletes them all. The live index carries each
+// message's sender, so one Query of it finds them.
+func (s *DynamoStore) DeleteFrom(ctx context.Context, box protocol.Address, from func(protocol.Address) bool) error {
 	var ids [][32]byte
 	p := dynamodb.NewQueryPaginator(s.db, s.liveQuery(box, s.liveFrom(), s.consistent))
 	for p.HasMorePages() {
@@ -882,6 +921,13 @@ func (s *DynamoStore) DeleteMessages(ctx context.Context, box protocol.Address) 
 			return err
 		}
 		for _, it := range out.Items {
+			sender, err := item(it).hash("from")
+			if err != nil {
+				return err
+			}
+			if !from(protocol.Address(sender)) {
+				continue
+			}
 			k, err := item(it).bytes("live")
 			if err != nil {
 				return err

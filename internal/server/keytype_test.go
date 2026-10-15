@@ -275,6 +275,7 @@ func TestGoClientOnAP256Identity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
+	landAll(t, p)
 	ed := e.box(protocol.Classic)
 	send(t, p, ed, "from the P-256 box")
 	send(t, ed, p, "to the P-256 box")

@@ -38,6 +38,11 @@ type Limits struct {
 	PublicRefill       time.Duration // [tunable]
 	IdentityActsPerDay int           // per box, per UTC day: renewals under a later certificate and raises of the floor (decided: 10, as renewals)
 
+	// ACLEntries is the most entries a box's ACL holds, its two lists
+	// together [tunable]: a box's record, with its ACL, is held in the box
+	// cache, so this bounds what one record costs memory there.
+	ACLEntries int
+
 	// How long a body may take: BodyTimeout, and one second more for each
 	// BodyMinRate bytes received, as Apache's RequestReadTimeout counts; a
 	// response the same, for the bytes it writes. A body that stops coming
@@ -71,6 +76,7 @@ func DefaultLimits() Limits {
 		PublicBurst:          10,
 		PublicRefill:         50 * time.Second,
 		IdentityActsPerDay:   10,
+		ACLEntries:           500,
 		BodyTimeout:          20 * time.Second,
 		BodyMinRate:          500,
 	}

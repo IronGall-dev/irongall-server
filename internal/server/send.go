@@ -178,7 +178,14 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return p
 	}
 
-	// 8. Quotas, counted only for sends that carried their sender's pass,
+	// 8. First the box's ACL (PROTOCOL.md §6.2): deny, then allow. It is
+	// read before any quota is taken, so a refused send spends none of them.
+	// One code and one wording whether the sender was denied or is not on an
+	// allow list, so a sender cannot tell which.
+	if !rcpt.ACL.Admits(from) {
+		return fail(protocol.CodeSenderNotAllowed, "nothing the sender can change: its client moves the message to outbox/failed/", "this box's ACL does not let your box send to it")
+	}
+	// Then quotas, counted only for sends that carried their sender's pass,
 	// each taken before the write and given back unless the send is stored:
 	// sends in flight at once cannot all pass on one count.
 	stored := false

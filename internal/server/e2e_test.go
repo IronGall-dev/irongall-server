@@ -96,6 +96,25 @@ func (e *env) opts() client.Options {
 // box makes and registers a box.
 func (e *env) box(kt protocol.KeyType) *client.Box {
 	e.t.Helper()
+	b := e.heldBox(kt)
+	landAll(e.t, b)
+	return b
+}
+
+// landAll gives a box the policy that lands every sender's mail in inbox/:
+// the tests that use it are of the server, not of where the client lands
+// mail.
+func landAll(t *testing.T, b *client.Box) {
+	t.Helper()
+	if err := b.SetPolicy(client.Policy{Unknown: client.LandInbox, Server: client.AdmitAll}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// heldBox makes a box with the client's default policy, which holds mail
+// from a sender it has not allowed.
+func (e *env) heldBox(kt protocol.KeyType) *client.Box {
+	e.t.Helper()
 	b, err := client.Init(context.Background(), e.t.TempDir(), e.opts(), kt)
 	if err != nil {
 		e.t.Fatalf("init: %v", err)
@@ -432,4 +451,40 @@ func TestLimits(t *testing.T) {
 			t.Fatalf("polls every 30 s outlasted the burst: %v", err)
 		}
 	})
+}
+
+// The Go client against this server: a block reaches the server, which
+// refuses the blocked sender's next send for good and deleted what it held
+// from it; under "server allowed" a send to a new address tells the server
+// first, so the reply is taken and a stranger's send is refused.
+func TestTheGoClientsACL(t *testing.T) {
+	e := newEnv(t, relaxed())
+	ctx := context.Background()
+	a, b, c, stranger := e.heldBox(protocol.Classic), e.heldBox(protocol.Classic), e.heldBox(protocol.Classic), e.heldBox(protocol.Classic)
+	send(t, a, b, "waits on the server")
+	if _, err := b.Block(ctx, a.Address()); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, err := e.store.Count(ctx, b.Address()); err != nil || n != 0 {
+		t.Fatalf("the box still holds %d messages, %v", n, err)
+	}
+	_, err := a.Send(ctx, b.Address(), "refused")
+	if client.Code(err) != protocol.CodeSenderNotAllowed || !strings.Contains(err.Error(), "moved to outbox/failed/") {
+		t.Fatalf("a send from a blocked sender: %v", err)
+	}
+	if err := b.SetPolicy(client.Policy{Unknown: client.LandHeld, Server: client.AdmitAllowed}); err != nil {
+		t.Fatal(err)
+	}
+	send(t, b, c, "hello")
+	send(t, c, b, "the reply")
+	if _, err := stranger.Send(ctx, b.Address(), "refused"); client.Code(err) != protocol.CodeSenderNotAllowed {
+		t.Fatalf("a stranger's send: %v", err)
+	}
+	if res := receive(t, b); len(res.Delivered) != 1 || len(res.Held) != 0 {
+		t.Fatalf("b received %+v", res)
+	}
+	rec, err := e.store.Box(ctx, b.Address())
+	if err != nil || rec.ACL == nil || rec.ACL.Allow.Any || !rec.ACL.Allow.Has(c.Address()) || !rec.ACL.Deny.Has(a.Address()) || rec.ACL.Version != 2 {
+		t.Fatalf("the record holds %+v, %v", rec.ACL, err)
+	}
 }

@@ -11,7 +11,8 @@
 #   8. certificates revoked: the Go client renews and revokes its earlier certificates, a revocation made with ssh-keygen alone, and each
 #      client checking the one it is shown, refusing mail under a revoked certificate and following a box to its next one;
 #   9. a revocation server beside this one, the reference one from the client repo: each client publishes to both, each is shown by it
-#      a revocation this server was never told of, and with it gone mail still goes.
+#      a revocation this server was never told of, and with it gone mail still goes;
+#  10. the sender ACL: a Go box's block reaches this server, which refuses the recipe box's send for good.
 # Every script step runs in a FRESH shell (agents run each command in a new one). --no-pq boxes only when the local
 # age is older than 1.3 (it cannot make or send to a post-quantum box); the Go client handles both either way.
 # Needs: go, bash ≥ 4, age, age-keygen, ssh-keygen, curl, jq, sha256sum, base64, od. Run from anywhere:
@@ -54,7 +55,9 @@ done
 
 R="$work/r"; G="$work/g"
 recipe(){ local home=$1; shift; IRONGALL_HOME=$home bash -c ". '$SCRIPT'; $*"; }   # a fresh shell per call
-gocli(){ local home=$1; shift; IRONGALL_HOME=$home "$work/irongall" "$@"; }
+# The Go client holds mail from a sender its box has not allowed (PROTOCOL.md §5.6). These tests are of what the two clients
+# send each other, so every box the Go client runs lands every sender's mail in inbox/, by its policy file, unless a test wrote one.
+gocli(){ local home=$1; shift; mkdir -p -m 700 "$home" && { [ -e "$home/policy" ] || printf 'unknown inbox\n' > "$home/policy"; } && IRONGALL_HOME=$home "$work/irongall" "$@"; }
 nopq_arg(){ [ "$kt" = no-pq ] && echo --no-pq; }
 
 # --- 1. both ways, across renewals ---
@@ -297,6 +300,12 @@ for _ in $(seq 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$REV/")" = 
   && out2=$(recipe "$X4" "ig_revoke $X4A" 2>&1) && [ "$out2" = "revoked $X4A" ] && [ "$(at "$REV" "$X4A")" = 200 ] \
   && ! grep -q -e "$X5A" -e "GET" "$work/revocation-server.log" \
   && ok "restarted on its directory the revocation server still holds every record, the same command again publishes what it missed, and its log names no lookup" || bad "after the restart: $out / ${out2:-} / $(tail -n 3 "$work/revocation-server.log")"
+
+# --- the sender ACL: a Go box that blocks a recipe box, and a recipe send that the server then refuses for good ---
+XB="$work/xb"; XBL=$(recipe "$XB" "ig_init $(nopq_arg)") && XBA=${XBL##*/} || bad "recipe init for the ACL: $XBL"
+out=$(gocli "$G" block "$XBL" 2>&1) && curl -s -H "Authorization: $(cat "$G/pass")" "$IG_BASE/v1/$GA/acl" | jq -e --arg x "$XBA" '.allow == ["*"] and .deny == [$x] and .version > 0' > /dev/null \
+  && out=$(recipe "$XB" "ig_send $GL '$work/body'" 2>&1); [ $? -ne 0 ] && grep -q 'ERROR 403 sender_not_allowed' <<< "$out" && grep -q 'moved to outbox/failed/' <<< "$out" && [ -n "$(ls "$XB/outbox/failed/"*.P 2> /dev/null)" ] \
+  && ok "a Go box's block reaches the server as its ACL, which refuses the recipe box's send for good: it moves to outbox/failed/" || bad "the ACL: $out"
 
 echo "interop: $pass PASS, $fail FAIL"
 [ "$fail" -eq 0 ]
