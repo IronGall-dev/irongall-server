@@ -141,12 +141,13 @@ func TestRevocation(t *testing.T) {
 	}
 
 	// Nothing brings it back: not a registration, not a new prekey, and a
-	// second revocation changes nothing.
+	// second revocation changes nothing. Whatever is sent for a revoked box
+	// is answered from its record, with no check: nothing could change it.
 	if _, err := a.Rekey(ctx, protocol.Classic); client.Code(err) != protocol.CodeRevoked {
 		t.Fatalf("a revoked box's renewal: %v", err)
 	}
-	e.want(e.do("PUT", path, rec, ""), 200, "")
-	e.want(e.do("PUT", path, protocol.Revocations{Identity: docA, Revocation: []byte("revoke it")}, ""), 400, protocol.CodeBadRevocation)
+	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
+	e.want(e.do("PUT", path, protocol.Revocations{Identity: docA, Revocation: []byte("revoke it")}, ""), 410, protocol.CodeRevoked)
 	e.want(e.do("GET", "/v1/"+a.Address().String()+"/identity", nil, ""), 410, protocol.CodeRevoked)
 }
 
@@ -244,7 +245,7 @@ func TestARevocationOutlivesTheProcess(t *testing.T) {
 	if _, err := protocol.VerifyRevocation(a.Address(), got.Identity, got.Revocation); err != nil || string(got.Revocation) != string(rec.Revocation) {
 		t.Fatalf("what a later process shows for a revoked box: %v", err)
 	}
-	e2.want(e2.do("PUT", revocationPath(a.Address()), rec, ""), 200, "")
+	e2.want(e2.do("PUT", revocationPath(a.Address()), rec, ""), 410, protocol.CodeRevoked) // and answers what is sent for it from that record
 }
 
 // countingDeletes wraps a Store and counts DeleteMessages, the read of the
@@ -295,9 +296,9 @@ func countingEnv(t *testing.T) (*env, *countingDeletes) {
 }
 
 // A box's own revocation is public: whoever holds it may send it back, as it
-// is or as the same signature in other bytes that verify. Each is checked
-// and answered 200, and none draws another read of the box's messages: the
-// box holds none.
+// is or as the same signature in other bytes that verify. A revoked box takes
+// nothing more, so each is answered 410 from its record with no check, and
+// none draws another read of the box's messages: the box holds none.
 func TestASecondRevocationReadsNoMail(t *testing.T) {
 	e, cs := countingEnv(t)
 	a := e.box(protocol.Classic)
@@ -310,7 +311,7 @@ func TestASecondRevocationReadsNoMail(t *testing.T) {
 		t.Fatalf("a revocation read the messages table %d times, want 1", n)
 	}
 	// The same revocation again changes nothing, and reads nothing.
-	e.want(e.do("PUT", path, rec, ""), 200, "")
+	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
 	if n := cs.deletes(); n != 1 {
 		t.Errorf("a resent revocation read the messages table %d times, want 1", n)
 	}
@@ -318,7 +319,7 @@ func TestASecondRevocationReadsNoMail(t *testing.T) {
 	// armour, which anyone can add.
 	other := *rec
 	other.Revocation = append(bytes.Clone(rec.Revocation), '\n')
-	e.want(e.do("PUT", path, other, ""), 200, "")
+	e.want(e.do("PUT", path, other, ""), 410, protocol.CodeRevoked)
 	if n := cs.deletes(); n != 1 {
 		t.Errorf("a revocation resent in other bytes read the messages table %d times, want 1", n)
 	}
@@ -326,8 +327,9 @@ func TestASecondRevocationReadsNoMail(t *testing.T) {
 
 // The record is written before the mail is deleted, so a delete that fails
 // leaves a revoked box holding mail. The caller is told it failed, and the
-// same revocation again finishes it: memory shows the box holding mail, and
-// that is what a second delete is for.
+// same revocation again finishes it, answered 410 as anything for a revoked
+// box is: memory shows the box holding mail, and that is what a second delete
+// is for.
 func TestARevocationRetriedAfterAFailedDeleteDeletes(t *testing.T) {
 	ctx := context.Background()
 	e, cs := countingEnv(t)
@@ -348,12 +350,12 @@ func TestARevocationRetriedAfterAFailedDeleteDeletes(t *testing.T) {
 	if n, _, err := e.store.Count(ctx, a.Address()); err != nil || n != 1 {
 		t.Fatalf("after a revocation whose delete failed the box holds %d messages (%v), want the 1 it had", n, err)
 	}
-	e.want(e.do("PUT", path, rec, ""), 200, "")
+	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
 	if n, _, err := e.store.Count(ctx, a.Address()); err != nil || n != 0 {
 		t.Errorf("after the retry the revoked box holds %d messages (%v), want none", n, err)
 	}
 	// With the box empty, one more reads nothing.
-	e.want(e.do("PUT", path, rec, ""), 200, "")
+	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
 	if n := cs.deletes(); n != 2 {
 		t.Errorf("a revocation, its retry and one more read the messages table %d times, want 2", n)
 	}
@@ -362,9 +364,9 @@ func TestARevocationRetriedAfterAFailedDeleteDeletes(t *testing.T) {
 // A revocation of the address may come with the revocation of its
 // certificates the box already holds: the record a server shows for an
 // address carries both. That is nothing new, and the revocation of the
-// address is taken all the same. Every part of a body is checked whatever the
-// box holds: the revocation it holds, with something beside it that is not a
-// revocation of certificates, is refused.
+// address is taken all the same. A part that is not a revocation of
+// certificates is refused, with the revocation beside it, and nothing changes.
+// Once the box is revoked, anything sent for it is answered from its record.
 func TestARevocationComesWithTheCertificatesHeld(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t, relaxed())
@@ -376,11 +378,15 @@ func TestARevocationComesWithTheCertificatesHeld(t *testing.T) {
 	if both.Revocation, err = protocol.SignRevocation(r.signer, r.id.Address()); err != nil {
 		t.Fatal(err)
 	}
+	junk := both
+	junk.RevokedCertificates, junk.RevokedCertificatesSignature = []byte("not a revocation"), []byte("not a signature")
+	e.want(e.do("PUT", path, junk, ""), 400, protocol.CodeBadRevocation)
+	if stored, err := e.store.Box(ctx, r.id.Address()); err != nil || stored.State == Revoked {
+		t.Fatalf("a revocation that came with something that is not one was taken: %+v, %v", stored, err)
+	}
 	e.want(e.do("PUT", path, both, ""), 201, "")
 	if stored, err := e.store.Box(ctx, r.id.Address()); err != nil || stored.State != Revoked || !bytes.Equal(stored.Revocation, both.Revocation) {
 		t.Fatalf("a revocation that came with the certificates' already held was not taken: %+v, %v", stored, err)
 	}
-	junk := both
-	junk.RevokedCertificates, junk.RevokedCertificatesSignature = []byte("not a revocation"), []byte("not a signature")
-	e.want(e.do("PUT", path, junk, ""), 400, protocol.CodeBadRevocation)
+	e.want(e.do("PUT", path, junk, ""), 410, protocol.CodeRevoked)
 }

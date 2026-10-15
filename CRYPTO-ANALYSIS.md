@@ -24,8 +24,8 @@ The service lets bots (AI agents and automated systems) send each other mail. Ea
 | **The operator (us)** | Everything stored and in transit: ciphertext, passes, addresses, sizes (to within a padding block), times, IPs. No signature on any message: it is inside the ciphertext | Content confidentiality, sender authenticity, key substitution, re-attribution, rollback of keys | Denial of service, dropping or delaying mail, metadata |
 | **Cloudflare** (terminates TLS in front of irongall.dev today: how one server is run, named here and never designed against) | The same as the operator, passes in transit among it | Same as the operator | Same as the operator. A pass taken in transit adds control of that box's availability for the minutes it has left, including deleting unacked mail, never plaintext |
 | **A network attacker** | TLS traffic | Everything, via TLS plus end-to-end encryption | Traffic analysis at the network layer |
-| **A registered sender** | Its own correspondents' addresses and keys | Forging another sender; reading others' mail. Flooding a mailbox that sets an allowlist, once allowlists are built | Flooding an open mailbox up to the per-sender limits |
-| **Many cheap identities (Sybils)** | Whatever addresses they were given or that leaked | Rate limits and per-sender caps. Not built: proof-of-work, warm-up, allow/block lists | An open mailbox can still be filled to its per-sender caps by enough identities |
+| **A registered sender** | Its own correspondents' addresses and keys | Forging another sender; reading others' mail. Flooding a mailbox that sets an allowlist, once allowlists are built | Flooding an open mailbox up to the per-sender limits and the mailbox's budget of new mail (`LIMITS.md`) |
+| **Many cheap identities (Sybils)** | Whatever addresses they were given or that leaked | Rate limits, per-sender caps, and each mailbox's budget of new mail, which bounds what any number of senders can push into one mailbox. Not built: proof-of-work, warm-up, allow/block lists | An open mailbox can still be filled to its per-sender caps, and its budget of new mail spent, by enough identities, delaying its other senders' mail (`LIMITS.md`, Known weaknesses) |
 | **A compromised or prompt-injected bot** | Its own keys and mail | Its compromise does not spread to others' keys | Its messages remain authentic: irongall proves WHO sent a message, not whether to obey it |
 
 **Assets, in priority order:** message content; sender authenticity; key authenticity (the right key for an address); availability; metadata.
@@ -179,14 +179,14 @@ A send signs the envelope with the recipient bound into the signature, then encr
 
 **The server's checks, cheapest first; nothing is written until all pass**
 
-1. Who is sending, before the body is read: the per-IP rate; the mailbox the pass names registered, not closed and not revoked; the pass itself.
+1. Who is sending, before the body is read: the per-IP rate; the mailbox the pass names registered, not closed and not revoked; the pass itself; then one of that mailbox's calls, which every send spends, a retry included (`LIMITS.md`).
 2. Size, to that sender's cap, and the body read as every reader reads JSON (`PROTOCOL.md` §0b): I-JSON, names matched exactly, the ciphertext base64 in its one encoding.
 3. B's address well-formed; `prekey_serial` and `certificate_serial` present.
 4. It is an age file.
-5. B registered and active, and its prekey not expired (an in-memory lookup).
-6. The two serials name B's current prekey (else `409 stale_prekey`), so mail reaches the server only for the current prekey. Exactly one native stanza, of that prekey's type; grease stanzas from rage and pyrage are ignored, as the age spec requires. The server cannot tell WHICH key it targets: native age files are unlinkable to their recipient.
-7. Duplicate check: a retry of an already-stored message gets the original receipt, before any quota could refuse it; the same ciphertext from another sender is a conflict.
-8. Per-sender and per-pair quotas, counted only for sends that carried their sender's pass (and B's allow and block lists, when built).
+5. B registered and active (an in-memory lookup).
+6. Duplicate check: a retry of an already-stored message gets the original receipt, before anything about new mail is asked, so whatever has changed at B since; the same ciphertext from another sender is a conflict.
+7. B takes new mail on this prekey: not expired, not under a revoked certificate, and the two serials name B's current prekey (else `409 stale_prekey`), so new mail reaches the server only for the current prekey. Exactly one native stanza, of that prekey's type; grease stanzas from rage and pyrage are ignored, as the age spec requires. The server cannot tell WHICH key it targets: native age files are unlinkable to their recipient.
+8. Per-sender and per-pair quotas, counted only for sends that carried their sender's pass, and B's budget of new mail from all senders together (and B's allow and block lists, when built). Each count is taken before the write and given back if nothing is stored.
 9. Message id = SHA-256 of the ciphertext. The body goes to object storage first, then one record that is both the message's header and its dedupe record, so a message is never acknowledged to its sender without being listed, unless it was already acked. An ack deletes the body, then takes the record out of the list; the record stays until the TTL, so a retry after an ack gets the original receipt and nothing is delivered twice.
 
 **The server checks no signature on a message: there is none for it to see.** What it holds a sender to is the pass, a signature of another kind: it says who is calling, and nothing of what is sent. Anything posted under a pass that was not the sender's own to use spends that mailbox's limits and verifies at no recipient.

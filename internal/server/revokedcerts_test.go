@@ -186,8 +186,8 @@ func TestRevokedCertificates(t *testing.T) {
 		t.Fatalf("a body that verified in part changed the record: %+v, %v", stored, err)
 	}
 	e.want(e.do("GET", other.path("/revocations"), nil, ""), 404, protocol.CodeNotRevoked)
-	// Whole, both are kept, and both are shown. A revoked box takes no
-	// revocation of its certificates alone.
+	// Whole, both are kept, and both are shown. A revoked box takes nothing
+	// more: whatever is sent for it is answered from its record.
 	e.want(e.do("PUT", other.path("/revocations"), both, ""), 201, "")
 	shown = e.do("GET", other.path("/revocations"), nil, "")
 	e.want(shown, 200, "")
@@ -197,7 +197,7 @@ func TestRevokedCertificates(t *testing.T) {
 	}
 	e.want(e.do("GET", other.path("/identity"), nil, ""), 410, protocol.CodeRevoked)
 	e.want(e.do("PUT", other.path("/revocations"), other.certs(2), ""), 410, protocol.CodeRevoked)
-	e.want(e.do("PUT", other.path("/revocations"), both, ""), 200, "")
+	e.want(e.do("PUT", other.path("/revocations"), both, ""), 410, protocol.CodeRevoked)
 }
 
 // A body that is not a revocation of certificates costs the server a
@@ -360,15 +360,16 @@ func TestARecordsStandingKnowsItsRevokedCertificates(t *testing.T) {
 	}
 }
 
-// A holder of a box's working key spends the box's renewals for the day, so
-// the owner's remedy is refused its renewal (rate_limited). It publishes its
-// revocation all the same, and from then on this server takes nothing more under
-// the taken certificate, and counts none of it: the owner's renewal is taken
-// the next UTC day.
-func TestTheRemedyOutlastsATakerWhoSpentTheDaysRenewals(t *testing.T) {
+// A holder of a box's working key spends the box's renewals for the day, and
+// holds nothing by it: a renewal under a later certificate is the identity's
+// act, counted apart (Limits.IdentityActsPerDay), so the owner's remedy renews
+// and revokes the taken certificate the same day. From then on this server
+// takes nothing more under that certificate.
+func TestTheRemedyRenewsWhenATakerSpentTheDaysRenewals(t *testing.T) {
 	ctx := context.Background()
 	l := relaxed()
 	l.RenewalsPerDay = DefaultLimits().RenewalsPerDay
+	l.IdentityActsPerDay = DefaultLimits().IdentityActsPerDay
 	e := newEnv(t, l)
 	now := e.clock.Now()
 	e.clock.Add(now.Truncate(24 * time.Hour).Add(25 * time.Hour).Sub(now)) // 01:00 UTC, far from a day's end
@@ -390,18 +391,12 @@ func TestTheRemedyOutlastsATakerWhoSpentTheDaysRenewals(t *testing.T) {
 	for i := range l.RenewalsPerDay {
 		e.want(thief(inUse+uint64(i)+1), 200, "")
 	}
+	e.want(thief(inUse+uint64(l.RenewalsPerDay)+1), 429, protocol.CodeRateLimited) // the taker is out of renewals
 	r, err := a.RenewAndRevoke(ctx, protocol.Classic)
-	if err != nil || r == nil || client.Code(r.NotRenewed) != protocol.CodeRateLimited || r.Revoked == nil || !r.Revoked.Revokes(inUse) || r.Revoked.Revokes(r.Below) {
+	if err != nil || r == nil || r.NotRenewed != nil || r.Prekey == nil || r.Revoked == nil || !r.Revoked.Revokes(inUse) || r.Revoked.Revokes(r.Below) {
 		t.Fatalf("the owner's remedy after the taker's renewals: %+v, %v", r, err)
 	}
 	e.want(thief(inUse+100), 400, protocol.CodeBadKey)
-	if p, cert := e.numbers(a.Address()); cert != inUse || p != inUse+uint64(l.RenewalsPerDay) {
-		t.Fatalf("the record after the revocation: prekey %d under certificate %d", p, cert)
-	}
-	e.clock.Add(24 * time.Hour)
-	if _, err := a.Rekey(ctx, protocol.Classic); err != nil {
-		t.Fatalf("the owner's renewal the next UTC day: %v", err)
-	}
 	if _, cert := e.numbers(a.Address()); cert != r.Below {
 		t.Fatalf("the box stands at certificate %d, not the one the remedy made, %d", cert, r.Below)
 	}

@@ -87,7 +87,14 @@ func serve(args []string) error {
 	fs.IntVar(&l.PollAfter, "poll-after", l.PollAfter, "poll interval told to clients, seconds")
 	fs.IntVar(&l.RegistrationsPerHour, "registrations-per-hour", l.RegistrationsPerHour, "registrations per IPv4 address or IPv6 /64 (0: off)")
 	fs.IntVar(&l.SendsPerMinutePerIP, "sends-per-minute-per-ip", l.SendsPerMinutePerIP, "pre-auth sends per IP (0: off)")
-	fs.IntVar(&l.MissesPerMinute, "misses-per-minute", l.MissesPerMinute, "reads of the boxes table that find no box, per IP (0: off)")
+	fs.IntVar(&l.MissesPerMinute, "misses-per-minute", l.MissesPerMinute, "calls per IP that named no box or carried nothing that verified (0: off)")
+	fs.IntVar(&l.ReceiveBurst, "receive-burst", l.ReceiveBurst, "new messages a box takes at once, from all senders together (0: off)")
+	fs.DurationVar(&l.ReceiveRefill, "receive-refill", l.ReceiveRefill, "one more new message each")
+	fs.IntVar(&l.CallBurst, "call-burst", l.CallBurst, "a box's calls with its pass that no other budget counts, at once (0: off)")
+	fs.DurationVar(&l.CallRefill, "call-refill", l.CallRefill, "one more such call each")
+	fs.IntVar(&l.PublicBurst, "public-burst", l.PublicBurst, "calls with no pass per IPv4 address or IPv6 /64, at once (0: off)")
+	fs.DurationVar(&l.PublicRefill, "public-refill", l.PublicRefill, "one more such call each")
+	fs.IntVar(&l.IdentityActsPerDay, "identity-acts-per-day", l.IdentityActsPerDay, "per box per UTC day: renewals under a later certificate, and raises of the revocation of certificates (0: off)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

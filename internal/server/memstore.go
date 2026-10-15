@@ -345,6 +345,10 @@ func (s *MemStore) Adopt(_ context.Context, b *Box, account string, key [16]byte
 	k.Uses--
 	cur.Account, cur.Rev = account, cur.Rev+1
 	b.Account, b.Rev = account, cur.Rev
+	if st, ok := s.held[b.Addr]; ok {
+		st.InAccount = cur.Account != ""
+		s.held[b.Addr] = st
+	}
 	return nil
 }
 
@@ -358,5 +362,9 @@ func (s *MemStore) Leave(_ context.Context, b *Box) error {
 	}
 	cur.Account, cur.Rev = "", cur.Rev+1
 	b.Account, b.Rev = "", cur.Rev
+	if st, ok := s.held[b.Addr]; ok {
+		st.InAccount = cur.Account != ""
+		s.held[b.Addr] = st
+	}
 	return nil
 }

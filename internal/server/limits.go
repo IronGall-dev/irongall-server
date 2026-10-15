@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net"
 	"sync"
 	"time"
@@ -24,7 +25,16 @@ type Limits struct {
 
 	RegistrationsPerHour int // per IPv4 address or IPv6 /64 [tunable]
 	SendsPerMinutePerIP  int // the pre-auth send rate per IP [tunable]
-	MissesPerMinute      int // reads of the boxes table that find no box, per IP (decided: 10 for now)
+	MissesPerMinute      int // per IP: reads of the boxes table that find no box, and checks that fail (decided: 10 for now)
+
+	// Budgets: a burst at once and one more each refill (LIMITS.md).
+	ReceiveBurst       int           // per box: new messages it takes, from all senders together (decided: 50); an account lifts it
+	ReceiveRefill      time.Duration // (decided: 6 s, ten a minute)
+	CallBurst          int           // per box: its calls with its pass that no other budget counts [tunable]; an account lifts it
+	CallRefill         time.Duration // [tunable]
+	PublicBurst        int           // per IP: calls with no pass [tunable]
+	PublicRefill       time.Duration // [tunable]
+	IdentityActsPerDay int           // per box, per UTC day: renewals under a later certificate and raises of the floor (decided: 10, as renewals)
 }
 
 // DefaultLimits are the decided numbers, and the proposed values of the
@@ -42,6 +52,13 @@ func DefaultLimits() Limits {
 		RetiredKept:          10,
 		RegistrationsPerHour: 10,
 		MissesPerMinute:      10,
+		ReceiveBurst:         50,
+		ReceiveRefill:        6 * time.Second,
+		CallBurst:            50,
+		CallRefill:           6 * time.Second,
+		PublicBurst:          10,
+		PublicRefill:         50 * time.Second,
+		IdentityActsPerDay:   10,
 	}
 }
 
@@ -80,11 +97,93 @@ type buckets struct {
 	every time.Duration
 	full  map[string]time.Time
 	sweep time.Time // when prune next runs
+	// held counts each key's reservations not yet kept or released, and
+	// settled is closed and replaced each time one is (reserve).
+	held    map[string]int
+	settled chan struct{}
 }
 
 // newBuckets is buckets of n, refilled one every interval.
 func newBuckets(n int, every time.Duration) *buckets {
-	return &buckets{n: n, every: every, full: map[string]time.Time{}}
+	return &buckets{n: n, every: every, full: map[string]time.Time{}, held: map[string]int{}, settled: make(chan struct{})}
+}
+
+// reserveWait bounds how long a reservation waits for others of its key to
+// settle. What they wait on is a table read or a signature check, which
+// takes milliseconds.
+const reserveWait = time.Second
+
+// reservation is a token taken before work whose outcome says whether it
+// counts: kept if it does, given back if not.
+type reservation struct {
+	bs   *buckets
+	key  string
+	done bool
+}
+
+// reserve takes a token for key before the work it guards. When none is
+// left only because reservations of the same key are still in flight, it
+// waits for one to settle, up to reserveWait or the end of ctx: so calls
+// that would all be given back, made at once, are not refused for each
+// other. It returns how long until a token is due when it refuses. A nil
+// reservation with ok true is a bucket set that never limits.
+func (bs *buckets) reserve(ctx context.Context, key string, now func() time.Time) (r *reservation, ok bool, wait time.Duration) {
+	if bs.n == 0 || bs.every <= 0 {
+		return nil, true, 0
+	}
+	var give *time.Timer // made only once there is something to wait for
+	for {
+		bs.mu.Lock()
+		t := now()
+		bs.prune(t)
+		next, over := bs.next(key, t)
+		if over <= 0 {
+			bs.full[key] = next
+			bs.held[key]++
+			bs.mu.Unlock()
+			return &reservation{bs: bs, key: key}, true, 0
+		}
+		inFlight, settled := bs.held[key] > 0, bs.settled
+		bs.mu.Unlock()
+		if !inFlight {
+			return nil, false, over
+		}
+		if give == nil {
+			give = time.NewTimer(reserveWait)
+			defer give.Stop()
+		}
+		select {
+		case <-settled:
+		case <-give.C:
+			return nil, false, over
+		case <-ctx.Done():
+			return nil, false, over
+		}
+	}
+}
+
+// keep settles the reservation as counted: its token stays taken.
+func (r *reservation) keep() { r.settle(false, time.Time{}) }
+
+// release settles the reservation as not counted: its token goes back.
+func (r *reservation) release(now time.Time) { r.settle(true, now) }
+
+func (r *reservation) settle(back bool, now time.Time) {
+	if r == nil || r.done {
+		return
+	}
+	r.done = true
+	bs := r.bs
+	bs.mu.Lock()
+	if bs.held[r.key]--; bs.held[r.key] <= 0 {
+		delete(bs.held, r.key)
+	}
+	if back {
+		bs.giveLocked(r.key, now)
+	}
+	close(bs.settled)
+	bs.settled = make(chan struct{})
+	bs.mu.Unlock()
 }
 
 // perPeriod is buckets of n, refilled n per period.
@@ -111,6 +210,21 @@ func (bs *buckets) take(key string, now time.Time) (ok bool, wait time.Duration)
 	}
 	bs.full[key] = next
 	return true, 0
+}
+
+// giveLocked puts back a token taken for key, for a call that turned out not
+// to count: a reservation released. It never fills a bucket past full. The
+// caller holds bs.mu.
+func (bs *buckets) giveLocked(key string, now time.Time) {
+	full, ok := bs.full[key]
+	if !ok {
+		return
+	}
+	if full = full.Add(-bs.every); full.After(now) {
+		bs.full[key] = full
+	} else {
+		delete(bs.full, key)
+	}
 }
 
 // ready reports whether key has a token at now, and takes none: for a limit
@@ -163,10 +277,11 @@ type daily struct {
 	n   map[protocol.Address]int
 }
 
-// add checks a send by a at now is under limit, and counts it if commit;
-// otherwise it returns how long until the next UTC day. limit == 0 never
-// limits.
-func (d *daily) add(a protocol.Address, now time.Time, limit int, commit bool) (ok bool, wait time.Duration) {
+// take counts one for a at now if a is under limit, and otherwise returns how
+// long until the next UTC day. A count is taken before the work it guards
+// and given back if that work does not happen (give), so calls in flight at
+// once cannot all pass on one count. limit == 0 never limits.
+func (d *daily) take(a protocol.Address, now time.Time, limit int) (ok bool, wait time.Duration) {
 	if limit == 0 {
 		return true, 0
 	}
@@ -180,10 +295,21 @@ func (d *daily) add(a protocol.Address, now time.Time, limit int, commit bool) (
 		next := now.UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
 		return false, next.Sub(now)
 	}
-	if commit {
-		d.n[a]++
-	}
+	d.n[a]++
 	return true, 0
+}
+
+// give takes back a count take took at now under limit, for work that did
+// not happen. A count from a day already past is gone with its day.
+func (d *daily) give(a protocol.Address, now time.Time, limit int) {
+	if limit == 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.day == now.UTC().Format(time.DateOnly) && d.n[a] > 0 {
+		d.n[a]--
+	}
 }
 
 // ipKey keys a per-IP limit on a client address: the IPv4 address, or the

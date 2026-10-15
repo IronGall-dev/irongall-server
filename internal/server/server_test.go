@@ -901,7 +901,11 @@ func TestSendNamesTheCurrentPrekey(t *testing.T) {
 // prekeys, so a box that renews often cannot grow it.
 func TestRenewalLimits(t *testing.T) {
 	l := relaxed()
-	l.RenewalsPerDay, l.RetiredKept = 3, 2
+	// The Go client certifies a new working key with each prekey, so each of
+	// its renewals is its identity's act, counted under that limit: a
+	// renewal under the current certificate counts under the other
+	// (TestTheRemedyRenewsWhenATakerSpentTheDaysRenewals).
+	l.RenewalsPerDay, l.IdentityActsPerDay, l.RetiredKept = 3, 3, 2
 	e := newEnv(t, l)
 	ctx := context.Background()
 	now := e.clock.Now()

@@ -344,6 +344,13 @@ func decodeStanding(it item) (Standing, uint64, error) {
 		return Standing{}, 0, err
 	}
 	st := Standing{State: State(state), Key: key, Cert: cert}
+	if _, ok := it["account"]; ok {
+		acc, err := it.bytes("account")
+		if err != nil {
+			return Standing{}, 0, err
+		}
+		st.InAccount = len(acc) > 0
+	}
 	if _, ok := it["revoked_certs"]; ok {
 		list, err := it.bytes("revoked_certs")
 		if err != nil {

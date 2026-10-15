@@ -136,6 +136,9 @@ type Standing struct {
 	// has revoked (PROTOCOL.md §6.3a): no pass of the box is taken until it
 	// publishes a prekey under a new certificate.
 	Listed bool
+	// InAccount is true for a box in an account, whose limits are read from
+	// it; a box in none has the server's, with nothing to read.
+	InAccount bool
 }
 
 // standing is b's standing.
@@ -148,7 +151,7 @@ func (b *Box) standing() (Standing, error) {
 	if err != nil {
 		return Standing{}, err
 	}
-	return Standing{State: b.State, Key: key, Cert: b.Cert, Listed: listed}, nil
+	return Standing{State: b.State, Key: key, Cert: b.Cert, Listed: listed, InAccount: b.Account != ""}, nil
 }
 
 // identityWire is the key of a stored identity document, in SSH wire form:

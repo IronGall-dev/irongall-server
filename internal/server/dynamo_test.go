@@ -704,11 +704,12 @@ func TestRetryAfterCloseIsNotRedelivered(t *testing.T) {
 	if _, err := b.Rekey(ctx, ""); err != nil { // reopen
 		t.Fatal(err)
 	}
-	// A retry of the same bytes names the retired serial: it is stale, and
-	// never reaches the dedupe record.
+	// A retry of the same bytes is answered as the first send was, from the
+	// dedupe record, though it names the retired serial (PROTOCOL.md §4.5
+	// step 6): it stores nothing, and what the close deleted stays deleted.
 	var req protocol.SendRequest
 	_ = json.Unmarshal(*sent, &req)
-	if r := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a)); r.code() != protocol.CodeStalePrekey {
+	if r := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a)); r.status != http.StatusOK {
 		t.Fatalf("retry: %d %s", r.status, r.body)
 	}
 	if res := receive(t, b); len(res.Delivered) != 0 {

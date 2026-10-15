@@ -126,9 +126,19 @@ func (s *Server) held(r *http.Request, box protocol.Address, id [32]byte) error 
 		return err
 	}
 	if !ok {
-		return gone()
+		return s.notHeld(r, box)
 	}
 	return nil
+}
+
+// notHeld answers a fetch or an ack of an id box a does not hold. A held
+// message's first fetch and its ack are paid for by its receive; anything
+// else is a call, spent from the box's budget (Limits.CallBurst).
+func (s *Server) notHeld(r *http.Request, a protocol.Address) error {
+	if err := s.spendOwner(r.Context(), a); err != nil {
+		return err
+	}
+	return gone()
 }
 
 // fetch is GET /v1/<address>/messages/<id>: the body, read through this
@@ -140,14 +150,14 @@ func (s *Server) fetch(w http.ResponseWriter, r *http.Request) error {
 	}
 	id, err := pathID(r)
 	if err != nil {
-		return err
+		return s.notHeld(r, box)
 	}
 	held, again, err := s.store.Fetched(r.Context(), box, id)
 	if err != nil {
 		return err
 	}
 	if !held {
-		return gone()
+		return s.notHeld(r, box)
 	}
 	// A message is fetched once and kept by its reader. Fetching it again is
 	// for catching up after a failure, so it has an allowance of its own, and
@@ -183,7 +193,7 @@ func (s *Server) ack(w http.ResponseWriter, r *http.Request) error {
 	}
 	id, err := pathID(r)
 	if err != nil {
-		return err
+		return s.notHeld(r, box)
 	}
 	if err := s.held(r, box, id); err != nil {
 		return err

@@ -134,7 +134,7 @@ func TestCostMemoryPerBox(t *testing.T) {
 	before = heapNow()
 	var d daily
 	for _, a := range addrs {
-		d.add(a, now, 20, true)
+		d.take(a, now, 20)
 	}
 	t.Logf("daily send count: %6.0f B per sender that sent today", float64(heapNow()-before)/n)
 	runtime.KeepAlive(&d)

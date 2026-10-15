@@ -50,6 +50,9 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if err := s.spendOwner(r.Context(), a); err != nil {
+		return err
+	}
 	var req protocol.AdoptRequest
 	if err := decodeBody(w, r, 4<<10, &req); err != nil {
 		return err
@@ -87,6 +90,9 @@ func (s *Server) leave(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if err := s.spendOwner(r.Context(), a); err != nil {
+		return err
+	}
 	b, err := s.box(r.Context(), a)
 	if err != nil {
 		return err
@@ -106,9 +112,10 @@ func (s *Server) leave(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// limitsFor returns the limits a sender gets: the server's, unless it is in
-// an unmetered account, whose boxes have no daily limit and the largest cap.
-// A box whose account is gone has the server's.
+// limitsFor returns the limits a box gets: the server's, unless it is in an
+// unmetered account, whose boxes have no daily limit, the largest cap, and
+// no budget of calls or of mail received. A box whose account is gone has the
+// server's. These are the volume levers (LIMITS.md): what an account may lift.
 func (s *Server) limitsFor(ctx context.Context, b *Box) (Limits, error) {
 	l := s.limits
 	if b.Account == "" {
@@ -122,7 +129,7 @@ func (s *Server) limitsFor(ctx context.Context, b *Box) (Limits, error) {
 		return l, err
 	}
 	if acc.Unmetered {
-		l.SendsPerDay, l.MaxSize = 0, l.ceiling()
+		l.SendsPerDay, l.MaxSize, l.CallBurst, l.ReceiveBurst = 0, l.ceiling(), 0, 0
 	}
 	return l, nil
 }

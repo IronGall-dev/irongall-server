@@ -46,7 +46,7 @@ else
   store=(--dev)
 fi
 echo "server: irongalld serve ${store[*]:0:6}"
-"$work/irongalld" serve "${store[@]}" -listen "127.0.0.1:$port" -poll-burst 0 -registrations-per-hour 0 2> "$work/server.log" & srv=$!
+"$work/irongalld" serve "${store[@]}" -listen "127.0.0.1:$port" -poll-burst 0 -registrations-per-hour 0 -public-burst 0 2> "$work/server.log" & srv=$!   # every box here registers from one address
 export IG_BASE="http://127.0.0.1:$port" IRONGALL_BASE="http://127.0.0.1:$port"
 for _ in $(seq 300); do   # up once the API answers other than 503 (loading)
   code=$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$(printf '0%.0s' $(seq 64))/identity"); [ "$code" != 000 ] && [ "$code" != 503 ] && break; sleep 0.1

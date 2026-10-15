@@ -116,16 +116,47 @@ const (
 // by a working key of the identity whose key, in SSH wire form, is key
 // (PROTOCOL.md §6.1b). p is the call's pass if the caller parsed it already,
 // and otherwise nil.
+//
+// A pass this process does not remember costs signature checks, and anyone
+// can bring one: so its caller's address reserves a count under
+// Limits.MissesPerMinute first, kept if the pass fails and given back if it
+// passes (s.miss). One the process remembers is a lookup in memory.
 func (s *Server) checkPass(r *http.Request, a protocol.Address, key string, cert [32]byte, p *protocol.Pass) error {
+	return s.passCheck(r, a, key, cert, p, true)
+}
+
+// checkPassBounded is checkPass for a call that a count taken before it
+// already bounds, a registration's (Limits.RegistrationsPerHour): its pass
+// is checked without a count of its own.
+func (s *Server) checkPassBounded(r *http.Request, a protocol.Address, key string, cert [32]byte) error {
+	return s.passCheck(r, a, key, cert, nil, false)
+}
+
+func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert [32]byte, p *protocol.Pass, count bool) (err error) {
 	auth := r.Header.Get("Authorization")
 	if len(auth) > protocol.MaxPassAuthorization {
-		// Longer than any pass can be: refused before it is hashed or parsed.
-		return unauthorized(hintPass, "no pass, or not a pass")
+		if !count {
+			return unauthorized(hintPass, "no pass, or not a pass")
+		}
+		return s.notAPass(r) // longer than any pass can be: refused before it is hashed or parsed
 	}
 	now := s.now()
 	sum := sha256.Sum256([]byte(auth))
 	if s.passes.has(a, sum, cert, now) {
 		return nil
+	}
+	if count {
+		var m *reservation
+		if m, err = s.miss(r); err != nil {
+			return err
+		}
+		defer func() {
+			if err != nil {
+				m.keep()
+			} else {
+				m.release(s.now())
+			}
+		}()
 	}
 	if p == nil {
 		var err error
@@ -185,6 +216,27 @@ func (s *Server) checkPass(r *http.Request, a protocol.Address, key string, cert
 	return nil
 }
 
+// notAPass refuses a call whose Authorization holds no pass, and counts it
+// against the caller's address as a check that failed.
+func (s *Server) notAPass(r *http.Request) error {
+	if err := s.failed(r); err != nil {
+		return err
+	}
+	return unauthorized(hintPass, "no pass, or not a pass")
+}
+
+// failed counts a check that failed against the caller's address, for one
+// refused before a reservation was taken (s.miss). Past the count it is
+// refused as such instead.
+func (s *Server) failed(r *http.Request) error {
+	m, err := s.miss(r)
+	if err != nil {
+		return err
+	}
+	m.keep()
+	return nil
+}
+
 // checkCertificate holds a certificate to the identity whose key, in SSH wire
 // form, is key, and whose address is a: protocol.CheckCertificate, for an
 // identity rebuilt from its key with every check its document had.
@@ -231,7 +283,7 @@ func (s *Server) owner(r *http.Request) (protocol.Address, error) {
 func (s *Server) sender(r *http.Request) (protocol.Address, error) {
 	p, err := protocol.ParsePass(r.Header.Get("Authorization"))
 	if err != nil {
-		return protocol.Address{}, unauthorized(hintPass, "no pass, or not a pass")
+		return protocol.Address{}, s.notAPass(r)
 	}
 	a := p.Address
 	st, ok, err := s.standingOf(r, a)

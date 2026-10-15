@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -21,8 +22,14 @@ const registerLimit = 64 << 10
 // take as one.
 const hintDocument = "the identity document is \"irongall-v1\", LF, one SSH public key with no comment, LF: look for a comment, CRLF or a missing final newline"
 
-// register is PUT /v1/<address> (PROTOCOL.md §3).
+// register is PUT /v1/<address> (PROTOCOL.md §3). It is a call with no pass
+// of a box that exists yet, so its address pays for it; the statement and the
+// pass it carries are checked only for a box this process does not already
+// hold, after the address's count of registrations.
 func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
+	if err := s.spendPublic(r); err != nil {
+		return err
+	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -50,6 +57,15 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	case err != nil:
 		return fail(protocol.CodeBadKey, "make a new identity: irongall init in a new box", "%v", err)
 	}
+	// Registration never changes a box, so a box this process holds is
+	// answered from its record, before anything that costs is checked.
+	if cur, ok := s.store.Known(h); ok && cur != nil {
+		return s.registered(w, r, id, cur, &req)
+	}
+	if ok, wait := s.regs.take(ipKey(s.clientIP(r)), s.now()); !ok {
+		return rateLimited(wait, "too many registrations from this address")
+	}
+	// The count just taken bounds what follows: no count of misses is needed.
 	p, cert, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
 	if err != nil {
 		return err
@@ -57,11 +73,8 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	// The pass, under the certificate the statement is signed under: the
 	// certificate shows the identity chose this working key, and a pass
 	// minutes old that its holder is here now.
-	if err := s.checkPass(r, h, string(id.PublicKey().Marshal()), certHash(cert), nil); err != nil {
+	if err := s.checkPassBounded(r, h, string(id.PublicKey().Marshal()), certHash(cert)); err != nil {
 		return err
-	}
-	if ok, wait := s.regs.take(ipKey(s.clientIP(r)), s.now()); !ok {
-		return rateLimited(wait, "too many registrations from this address")
 	}
 
 	b := &Box{
@@ -84,25 +97,37 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	if !errors.Is(err, ErrExists) {
 		return err
 	}
-	// An existing box: registration never changes it.
 	cur, err := s.box(r.Context(), h)
 	if err != nil {
 		return err
 	}
-	switch {
-	case cur == nil: // a read that does not see the record yet
+	if cur == nil { // a read that does not see the record yet
 		p := fail(protocol.CodeUnavailable, "retry", "this box is being registered")
 		p.retryAfter = time.Second
 		return p
+	}
+	return s.registered(w, r, id, cur, &req)
+}
+
+// registered answers a registration of a box that exists, from its record:
+// registration never changes it. An identical retry is answered 200 once its
+// pass, under the box's current certificate, is checked; nothing else is.
+// What bounds that check is the call's own budget, its address's
+// (Limits.PublicBurst), or the count of registrations taken before it.
+func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol.Identity, cur *Box, req *protocol.RegisterRequest) error {
+	switch {
 	case cur.State == Revoked:
 		return revoked()
 	case cur.State == Closed:
 		return fail(protocol.CodeConflict, "closed: reopen it with a new prekey, irongall rekey", "this box is closed")
-	case bytes.Equal(cur.Identity, req.Identity) && bytes.Equal(cur.Statement, req.Prekey) && bytes.Equal(cur.Signature, req.PrekeySignature):
-		writeJSON(w, http.StatusOK, struct{}{}) // an identical retry
-		return nil
+	case !bytes.Equal(cur.Identity, req.Identity) || !bytes.Equal(cur.Statement, req.Prekey) || !bytes.Equal(cur.Signature, req.PrekeySignature):
+		return fail(protocol.CodeConflict, "registered: to replace its prekey, irongall rekey", "this address is registered with another prekey")
 	}
-	return fail(protocol.CodeConflict, "registered: to replace its prekey, irongall rekey", "this address is registered with another prekey")
+	if err := s.checkPassBounded(r, cur.Addr, string(id.PublicKey().Marshal()), cur.Cert); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, struct{}{}) // an identical retry
+	return nil
 }
 
 // checkPrekey verifies a prekey statement: signed by a working key under a
@@ -145,6 +170,11 @@ func (s *Server) checkPrekey(id *protocol.Identity, statement, sig []byte) (*pro
 // their own serial second (PROTOCOL.md §2b). So a prekey published at the
 // highest serial there is, by whoever took a working key, holds nothing: the
 // box's next certificate passes it.
+//
+// What could not be taken even if it verified is refused before any
+// signature is checked: the statement's place in that order is read from it
+// unverified (protocol.PrekeyOrder), and a statement the box holds already is
+// answered from its record.
 func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	h, err := pathAddr(r)
 	if err != nil {
@@ -170,40 +200,88 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	p, cert, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
+	key := string(id.PublicKey().Marshal())
+	refusedRevoked := fail(protocol.CodeBadKey, "certify a new working key at a higher serial: irongall rekey", "the statement is signed under a certificate this box's identity revoked")
+	// An identical retry: it was verified when it was stored, so only its
+	// pass is checked, and nothing changes. A certificate the identity has
+	// revoked signs nothing this server takes, the box's current statement
+	// sent again included (PROTOCOL.md §6.3a).
+	if bytes.Equal(req.Prekey, b.Statement) && bytes.Equal(req.PrekeySignature, b.Signature) {
+		if listed, err := b.listed(b.CertSerial); err != nil {
+			return err
+		} else if listed {
+			return refusedRevoked
+		}
+		if err := s.checkPass(r, h, key, b.Cert, nil); err != nil {
+			return err
+		}
+		if err := s.spendOwner(r.Context(), h); err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, struct{}{})
+		return nil
+	}
+	// Where it would stand, read before anything is verified. The box moves
+	// to a later certificate, at any prekey serial, or stays under its
+	// current one at a higher serial: never back to an older certificate,
+	// never to another of the same serial, and never to one its identity
+	// has revoked.
+	o, err := protocol.PrekeyOrder(req.Prekey, req.PrekeySignature)
+	if err != nil {
+		if err := s.failed(r); err != nil {
+			return err
+		}
+		return fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "%v", err)
+	}
+	if listed, err := b.listed(o.CertSerial); err != nil {
+		return err
+	} else if listed {
+		return refusedRevoked
+	}
+	if o.CertSerial < b.CertSerial || (o.CertSerial == b.CertSerial && o.Cert != b.Cert) {
+		return fail(protocol.CodeBadKey, "certify a new working key at a higher serial: irongall rekey", "the certificate's serial must be above %d, or the certificate be the box's current one", b.CertSerial)
+	}
+	if o.CertSerial == b.CertSerial && o.Serial <= b.Prekey.Serial {
+		return fail(protocol.CodeConflict, "a newer prekey is already published: irongall rekey takes the next serial", "under the box's current certificate the serial must be above %d", b.Prekey.Serial)
+	}
+	m, err := s.miss(r)
 	if err != nil {
 		return err
 	}
-	// A certificate the identity has revoked signs nothing this server
-	// takes: not the statement, and not the pass that comes with it
-	// (PROTOCOL.md §6.3a). That holds for the box's current statement sent
-	// again, too.
-	if listed, err := b.listed(cert.Serial()); err != nil {
-		return err
-	} else if listed {
-		return fail(protocol.CodeBadKey, "certify a new working key at a higher serial: irongall rekey", "the statement is signed under a certificate this box's identity revoked")
+	p, cert, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
+	if err == nil && (cert.Serial() != o.CertSerial || certHash(cert) != o.Cert || p.Serial != o.Serial) {
+		err = fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "the statement does not read the same verified as unverified")
 	}
+	if err != nil {
+		m.keep()
+		return err
+	}
+	m.release(s.now())
 	under := certHash(cert)
-	if err := s.checkPass(r, h, string(id.PublicKey().Marshal()), under, nil); err != nil {
+	if err := s.checkPass(r, h, key, under, nil); err != nil {
 		return err
 	}
-	if bytes.Equal(req.Prekey, b.Statement) && bytes.Equal(req.PrekeySignature, b.Signature) {
-		writeJSON(w, http.StatusOK, struct{}{}) // an identical retry: nothing changes
-		return nil
+	if err := s.spendOwner(r.Context(), h); err != nil {
+		return err
 	}
-	// The box moves to a later certificate, at any prekey serial, or stays
-	// under its current one at a higher serial: never back to an older
-	// certificate, and never to another of the same serial.
-	if cert.Serial() < b.CertSerial || (cert.Serial() == b.CertSerial && under != b.Cert) {
-		return fail(protocol.CodeBadKey, "certify a new working key at a higher serial: irongall rekey", "the certificate's serial must be above %d, or the certificate be the box's current one", b.CertSerial)
-	}
-	if cert.Serial() == b.CertSerial && p.Serial <= b.Prekey.Serial {
-		return fail(protocol.CodeConflict, "a newer prekey is already published: irongall rekey takes the next serial", "under the box's current certificate the serial must be above %d", b.Prekey.Serial)
-	}
+	// A renewal under the box's current certificate counts against the
+	// box's renewals; one under a later certificate is its identity's act,
+	// counted apart, so whoever holds the current working key and spends the
+	// day's renewals does not hold back the identity's.
 	now := s.now()
-	if ok, wait := s.renewals.add(h, now, s.limits.RenewalsPerDay, false); !ok {
-		return rateLimited(wait, "this box has renewed its prekey %d times today", s.limits.RenewalsPerDay)
+	count, limit, what := &s.renewals, s.limits.RenewalsPerDay, "this box has renewed its prekey %d times today"
+	if cert.Serial() > b.CertSerial {
+		count, limit, what = &s.acts, s.limits.IdentityActsPerDay, "this box's identity has certified %d new working keys or revoked certificates today"
 	}
+	if ok, wait := count.take(h, now, limit); !ok {
+		return rateLimited(wait, what, limit)
+	}
+	stored := false
+	defer func() {
+		if !stored {
+			count.give(h, now, limit)
+		}
+	}()
 	keyHash := sha256.Sum256([]byte(p.Key))
 	retired := slices.DeleteFunc(b.Retired, func(x Retired) bool { return !now.Before(x.NotAfter) })
 	if keyHash == sha256.Sum256([]byte(b.Prekey.Key)) || slices.ContainsFunc(retired, func(x Retired) bool { return x.KeyHash == keyHash }) {
@@ -226,7 +304,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 		}
 		return err
 	}
-	s.renewals.add(h, now, s.limits.RenewalsPerDay, true)
+	stored = true
 	writeJSON(w, http.StatusOK, struct{}{})
 	return nil
 }
@@ -234,6 +312,9 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 // identity is GET /v1/<address>/identity. It answers for closed boxes too, so
 // an owner can read its own serial to reopen.
 func (s *Server) identity(w http.ResponseWriter, r *http.Request) error {
+	if err := s.spendLookup(r); err != nil {
+		return err
+	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -263,25 +344,33 @@ const (
 // can be stolen without the identity and must not be able to end the address
 // or to revoke a certificate, and an owner who lost the box holds no working
 // key at all. The signature is the whole authority, and it may have been made
-// long ago.
+// long ago. So the call is its address's to pay for, as every call with no
+// pass is.
 //
 // A revocation of the address (PROTOCOL.md §6.3): the box is revoked for
 // good, its mail is deleted, and the signature is kept and served
-// (revocations). A second revocation of a revoked box is answered 200 and
-// changes nothing.
+// (revocations).
 //
 // A revocation of certificates (PROTOCOL.md §6.3a): the address goes on.
 // It revokes every certificate through a serial, and the highest stands: one
 // through a lower serial than the one held is refused, and the same one again
 // changes nothing. From then on no pass and no prekey statement under a
 // revoked certificate is taken, and nobody is told to encrypt to a prekey
-// under one.
+// under one. A raise of it is the identity's act, counted per box with a
+// renewal under a later certificate (Limits.IdentityActsPerDay); the
+// revocation of the address is never counted.
 //
-// A body may carry both. Everything in it is checked before anything is
-// changed. A body that does not verify counts against the caller's address
-// as a lookup of a box that does not exist does (-misses-per-minute): each
-// costs the server a signature check that nothing else has paid for.
+// A body may carry both. What could change nothing is answered from the
+// record before any signature is checked: anything for a box already
+// revoked, and a revocation of certificates through a serial no higher than
+// the one held. Both kinds of statement are public, and more than one set of
+// bytes verifies for each, so one sent back must cost no signature check.
+// Everything else in the body is checked before anything is changed, and a
+// check that fails counts against the caller's address (s.miss).
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
+	if err := s.spendPublic(r); err != nil {
+		return err
+	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -312,47 +401,74 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	case b == nil:
 		return noSuchMailbox
 	}
-	ip, now := ipKey(s.clientIP(r)), s.now()
-	if ok, wait := s.misses.ready(ip, now); !ok {
-		return rateLimited(wait, "too many requests from this address that named no box or carried no revocation")
+	// A revoked box takes nothing more: its address is ended, and that says
+	// which of its certificates still stand. Its mail is deleted again while
+	// memory shows the box holding any, as it does when the first delete
+	// failed: a revocation sent back must not draw a read of the messages
+	// table each time.
+	if b.State == Revoked {
+		if err := s.deleteHeld(r.Context(), b); err != nil {
+			return err
+		}
+		return revoked()
+	}
+	var held *protocol.RevokedCertificates
+	if len(b.RevokedCerts) > 0 {
+		if held, err = protocol.ParseRevokedCertificates(b.RevokedCerts); err != nil {
+			return fmt.Errorf("the stored revocation of certificates: %w", err)
+		}
+	}
+	// A revocation of certificates that reaches no higher than the one held
+	// changes nothing, whether or not it verifies: read before it is checked.
+	if hasCerts && held != nil {
+		if f, err := protocol.ParseRevokedCertificates(req.RevokedCertificates); err == nil && f.Address == h && f.Through <= held.Through {
+			switch {
+			case req.Revocation != nil:
+				hasCerts = false // the revocation of the address is the body's one change
+			case f.Through == held.Through:
+				writeJSON(w, http.StatusOK, struct{}{})
+				return nil
+			default:
+				return fail(protocol.CodeConflict, "GET the same path for the one held: it covers every certificate yours does", "a revocation of this address's certificates through serial %d is held, and nothing revokes fewer", held.Through)
+			}
+		}
+	}
+	m, err := s.miss(r)
+	if err != nil {
+		return err
 	}
 	var certs *protocol.RevokedCertificates
 	if hasCerts {
 		if certs, err = protocol.VerifyRevokedCertificates(h, req.Identity, req.RevokedCertificates, req.RevokedCertificatesSignature); err != nil {
-			s.misses.take(ip, now)
+			m.keep()
 			return fail(protocol.CodeBadRevocation, hintRevokedCerts, "this is not a revocation of this address's certificates")
 		}
 	}
 	if req.Revocation != nil {
 		if _, err := protocol.VerifyRevocation(h, req.Identity, req.Revocation); err != nil {
-			s.misses.take(ip, now)
+			m.keep()
 			return fail(protocol.CodeBadRevocation, hintRevocation, "this is not a revocation of this address")
 		}
 	}
-	// A revoked box takes no revocation of its certificates: its address is
-	// ended, and that says which of its certificates still stand.
-	if b.State == Revoked && req.Revocation == nil {
-		return revoked()
+	m.release(s.now())
+	now := s.now()
+	status, raised := http.StatusOK, false
+	if certs != nil && (held == nil || certs.Through > held.Through) {
+		b.RevokedCerts, b.RevokedCertsSig, raised = req.RevokedCertificates, req.RevokedCertificatesSignature, true
 	}
-	status, changed := http.StatusOK, false
-	if certs != nil && b.State != Revoked && !bytes.Equal(req.RevokedCertificates, b.RevokedCerts) {
-		if len(b.RevokedCerts) > 0 {
-			held, err := protocol.ParseRevokedCertificates(b.RevokedCerts)
-			if err != nil {
-				return fmt.Errorf("the stored revocation of certificates: %w", err)
-			}
-			if certs.Through <= held.Through {
-				return fail(protocol.CodeConflict, "GET the same path for the one held: it covers every certificate yours does", "a revocation of this address's certificates through serial %d is held, and nothing revokes fewer", held.Through)
-			}
-		}
-		b.RevokedCerts, b.RevokedCertsSig, changed = req.RevokedCertificates, req.RevokedCertificatesSignature, true
-	}
-	if req.Revocation != nil && b.State != Revoked {
+	if req.Revocation != nil {
 		b.State, b.Revocation = Revoked, req.Revocation
-		status, changed = http.StatusCreated, true
+		status = http.StatusCreated
+	} else if raised {
+		if ok, wait := s.acts.take(h, now, s.limits.IdentityActsPerDay); !ok {
+			return rateLimited(wait, "this box's identity has certified %d new working keys or revoked certificates today", s.limits.IdentityActsPerDay)
+		}
 	}
-	if changed {
+	if raised || req.Revocation != nil {
 		if err := s.store.UpdateBox(r.Context(), b); err != nil {
+			if raised && req.Revocation == nil {
+				s.acts.give(h, now, s.limits.IdentityActsPerDay)
+			}
 			if errors.Is(err, ErrStale) {
 				return fail(protocol.CodeConflict, "retry", "the box changed during the request")
 			}
@@ -360,29 +476,24 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	// After the record says revoked: mail that arrived around the write is
-	// never served, and this deletes it sooner than its expiry would. A
-	// revocation of a box already revoked deletes only while memory shows
-	// the box holding mail, as it does when the first delete failed. A
-	// revocation is public and its bytes are not the only ones that verify
-	// (a line feed after the armour, the identity signing again), so one
-	// sent back must not draw a read of the messages table each time.
+	// never served, and this deletes it sooner than its expiry would.
 	if b.State == Revoked {
-		held := changed
-		if !held {
-			n, _, err := s.store.Count(r.Context(), b.Addr)
-			if err != nil {
-				return err
-			}
-			held = n > 0
-		}
-		if held {
-			if err := s.store.DeleteMessages(r.Context(), b.Addr); err != nil {
-				return err
-			}
+		if err := s.store.DeleteMessages(r.Context(), b.Addr); err != nil {
+			return err
 		}
 	}
 	writeJSON(w, status, struct{}{})
 	return nil
+}
+
+// deleteHeld deletes the mail of revoked box b while memory shows the box
+// holding any: a delete that failed when it was revoked is done again.
+func (s *Server) deleteHeld(ctx context.Context, b *Box) error {
+	n, _, err := s.store.Count(ctx, b.Addr)
+	if err != nil || n == 0 {
+		return err
+	}
+	return s.store.DeleteMessages(ctx, b.Addr)
 }
 
 // revocations is GET /v1/<address>/revocations: what this server holds that
@@ -391,6 +502,9 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 // nothing a 410 or a refused pass does not already tell; what it adds is the
 // proof.
 func (s *Server) revocations(w http.ResponseWriter, r *http.Request) error {
+	if err := s.spendLookup(r); err != nil {
+		return err
+	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -418,6 +532,9 @@ func (s *Server) revocations(w http.ResponseWriter, r *http.Request) error {
 func (s *Server) closeBox(w http.ResponseWriter, r *http.Request) error {
 	a, err := s.owner(r)
 	if err != nil {
+		return err
+	}
+	if err := s.spendOwner(r.Context(), a); err != nil {
 		return err
 	}
 	b, err := s.box(r.Context(), a)

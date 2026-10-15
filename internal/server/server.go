@@ -67,9 +67,13 @@ type Server struct {
 	repeats  *buckets // per box: fetches of a message already fetched
 	regs     *buckets // per IP
 	sendIPs  *buckets // per IP
-	misses   *buckets // per IP: reads of the boxes table that found no box
+	misses   *buckets // per IP: reads of the boxes table that found no box, and checks that failed
+	public   *buckets // per IP: calls with no pass
+	calls    *buckets // per box: its calls with its pass that no other budget counts
+	receives *buckets // per box: new messages it takes
 	sends    daily    // per sender
 	renewals daily    // per box
+	acts     daily    // per box: what only its identity can do
 	// largeRead is the one allowance for reading a send past the free
 	// cap's size, held until the send is answered. Only a sender whose own
 	// cap is larger ever asks for it.
@@ -97,6 +101,9 @@ func New(c Config) *Server {
 		regs:          perPeriod(c.Limits.RegistrationsPerHour, time.Hour),
 		sendIPs:       perPeriod(c.Limits.SendsPerMinutePerIP, time.Minute),
 		misses:        perPeriod(c.Limits.MissesPerMinute, time.Minute),
+		public:        newBuckets(c.Limits.PublicBurst, c.Limits.PublicRefill),
+		calls:         newBuckets(c.Limits.CallBurst, c.Limits.CallRefill),
+		receives:      newBuckets(c.Limits.ReceiveBurst, c.Limits.ReceiveRefill),
 		largeRead:     make(chan struct{}, 1),
 		passes:        newPasses(),
 	}
@@ -125,7 +132,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("GET /v1/{addr}/messages/{id}", s.handle(s.fetch))
 	api.HandleFunc("DELETE /v1/{addr}/messages/{id}", s.handle(s.ack))
 	mux := http.NewServeMux()
-	mux.Handle("GET "+protocol.LinkPath+"{addr}", linkPage())
+	mux.Handle("GET "+protocol.LinkPath+"{addr}", s.publicPage(linkPage()))
 	mux.Handle("/v1/", notStored(s.whenReady(api)))
 	return s.accessLog(s.dated(mux))
 }
@@ -285,22 +292,108 @@ func (s *Server) box(ctx context.Context, a protocol.Address) (*Box, error) {
 // What memory holds is answered at once and is never refused or counted: a
 // box's record, or that a read found no such box a moment ago. Anything else
 // costs a read of the boxes table, and that read is what
-// Limits.MissesPerMinute guards: an address past its count is refused before
-// it, and a read that finds no box is counted against the address that
-// asked, whoever it is.
+// Limits.MissesPerMinute guards: the caller's address reserves a count before
+// it, and keeps it only if the read finds no box (s.miss).
 func (s *Server) lookup(r *http.Request, a protocol.Address) (*Box, error) {
 	if b, ok := s.store.Known(a); ok {
 		return b, nil
 	}
-	ip, now := ipKey(s.clientIP(r)), s.now()
-	if ok, wait := s.misses.ready(ip, now); !ok {
-		return nil, rateLimited(wait, "too many requests from this address naming boxes that do not exist")
+	m, err := s.miss(r)
+	if err != nil {
+		return nil, err
 	}
 	b, err := s.box(r.Context(), a)
 	if err == nil && b == nil {
-		s.misses.take(ip, now)
+		m.keep()
+	} else {
+		m.release(s.now())
 	}
 	return b, err
+}
+
+// miss reserves a count of the caller's address under Limits.MissesPerMinute,
+// before work that a caller who named no box, or brought nothing that
+// verifies, makes the server do: a read that may find no box, or a
+// signature check that may fail. It is kept if the work comes to nothing and
+// released if not, so a caller is counted for what failed and never for what
+// passed.
+func (s *Server) miss(r *http.Request) (*reservation, error) {
+	m, ok, wait := s.misses.reserve(r.Context(), ipKey(s.clientIP(r)), s.now)
+	if !ok {
+		return nil, rateLimited(wait, "too many calls from this address that named no box or carried nothing that verified")
+	}
+	return m, nil
+}
+
+// spendPublic spends one of the calls with no pass that the caller's address
+// may make (Limits.PublicBurst). A box's own calls carry its pass, and are
+// spent from the box's budgets instead.
+func (s *Server) spendPublic(r *http.Request) error {
+	if ok, wait := s.public.take(ipKey(s.clientIP(r)), s.now()); !ok {
+		return rateLimited(wait, "too many calls with no pass from this address; a box's calls carry its pass, and are counted against the box")
+	}
+	return nil
+}
+
+// publicPage serves h, a page anyone may open, once the caller's address has
+// spent a call with no pass on it.
+func (s *Server) publicPage(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p *problem
+		if err := s.spendPublic(r); errors.As(err, &p) {
+			writeProblem(w, p)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// spendCall spends one of box a's calls (Limits.CallBurst), the budget of
+// every call with its pass that no other budget counts. An account that lifts
+// it comes with lim.CallBurst zero.
+func (s *Server) spendCall(a protocol.Address, lim Limits) error {
+	if lim.CallBurst == 0 {
+		return nil
+	}
+	if ok, wait := s.calls.take(a.String(), s.now()); !ok {
+		return rateLimited(wait, "this box has made as many calls as it may for now")
+	}
+	return nil
+}
+
+// spendOwner spends a call by box a, which showed its pass, from its budget,
+// with whatever its account lifts. A box this process holds that is in no
+// account has the server's limits, read from nothing.
+func (s *Server) spendOwner(ctx context.Context, a protocol.Address) error {
+	if st, ok := s.store.Held(a); ok && !st.InAccount {
+		return s.spendCall(a, s.limits)
+	}
+	b, ok := s.store.Known(a)
+	if !ok || b == nil {
+		var err error
+		if b, err = s.box(ctx, a); err != nil || b == nil {
+			return err
+		}
+	}
+	lim, err := s.limitsFor(ctx, b)
+	if err != nil {
+		return err
+	}
+	return s.spendCall(a, lim)
+}
+
+// spendLookup spends a call that may carry its caller's pass, a GET of what
+// is public about a box (PROTOCOL.md §4.1): with a pass it is the calling
+// box's, once the pass is checked; with none, its address's.
+func (s *Server) spendLookup(r *http.Request) error {
+	if r.Header.Get("Authorization") == "" {
+		return s.spendPublic(r)
+	}
+	from, err := s.sender(r)
+	if err != nil {
+		return err
+	}
+	return s.spendOwner(r.Context(), from)
 }
 
 var noSuchMailbox = fail(protocol.CodeNoSuchMailbox, "check the address", "no box has this address")

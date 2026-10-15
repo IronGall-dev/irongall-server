@@ -196,12 +196,16 @@ func TestMissesPerIP(t *testing.T) {
 	for range 3 {
 		e2.want(identity(b.Address()), http.StatusOK, "")
 	}
+	pass := e2.pass(b)
+	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, pass); r.status != http.StatusOK { // a pass this process now remembers
+		t.Fatalf("the owner's poll: %d %s", r.status, r.body)
+	}
 	e2.want(identity(nobody(1)), http.StatusNotFound, protocol.CodeNoSuchMailbox)
 	e2.want(e2.do(http.MethodGet, "/v1/"+nobody(2).String()+"/messages", nil, e2.pass(b)), http.StatusNotFound, protocol.CodeNoSuchMailbox) // a call with a pass, naming no box
 	before := cs.reads.Load()
 	r := identity(nobody(3))
 	e2.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
-	if !strings.Contains(string(r.body), "boxes that do not exist") || r.header.Get("Retry-After") != "30" {
+	if !strings.Contains(string(r.body), "named no box") || r.header.Get("Retry-After") != "30" {
 		t.Fatalf("a third miss in a minute: Retry-After %q, %s", r.header.Get("Retry-After"), r.body)
 	}
 	if n := cs.reads.Load(); n != before {
@@ -210,9 +214,15 @@ func TestMissesPerIP(t *testing.T) {
 	for range 3 {
 		e2.want(identity(b.Address()), http.StatusOK, "") // a live box, held in memory: not a miss
 	}
-	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e2.pass(b)); r.status != http.StatusOK {
-		t.Fatalf("the owner's poll: %d %s", r.status, r.body)
+	// A pass the process remembers is answered from memory, whatever its
+	// address has spent; a new one costs signature checks, and an address
+	// past its count is refused before them.
+	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, pass); r.status != http.StatusOK {
+		t.Fatalf("the owner's poll with its pass remembered: %d %s", r.status, r.body)
 	}
+	e.clock.Add(time.Second)
+	e2.want(e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e2.pass(b)), http.StatusTooManyRequests, protocol.CodeRateLimited)
+	e.clock.Add(-time.Second)
 	e.clock.Add(30 * time.Second) // one back
 	e2.want(identity(nobody(4)), http.StatusNotFound, protocol.CodeNoSuchMailbox)
 	e2.want(identity(nobody(5)), http.StatusTooManyRequests, protocol.CodeRateLimited)

@@ -14,18 +14,24 @@ import (
 )
 
 // send is POST /v1/<recipient> (PROTOCOL.md §4.5, the server pipeline):
-// cheapest check first, and only the last step writes.
+// cheapest check first, and only the last step writes. Every count is taken
+// before the work it guards and given back if that work does not happen.
 func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	now := s.now()
 
-	// 1. Who is sending: the pass, before the body is read. The pre-auth
-	// rate is per IP, and comes before anything is checked.
+	// 1. Who is sending: the pass, before the body is read, and then the
+	// sender's own budget for calls, which every send spends, a retry
+	// included: it bounds everything after it, the dedupe's read among them.
+	// The pre-auth rate is per IP, and comes before anything is checked.
 	if ok, wait := s.sendIPs.take(ipKey(s.clientIP(r)), now); !ok {
 		return rateLimited(wait, "too many sends from this address")
 	}
 	from, err := s.sender(r)
 	if err != nil {
+		return err
+	}
+	if err := s.spendOwner(ctx, from); err != nil {
 		return err
 	}
 	// The pass showed the box exists, so reading its record is no guess at
@@ -88,7 +94,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return tooLarge
 	}
 
-	// 3. The recipient's address, and the serial.
+	// 3. The recipient's address, and the serials.
 	to, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -116,7 +122,21 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return noSuchMailbox
 	case rcpt.State == Revoked:
 		return revoked()
-	case rcpt.Prekey.Expired(now):
+	}
+
+	// 6. Dedupe, before anything asks whether the box takes new mail: a
+	// retry gets the original receipt, whatever has changed since it was
+	// stored, a renewal of the box's prekey included. What those checks
+	// keep from the box is new mail, and a retry is none.
+	msgID := sha256.Sum256(req.Ciphertext)
+	if orig, err := s.store.Dedupe(ctx, to, msgID); err == nil {
+		return s.duplicate(w, orig, from)
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+
+	// 7. The box takes new mail on this prekey, and from this sender.
+	if rcpt.Prekey.Expired(now) {
 		return fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall rekey); retry later", "this box's prekey has expired")
 	}
 	// A prekey under a certificate the box's identity has revoked is one
@@ -135,8 +155,6 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return fail(protocol.CodeSenderKeyType, "a box whose identity is an ssh-ed25519 key, as irongall init makes one, can write to any box",
 			"this box's client does not verify identities of your box's key type, %s", t)
 	}
-
-	// 6. The prekey and the stanza.
 	// A prekey is named by both serials: its own, and its certificate's.
 	if *req.PrekeySerial != rcpt.Prekey.Serial || *req.CertificateSerial != rcpt.CertSerial {
 		return fail(protocol.CodeStalePrekey, "a newer prekey exists: fetch GET /v1/<address>/identity and re-encrypt the same envelope (irongall does this)", "the box's current prekey is serial %d, under certificate %d", rcpt.Prekey.Serial, rcpt.CertSerial)
@@ -145,18 +163,18 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return p
 	}
 
-	// 7. Dedupe, before any quota: a retry gets the original receipt.
-	msgID := sha256.Sum256(req.Ciphertext)
-	if orig, err := s.store.Dedupe(ctx, to, msgID); err == nil {
-		return s.duplicate(w, orig, from)
-	} else if !errors.Is(err, ErrNotFound) {
-		return err
-	}
-
-	// 8. Quotas, counted only for sends that carried their sender's pass.
-	if ok, wait := s.sends.add(from, now, lim.SendsPerDay, false); !ok {
+	// 8. Quotas, counted only for sends that carried their sender's pass,
+	// each taken before the write and given back unless the send is stored:
+	// sends in flight at once cannot all pass on one count.
+	stored := false
+	if ok, wait := s.sends.take(from, now, lim.SendsPerDay); !ok {
 		return rateLimited(wait, "this box has sent its %d messages for the day", lim.SendsPerDay)
 	}
+	defer func() {
+		if !stored {
+			s.sends.give(from, now, lim.SendsPerDay)
+		}
+	}()
 	if s.limits.PairCap > 0 {
 		n, oldest, err := s.store.PairCount(ctx, to, from)
 		if err != nil {
@@ -180,8 +198,29 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 			return p
 		}
 	}
+	// The box's own budget for new mail, from every sender together: what
+	// keeps one box from taking mail at any rate however many boxes send.
+	rlim, err := s.limitsFor(ctx, rcpt)
+	if err != nil {
+		return err
+	}
+	if rlim.ReceiveBurst > 0 {
+		recv, ok, wait := s.receives.reserve(ctx, to.String(), s.now)
+		if !ok {
+			p := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail a minute: post it again after Retry-After (irongall flush does, unchanged)", "the box has taken as much new mail as it takes for now; retry in %ds", retrySeconds(wait))
+			p.retryAfter = wait
+			return p
+		}
+		defer func() {
+			if stored {
+				recv.keep()
+			} else {
+				recv.release(s.now())
+			}
+		}()
+	}
 
-	// 9. Write, then count the send.
+	// 9. Write, and the counts above stand.
 	h := &Header{
 		ID:         msgID,
 		From:       from,
@@ -196,7 +235,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	if orig != nil {
 		return s.duplicate(w, orig, from) // a concurrent send won the dedupe record
 	}
-	s.sends.add(from, now, lim.SendsPerDay, true)
+	stored = true
 	writeJSON(w, http.StatusCreated, receipt(h))
 	return nil
 }
