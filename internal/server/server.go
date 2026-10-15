@@ -73,6 +73,7 @@ type Server struct {
 	public   *buckets // per IP: calls with no pass
 	calls    *buckets // per box: its calls with its pass that no other budget counts
 	receives *buckets // per box: new messages it takes
+	drained  *buckets // per box: its first fetches of held messages
 	sends    daily    // per sender
 	renewals daily    // per box
 	acts     daily    // per box: what only its identity can do
@@ -113,6 +114,7 @@ func New(c Config) *Server {
 		public:        newBuckets(c.Limits.PublicBurst, c.Limits.PublicRefill),
 		calls:         newBuckets(c.Limits.CallBurst, c.Limits.CallRefill),
 		receives:      newBuckets(c.Limits.ReceiveBurst, c.Limits.ReceiveRefill),
+		drained:       newBuckets(c.Limits.DrainBurst, c.Limits.DrainRefill),
 		largeRead:     make(chan struct{}, 1),
 		passes:        newPasses(),
 	}
@@ -512,21 +514,27 @@ func (s *Server) spendCall(a protocol.Address, lim Limits) error {
 	return nil
 }
 
-// spendOwner spends a call by box a, which showed its pass, from its budget,
-// with whatever its account lifts. A box this process holds that is in no
-// account has the server's limits, read from nothing.
-func (s *Server) spendOwner(ctx context.Context, a protocol.Address) error {
+// limitsOf returns the limits of box a, which showed its pass: the server's
+// for a box this process holds that is in no account, read from nothing;
+// otherwise with whatever its account lifts.
+func (s *Server) limitsOf(ctx context.Context, a protocol.Address) (Limits, error) {
 	if st, ok := s.store.Held(a); ok && !st.InAccount {
-		return s.spendCall(a, s.limits)
+		return s.limits, nil
 	}
 	b, ok := s.store.Known(a)
 	if !ok || b == nil {
 		var err error
 		if b, err = s.box(ctx, a); err != nil || b == nil {
-			return err
+			return s.limits, err
 		}
 	}
-	lim, err := s.limitsFor(ctx, b)
+	return s.limitsFor(ctx, b)
+}
+
+// spendOwner spends a call by box a, which showed its pass, from its budget,
+// with whatever its account lifts.
+func (s *Server) spendOwner(ctx context.Context, a protocol.Address) error {
+	lim, err := s.limitsOf(ctx, a)
 	if err != nil {
 		return err
 	}

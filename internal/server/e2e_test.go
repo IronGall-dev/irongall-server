@@ -54,7 +54,7 @@ type env struct {
 func relaxed() Limits {
 	l := DefaultLimits()
 	l.SendsPerDay, l.PollBurst, l.RegistrationsPerHour, l.RenewalsPerDay, l.MissesPerMinute = 0, 0, 0, 0, 0
-	l.ReceiveBurst, l.CallBurst, l.PublicBurst, l.IdentityActsPerDay = 0, 0, 0, 0
+	l.ReceiveBurst, l.DrainBurst, l.CallBurst, l.PublicBurst, l.IdentityActsPerDay = 0, 0, 0, 0, 0
 	return l
 }
 

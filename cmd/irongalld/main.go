@@ -90,6 +90,8 @@ func serve(args []string) error {
 	fs.IntVar(&l.MissesPerMinute, "misses-per-minute", l.MissesPerMinute, "calls per IP that named no box or carried nothing that verified (0: off)")
 	fs.IntVar(&l.ReceiveBurst, "receive-burst", l.ReceiveBurst, "new messages a box takes at once, from all senders together (0: off)")
 	fs.DurationVar(&l.ReceiveRefill, "receive-refill", l.ReceiveRefill, "one more new message each")
+	fs.IntVar(&l.DrainBurst, "drain-burst", l.DrainBurst, "a box's first fetches of held messages, at once: the new mail it takes out (0: off)")
+	fs.DurationVar(&l.DrainRefill, "drain-refill", l.DrainRefill, "one more first fetch each")
 	fs.IntVar(&l.CallBurst, "call-burst", l.CallBurst, "a box's calls with its pass that no other budget counts, at once (0: off)")
 	fs.DurationVar(&l.CallRefill, "call-refill", l.CallRefill, "one more such call each")
 	fs.IntVar(&l.PublicBurst, "public-burst", l.PublicBurst, "calls with no pass per IPv4 address or IPv6 /64, at once (0: off)")

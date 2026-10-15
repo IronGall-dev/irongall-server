@@ -173,8 +173,9 @@ func (s *Server) held(r *http.Request, box protocol.Address, id [32]byte) error 
 }
 
 // notHeld answers a fetch or an ack of an id box a does not hold. A held
-// message's first fetch and its ack are paid for by its receive; anything
-// else is a call, spent from the box's budget (Limits.CallBurst).
+// message's first fetch spends the box's budget of mail taken out
+// (Limits.DrainBurst), and its ack is paid for by its receive; anything else
+// is a call, spent from the box's budget (Limits.CallBurst).
 func (s *Server) notHeld(r *http.Request, a protocol.Address) error {
 	if err := s.spendOwner(r.Context(), a); err != nil {
 		return err
@@ -193,7 +194,29 @@ func (s *Server) fetch(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return s.notHeld(r, box)
 	}
+	// A first fetch of a held message is new mail drained, and spends the
+	// box's budget of it (Limits.DrainBurst): how much mail a box takes out,
+	// whoever sent it, which only the box's own calls spend. Whether a fetch
+	// is a first one is known only once memory counts it, so a token is
+	// reserved before and given back if it was not.
+	lim, err := s.limitsOf(r.Context(), box)
+	if err != nil {
+		return err
+	}
+	var drain *reservation
+	if lim.DrainBurst > 0 {
+		var ok bool
+		var wait time.Duration
+		if drain, ok, wait = s.drained.reserve(r.Context(), box.String(), s.now); !ok {
+			return rateLimited(wait, "this box takes out at most so much new mail a minute: the rest waits on the server")
+		}
+	}
 	held, again, err := s.store.Fetched(r.Context(), box, id)
+	if err != nil || !held || again {
+		drain.release(s.now())
+	} else {
+		drain.keep()
+	}
 	if err != nil {
 		return err
 	}

@@ -28,8 +28,10 @@ type Limits struct {
 	MissesPerMinute      int // per IP: reads of the boxes table that find no box, and checks that fail (decided: 10 for now)
 
 	// Budgets: a burst at once and one more each refill (LIMITS.md).
-	ReceiveBurst       int           // per box: new messages it takes, from all senders together (decided: 50); an account lifts it
+	ReceiveBurst       int           // per box: new messages it takes, from all senders together (decided: 50, on); an account lifts it
 	ReceiveRefill      time.Duration // (decided: 6 s, ten a minute)
+	DrainBurst         int           // per box: its first fetches of held messages, spent only by its own calls (decided: 50, on); an account lifts it
+	DrainRefill        time.Duration // (decided: 6 s, ten a minute)
 	CallBurst          int           // per box: its calls with its pass that no other budget counts [tunable]; an account lifts it
 	CallRefill         time.Duration // [tunable]
 	PublicBurst        int           // per IP: calls with no pass [tunable]
@@ -62,6 +64,8 @@ func DefaultLimits() Limits {
 		MissesPerMinute:      10,
 		ReceiveBurst:         50,
 		ReceiveRefill:        6 * time.Second,
+		DrainBurst:           50,
+		DrainRefill:          6 * time.Second,
 		CallBurst:            50,
 		CallRefill:           6 * time.Second,
 		PublicBurst:          10,

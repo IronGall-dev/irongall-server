@@ -472,3 +472,51 @@ func TestLookupsOfOneAddressShareARead(t *testing.T) {
 		t.Fatalf("%d reads for twenty lookups of one address at once", got)
 	}
 }
+
+// A box takes mail out at a rate of its own (Limits.DrainBurst): its first
+// fetch of each held message spends the budget, which only its own calls
+// spend. Past it a fetch is rate_limited and the rest waits on the server;
+// a fetch that is not a first one gives its token back; an account can lift
+// it.
+func TestTheDrainBudget(t *testing.T) {
+	l := relaxed()
+	e := newEnv(t, l)
+	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
+	for _, body := range []string{"1", "2", "3"} {
+		send(t, a, b, body)
+	}
+	l.DrainBurst, l.DrainRefill = 2, time.Minute
+	e2, _ := counted(t, e, l)
+	pass := e2.pass(b)
+	ids := listOf(t, e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, pass)).Messages
+	if len(ids) != 3 {
+		t.Fatalf("listed %d", len(ids))
+	}
+	fetch := func(id string) reply {
+		return e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages/"+id, nil, pass)
+	}
+	unknown := strings.Repeat("cd", 32)
+	e2.want(fetch(unknown), http.StatusNotFound, protocol.CodeNoSuchMessage) // given back: not new mail
+	e2.want(fetch(ids[0].ID), http.StatusOK, "")
+	e2.want(fetch(ids[0].ID), http.StatusOK, "") // a repeat: given back, and its own allowance spent
+	e2.want(fetch(ids[1].ID), http.StatusOK, "")
+	r := fetch(ids[2].ID)
+	e2.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
+	if r.header.Get("Retry-After") == "" || !strings.Contains(string(r.body), "waits on the server") {
+		t.Fatalf("the third first fetch: %s", r.body)
+	}
+	e.clock.Add(l.DrainRefill)
+	e2.want(fetch(ids[2].ID), http.StatusOK, "")
+
+	// An unmetered account's box drains with no budget.
+	_, key := accountEnv(t, e, true, 1)
+	echo := e.box(protocol.Classic)
+	adopt(t, echo, key)
+	for range 3 {
+		send(t, a, echo, "to the unmetered box")
+	}
+	epass := e2.pass(echo)
+	for _, m := range listOf(t, e2.do(http.MethodGet, "/v1/"+echo.Address().String()+"/messages", nil, epass)).Messages {
+		e2.want(e2.do(http.MethodGet, "/v1/"+echo.Address().String()+"/messages/"+m.ID, nil, epass), http.StatusOK, "")
+	}
+}

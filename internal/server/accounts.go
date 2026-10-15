@@ -114,7 +114,7 @@ func (s *Server) leave(w http.ResponseWriter, r *http.Request) error {
 
 // limitsFor returns the limits a box gets: the server's, unless it is in an
 // unmetered account, whose boxes have no daily limit, the largest cap, and
-// no budget of calls or of mail received. A box whose account is gone has the
+// no budget of calls or of mail received or drained. A box whose account is gone has the
 // server's. These are the volume levers (LIMITS.md): what an account may lift.
 func (s *Server) limitsFor(ctx context.Context, b *Box) (Limits, error) {
 	l := s.limits
@@ -129,7 +129,7 @@ func (s *Server) limitsFor(ctx context.Context, b *Box) (Limits, error) {
 		return l, err
 	}
 	if acc.Unmetered {
-		l.SendsPerDay, l.MaxSize, l.CallBurst, l.ReceiveBurst = 0, l.ceiling(), 0, 0
+		l.SendsPerDay, l.MaxSize, l.CallBurst, l.ReceiveBurst, l.DrainBurst = 0, l.ceiling(), 0, 0, 0
 	}
 	return l, nil
 }
