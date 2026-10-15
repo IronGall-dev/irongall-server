@@ -72,7 +72,7 @@ flowchart LR
 
 | Layer | Holds | Size (estimate) | Used for | Under memory pressure |
 |---|---|---|---|---|
-| **1. Counts** — always resident | For each box WITH mail, one 40-byte mark per live message (a keyed tag, id, sender, expiry, a count of its fetches) | 32 to 51 B per live message, plus 271 B per loaded box on an Ed25519 identity (measured 2026-10-13, before the tag); the tag adds 8 B a mark (not measured) | **Every poll:** the exact count, the ETag, the per-pair and box caps | Never shed: it IS the poll. If it doesn't fit, that's capacity, because every process holds all of it |
+| **1. Counts** — always resident | For each box WITH mail, one 40-byte mark per live message (a keyed tag, id, sender, expiry, a count of its fetches) | 48 to 64 B per live message, plus 271 B per loaded box on an Ed25519 identity (measured 2026-10-15, with the tag; 32 to 51 B before it) | **Every poll:** the exact count, the ETag, the per-pair and box caps | Never shed: it IS the poll. If it doesn't fit, that's capacity, because every process holds all of it |
 | **2. Listings** — optional | Full metadata for recently listed boxes: id, sender, size, received_at | ~100 B per message | Serving a list from memory | Shrinks first (an LRU under a byte budget), down to off; lists then come from DynamoDB |
 
 ```go
@@ -204,7 +204,7 @@ What changes:
 | Failure | What happens | Recovery |
 |---|---|---|
 | Memory pressure | Layer 2 (once built) shrinks, down to off; lists come from DynamoDB, as all of them do today; polls are unaffected | Automatic |
-| Layer 1 alone outgrows memory | Capacity, not a fault: every process holds all of it | A bigger instance; ~32 B per live message makes this distant. At the extreme, shard by address (§ Extreme scale) |
+| Layer 1 alone outgrows memory | Capacity, not a fault: every process holds all of it | A bigger instance; ~50 B per live message makes this distant. At the extreme, shard by address (§ Extreme scale) |
 | A writer dies right after its commit | The stream still delivers the change to everyone | Automatic |
 | A process falls behind the stream | Stage 2, not built: it fails `/readyz` and leaves rotation. Today a follower that loses its place exits the process | It catches up. More than 24 h behind (stream retention) means a restart: memory starts empty, and each box is read again on its first use (§ Startup) |
 | DynamoDB or its stream unavailable | Processes can't prove they're current: `503` + `Retry-After` | Wait |
@@ -362,7 +362,7 @@ Decided 2026-10-10 and gone from this list: DynamoDB Streams as the change log (
 
 - **Estimates:**
   - ~1–2 s stream propagation;
-  - ~40 B per mark and ~100 B per listed message;
+  - ~50 B per mark, measured, and ~100 B per listed message;
   - ~4 read units per page Query;
   - ~300 lines of shard following.
 - **Measured:** the poll cost (33 to 34 µs with a pass the server remembers), a new pass's check (about 180 µs), memory per box, and the compression table.
