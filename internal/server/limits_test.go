@@ -319,11 +319,11 @@ func TestAFetchedMessageIsFetchedAgainFromAnAllowance(t *testing.T) {
 	e2.want(msg(http.MethodGet, id1), http.StatusOK, "") // the other
 	before := cs.reads.Load()
 	r := msg(http.MethodGet, id1)
-	e2.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
+	e2.want(r, http.StatusTooManyRequests, protocol.CodeRefetchSpent)
 	if !strings.Contains(string(r.body), "fetched before") || r.header.Get("Retry-After") != "60" {
 		t.Fatalf("a fetch past the allowance: Retry-After %q, %s", r.header.Get("Retry-After"), r.body)
 	}
-	e2.want(msg(http.MethodGet, id2), http.StatusTooManyRequests, protocol.CodeRateLimited) // the allowance is the box's
+	e2.want(msg(http.MethodGet, id2), http.StatusTooManyRequests, protocol.CodeRefetchSpent) // the allowance is the box's
 	if n := cs.reads.Load(); n != before {
 		t.Fatalf("%d storage calls for fetches past the allowance", n-before)
 	}
@@ -334,10 +334,10 @@ func TestAFetchedMessageIsFetchedAgainFromAnAllowance(t *testing.T) {
 	}
 	id3 := send(t, a, b, "three").ID
 	e2.want(msg(http.MethodGet, id3), http.StatusOK, "") // a first fetch is never limited
-	e2.want(msg(http.MethodGet, id3), http.StatusTooManyRequests, protocol.CodeRateLimited)
+	e2.want(msg(http.MethodGet, id3), http.StatusTooManyRequests, protocol.CodeRefetchSpent)
 	e.clock.Add(time.Minute) // one back
 	e2.want(msg(http.MethodGet, id1), http.StatusOK, "")
-	e2.want(msg(http.MethodGet, id1), http.StatusTooManyRequests, protocol.CodeRateLimited)
+	e2.want(msg(http.MethodGet, id1), http.StatusTooManyRequests, protocol.CodeRefetchSpent)
 	e2.want(msg(http.MethodDelete, id1), http.StatusNoContent, "") // an ack is never limited
 	e2.want(msg(http.MethodGet, id1), http.StatusNotFound, protocol.CodeNoSuchMessage)
 }

@@ -282,7 +282,7 @@ func TestPassRefusedAfterRekey(t *testing.T) {
 	if pass() == old {
 		t.Fatal("a new prekey did not bring a new pass")
 	}
-	e.want(e.do(http.MethodGet, messages, nil, old), http.StatusUnauthorized, protocol.CodeUnauthorized)
+	e.want(e.do(http.MethodGet, messages, nil, old), http.StatusUnauthorized, protocol.CodeCertificateNotCurrent)
 	e.want(e.do(http.MethodGet, messages, nil, pass()), http.StatusOK, "")
 	// The client signing a new pass when one is refused is tested in
 	// irongall-client.
@@ -413,7 +413,7 @@ func TestLimits(t *testing.T) {
 		a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 		send(t, a, b, "1")
 		send(t, a, b, "2")
-		if _, err := a.Send(ctx, b.Address(), "3"); client.Code(err) != protocol.CodeRateLimited {
+		if _, err := a.Send(ctx, b.Address(), "3"); client.Code(err) != protocol.CodeSendsSpent {
 			t.Fatalf("third send: %v", err)
 		}
 	})

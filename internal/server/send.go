@@ -54,7 +54,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	// a read waits for the one allowance for large reads, which only a
 	// sender whose cap is larger ever takes.
 	free, limit := readLimit(s.limits.MaxSize), readLimit(lim.MaxSize)
-	tooLarge := fail(protocol.CodeTooLarge, "send less", "the ciphertext is over %d bytes", lim.MaxSize)
+	tooLarge := fail(protocol.CodeTooLarge, "send less", "the ciphertext is over %d bytes", limitValue(lim.MaxSize))
 	if r.ContentLength > limit {
 		return tooLarge
 	}
@@ -115,10 +115,10 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if req.PrekeySerial == nil || *req.PrekeySerial < 1 || *req.PrekeySerial > protocol.MaxSerial {
-		return fail(protocol.CodeBadRequest, "name the serial of the prekey the ciphertext is encrypted to: irongall send does", "prekey_serial is missing or not a serial")
+		return fail(protocol.CodeBadRequest, "name the serial of the prekey the ciphertext is encrypted to: irongall send does", "%s is missing or not a serial", memberValue("prekey_serial"))
 	}
 	if req.CertificateSerial == nil || *req.CertificateSerial < 1 || *req.CertificateSerial > protocol.MaxSerial {
-		return fail(protocol.CodeBadRequest, "name the serial of the certificate that prekey's statement is signed under: irongall send does", "certificate_serial is missing or not a serial")
+		return fail(protocol.CodeBadRequest, "name the serial of the certificate that prekey's statement is signed under: irongall send does", "%s is missing or not a serial", memberValue("certificate_serial"))
 	}
 
 	// 4. It is an age file.
@@ -168,11 +168,11 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	// the recipient would have refused on reading it.
 	if t := identityType(sender.Identity); !protocol.AcceptsSender(rcpt.SenderKeyTypes, t) {
 		return fail(protocol.CodeSenderKeyType, "a box whose identity is an ssh-ed25519 key, as irongall init makes one, can write to any box",
-			"this box's client does not verify identities of your box's key type, %s", t)
+			"this box's client does not verify identities of your box's key type, %s", keyTypeValue(t))
 	}
 	// A prekey is named by both serials: its own, and its certificate's.
 	if *req.PrekeySerial != rcpt.Prekey.Serial || *req.CertificateSerial != rcpt.CertSerial {
-		return fail(protocol.CodeStalePrekey, "a newer prekey exists: fetch GET /v1/<address>/identity and re-encrypt the same envelope (irongall does this)", "the box's current prekey is serial %d, under certificate %d", rcpt.Prekey.Serial, rcpt.CertSerial)
+		return fail(protocol.CodeStalePrekey, "a newer prekey exists: fetch GET /v1/<address>/identity and re-encrypt the same envelope (irongall does this)", "the box's current prekey is serial %d, under certificate %d", prekeySerialValue(rcpt.Prekey.Serial), certificateSerialValue(rcpt.CertSerial))
 	}
 	if p := checkStanzas(stanzas, rcpt); p != nil {
 		return p
@@ -190,7 +190,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	// sends in flight at once cannot all pass on one count.
 	stored := false
 	if ok, wait := s.sends.take(from, now, lim.SendsPerDay); !ok {
-		return rateLimited(wait, "this box has sent its %d messages for the day", lim.SendsPerDay)
+		return spent(protocol.CodeSendsSpent, wait, "this box has sent its %d messages for the day", limitValue(lim.SendsPerDay))
 	}
 	defer func() {
 		if !stored {
@@ -214,7 +214,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	if rlim.ReceiveBurst > 0 {
 		recv, ok, wait := s.receives.reserve(ctx, to.String(), s.now)
 		if !ok {
-			p := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail a minute: post it again after Retry-After (irongall outbox flush does, unchanged)", "the box has taken as much new mail as it takes for now; retry in %ds", retrySeconds(wait))
+			p := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail a minute: post it again after Retry-After (irongall outbox flush does, unchanged)", "the box has taken as much new mail as it takes for now")
 			p.retryAfter = wait
 			return p
 		}
@@ -281,10 +281,8 @@ func (s *Server) reserveCaps(ctx context.Context, to, from protocol.Address) (re
 			return nil, nil, err
 		}
 		if n += f.pair[pair]; n >= s.limits.PairCap {
-			p := fail(protocol.CodePairFull, "the box holds the most unacked mail it takes from you: retry after it reads some", "%d unacked messages from this sender", n)
+			p := fail(protocol.CodePairFull, "the box holds the most unacked mail it takes from you: retry after it reads some", "%d unacked messages from this sender, the oldest expiring %s", unackedValue(n), oldestValue(oldest))
 			p.retryAfter = time.Duration(s.limits.PollAfter) * time.Second
-			unacked := int64(n)
-			p.unacked, p.oldest = &unacked, oldest
 			return nil, p, nil
 		}
 	}
@@ -294,7 +292,7 @@ func (s *Server) reserveCaps(ctx context.Context, to, from protocol.Address) (re
 			return nil, nil, err
 		}
 		if n += f.box[to]; n >= s.limits.BoxCap {
-			p := fail(protocol.CodeMailboxFull, "the box is full: retry later", "the box holds %d messages", n)
+			p := fail(protocol.CodeMailboxFull, "the box is full: retry later", "the box holds %d messages", messagesValue(n))
 			p.retryAfter = time.Duration(s.limits.PollAfter) * time.Second
 			return nil, p, nil
 		}
@@ -375,11 +373,11 @@ func checkStanzas(stanzas []*age.Stanza, b *Box) *problem {
 			native = append(native, protocol.KeyType(st.Type))
 		case grease.MatchString(st.Type) && len(st.Args) <= 4:
 		default:
-			return fail(protocol.CodeWrongRecipientType, "encrypt to the box's prekey", "the file has a %q stanza", st.Type)
+			return fail(protocol.CodeWrongRecipientType, "encrypt to the box's prekey", "the file has a stanza of a type no prekey has")
 		}
 	}
 	if len(native) != 1 {
-		return fail(protocol.CodeWrongRecipientType, "encrypt to one recipient only", "the file has %d native stanzas", len(native))
+		return fail(protocol.CodeWrongRecipientType, "encrypt to one recipient only", "the file has more than one native stanza")
 	}
 	if native[0] == b.Prekey.Type() {
 		return nil

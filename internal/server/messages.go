@@ -208,7 +208,7 @@ func (s *Server) fetch(w http.ResponseWriter, r *http.Request) error {
 		var ok bool
 		var wait time.Duration
 		if drain, ok, wait = s.drained.reserve(r.Context(), box.String(), s.now); !ok {
-			return rateLimited(wait, "this box takes out at most so much new mail a minute: the rest waits on the server")
+			return spent(protocol.CodeFetchPaced, wait, "this box takes out at most so much new mail a minute: the rest waits on the server")
 		}
 	}
 	held, again, err := s.store.Fetched(r.Context(), box, id)

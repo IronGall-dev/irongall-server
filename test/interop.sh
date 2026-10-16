@@ -97,7 +97,7 @@ gocli "$R" prekey renew > /dev/null && recipe "$R" "ig_send $GA '$work/body'" &&
 # --- 3. the recipe's error path on a real problem+json ---
 nobody=$(printf '%064d' 0)
 err=$(recipe "$R" "ig_send $nobody '$work/body'" 2>&1); rc=$?
-[ $rc -ne 0 ] && grep -q '^ERROR 404 no_such_mailbox; the server says: "' <<< "$err" && ok "recipe prints a real problem's status and code, and the server's words as its words" || bad "recipe error path: rc=$rc $err"
+[ $rc -ne 0 ] && grep -qx 'ERROR 404 no_such_mailbox' <<< "$err" && ! grep -q 'no box has this address' <<< "$err" && ok "recipe prints a real problem's status and code, and none of the server's words (PROTOCOL.md §13)" || bad "recipe error path: rc=$rc $err"
 
 # --- 4. the optional fields, sent/ and aliases, across the clients ---
 recipe "$R" "ig_alias go $GL" > /dev/null && [ "$(gocli "$R" alias list)" = "go $GA" ] && ok "an alias the recipe made is read by the Go client" || bad "the recipe's alias in the Go client"
@@ -160,11 +160,11 @@ for c in "-540 9 minutes slow" "2940 49 minutes fast"; do
     && recipe "$d" "$(clock "$off"); ig_rekey $(nopq_arg)" 2>> "$work/err" \
     && ok "a recipe box whose clock is $name registers, renews, and exchanges mail with a Go box made that moment" || bad "clock $name: $out $(cat "$work/err")"
 done
-out=$(recipe "$work/clock-late" "$(clock -660); ig_init $(nopq_arg)" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 401 pass_expired" <<< "$out" && grep -q "the server's clock reads" <<< "$out" && grep -q "this machine's clock reads" <<< "$out" \
-  && ok "a recipe box 11 minutes slow is refused at its pass: the server states its clock, and the recipe what its own reads" || bad "clock 11 minutes slow: $out"
-out=$(recipe "$work/clock-early" "$(clock 3660); ig_init $(nopq_arg)" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 400 bad_key" <<< "$out" && grep -q "has not begun; the server's clock reads" <<< "$out" \
+out=$(recipe "$work/clock-late" "$(clock -660); ig_init $(nopq_arg)" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 401 pass_expired" <<< "$out" && grep -q "the server dates its answer 20" <<< "$out" && grep -q "this machine's clock reads" <<< "$out" \
+  && ok "a recipe box 11 minutes slow is refused at its pass: the server's answer is dated by its clock, and the recipe says that beside what its own reads" || bad "clock 11 minutes slow: $out"
+out=$(recipe "$work/clock-early" "$(clock 3660); ig_init $(nopq_arg)" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 400 prekey_time" <<< "$out" && grep -q "the server dates its answer 20" <<< "$out" \
   && L=$(recipe "$work/clock-early" "ig_init $(nopq_arg)" 2> "$work/err") && ig_hex "${L##*/}" \
-  && ok "a recipe box first made 61 minutes fast is refused, the server stating its clock; with the clock right, the same box registers" || bad "clock 61 minutes fast: $out $(cat "$work/err")"
+  && ok "a recipe box first made 61 minutes fast is refused, the answer dated by the server's clock; with the clock right, the same box registers" || bad "clock 61 minutes fast: $out $(cat "$work/err")"
 
 # --- 7. revocation (PROTOCOL.md §6.3): the server keeps the identity's own signature and shows it, and each client checks it ---
 V1="$work/v1"; V2="$work/v2"; V3="$work/v3"; V4="$work/v4"; V5="$work/v5"
@@ -247,7 +247,7 @@ out=$(gocli "$W3" recv 2>&1); [ $? -eq 0 ] && [ "$(grep -c ': certificate_revoke
   && ok "the Go client refuses the recipe box's mail under the certificate that revocation covers, and delivers its mail under the next" || bad "Go recv after the recipe box's revocation: $out"
 # A revocation through the box's CURRENT certificate: the server takes no pass of the box and no mail for it, until it renews.
 [ "$(put "$work/two.json" "$W2A")" = 200 ] || bad "the second revocation: $(cat "$work/put.json")"
-out=$(recipe "$W2" "ig_recv" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 401 unauthorized" <<< "$out" && ok "a box whose current certificate is revoked has no pass the server takes" || bad "a revoked certificate's recv: $out"
+out=$(recipe "$W2" "ig_recv" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 401 certificate_revoked" <<< "$out" && ok "a box whose current certificate is revoked has no pass the server takes" || bad "a revoked certificate's recv: $out"
 # A sender asks what the server holds about a box before it posts to it (PROTOCOL.md §4.1): shown the revocation, it refuses the box's statement itself.
 out=$(gocli "$W3" send "$W2L" < "$work/body8" 2>&1); [ $? -ne 0 ] && grep -q "under a certificate its identity has revoked" <<< "$out" && ! grep -q "prekey_expired" <<< "$out" && ls "$W3"/outbox/*.P > /dev/null 2>&1 \
   && kept "$W3/peers/$W2A/revoked-certs.json" | cmp -s - "$work/two.certs" && ! ls "$W3"/outbox/*.json > /dev/null 2>&1 \

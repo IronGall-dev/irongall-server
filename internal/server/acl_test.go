@@ -174,7 +174,7 @@ func TestACLRefusesSends(t *testing.T) {
 	// c was refused twice under SendsPerDay 1: neither refusal spent its
 	// send, which "*" now lets through, and the count then holds.
 	e.want(e.do("POST", to, e.sealTo(b), e.pass(c)), 201, "")
-	e.want(e.do("POST", to, e.sealTo(b), e.pass(c)), 429, protocol.CodeRateLimited)
+	e.want(e.do("POST", to, e.sealTo(b), e.pass(c)), 429, protocol.CodeSendsSpent)
 }
 
 // A deny list deletes the box's unacked mail from what it matches, and only

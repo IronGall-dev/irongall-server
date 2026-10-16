@@ -212,7 +212,7 @@ func TestAStatementOutOfOrderIsRefusedBeforeItsSignature(t *testing.T) {
 	stale.Serial = 2
 	misSigned.Prekey = stale.Statement()
 	got := e.do("PUT", r.path("/prekey"), misSigned, r.pass(1))
-	e.want(got, http.StatusBadRequest, protocol.CodeBadKey)
+	e.want(got, http.StatusUnauthorized, protocol.CodeCertificateRevoked)
 	if !strings.Contains(string(got.body), "revoked") {
 		t.Fatalf("a statement under a revoked certificate: %s", got.body)
 	}
@@ -267,8 +267,8 @@ func TestTheIdentitysActsAreCounted(t *testing.T) {
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
 	e.want(e.do("PUT", r.path("/revocations"), r.certs(1), ""), http.StatusOK, "") // the day's one act
 	r.prekey(5, e.clock.Now().Add(protocol.PrekeyLifetime), nil)
-	e.want(e.do("PUT", r.path("/prekey"), r.upload(5), r.pass(5)), http.StatusTooManyRequests, protocol.CodeRateLimited)
-	e.want(e.do("PUT", r.path("/revocations"), r.certs(3), ""), http.StatusTooManyRequests, protocol.CodeRateLimited)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(5), r.pass(5)), http.StatusTooManyRequests, protocol.CodeIdentityActsSpent)
+	e.want(e.do("PUT", r.path("/revocations"), r.certs(3), ""), http.StatusTooManyRequests, protocol.CodeIdentityActsSpent)
 	rev, err := protocol.SignRevocation(r.signer, r.id.Address())
 	if err != nil {
 		t.Fatal(err)
@@ -501,7 +501,7 @@ func TestTheDrainBudget(t *testing.T) {
 	e2.want(fetch(ids[0].ID), http.StatusOK, "") // a repeat: given back, and its own allowance spent
 	e2.want(fetch(ids[1].ID), http.StatusOK, "")
 	r := fetch(ids[2].ID)
-	e2.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
+	e2.want(r, http.StatusTooManyRequests, protocol.CodeFetchPaced)
 	if r.header.Get("Retry-After") == "" || !strings.Contains(string(r.body), "waits on the server") {
 		t.Fatalf("the third first fetch: %s", r.body)
 	}

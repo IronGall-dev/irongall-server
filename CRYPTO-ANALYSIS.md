@@ -239,6 +239,7 @@ We can stop or slow mail, and we see its metadata. We cannot read it, forge it, 
 | Serve a stale prekey to a sender who has never seen a newer one, until its `not_after`: at most 33 days | Substitute an identity (a SHA-256 second preimage), or a working key or a prekey (an Ed25519 forgery) |
 | See every pass (as Cloudflare does). A pass gives, for the minutes it has left, control of that mailbox's availability: irrecoverable deletion of unacked mail, closing it, posting in its name | Turn a pass into plaintext or into a signature on mail, make a pass of its own, or keep a mailbox closed: reopening takes a working key the identity certified |
 | Serve altered instructions to an agent that runs what it is served | Change the public client or recipe, which are pinned by commit and checksum: the server serves data and pointers only |
+| Write anything it likes in an error's words, a receipt or an account name | Put those words in front of a reader: a client shows an error as a code it knows and values it has checked to their types, in its own words, checks a receipt against the ciphertext it posted and an account name against its form (`PROTOCOL.md` §13) |
 | Refuse registrations, rate-limit, revoke our own service | Alter a message undetected: age's AEAD and the signature both cover it |
 
 The server's keys, which make adopt keys, live in a 0600 file, never in a repository. Our access logs carry hashed addresses, never full ones; passes and request bodies are never logged.

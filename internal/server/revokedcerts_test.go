@@ -138,15 +138,15 @@ func TestRevokedCertificates(t *testing.T) {
 	// The highest stands: one through a lower serial is refused, so what was
 	// revoked stays revoked.
 	e.want(e.do("PUT", path, good, ""), 409, protocol.CodeConflict)
-	e.want(e.do("GET", r.path("/messages"), nil, held), 401, protocol.CodeUnauthorized)
-	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 401, protocol.CodeUnauthorized)
-	e.want(e.do("DELETE", r.path(""), nil, r.pass(2)), 401, protocol.CodeUnauthorized)
-	e.want(e.sendTo(other, 1, 1, r, 2), 401, protocol.CodeUnauthorized)
+	e.want(e.do("GET", r.path("/messages"), nil, held), 401, protocol.CodeCertificateRevoked)
+	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 401, protocol.CodeCertificateRevoked)
+	e.want(e.do("DELETE", r.path(""), nil, r.pass(2)), 401, protocol.CodeCertificateRevoked)
+	e.want(e.sendTo(other, 1, 1, r, 2), 401, protocol.CodeCertificateRevoked)
 	e.want(e.sendTo(r, 2, 2, other, 1), 409, protocol.CodePrekeyExpired)
-	e.want(put(2, 2), 400, protocol.CodeBadKey)
+	e.want(put(2, 2), 401, protocol.CodeCertificateRevoked)
 	current := r.work[2]
 	r.prekeyUnder(current, 3, now.Add(time.Hour), nil)
-	e.want(put(3, 2), 400, protocol.CodeBadKey)
+	e.want(put(3, 2), 401, protocol.CodeCertificateRevoked)
 	if n, _, _ := e.store.Count(ctx, r.id.Address()); n != 1 {
 		t.Errorf("the box holds %d messages after its certificate was revoked, want the 1 it had", n)
 	}
@@ -165,7 +165,7 @@ func TestRevokedCertificates(t *testing.T) {
 	// it is then taken, and the next one above is.
 	e.want(e.do("PUT", path, r.certs(4), ""), 200, "")
 	r.prekey(4, now.Add(protocol.MaxPrekeyLifetime), nil)
-	e.want(put(4, 4), 400, protocol.CodeBadKey)
+	e.want(put(4, 4), 401, protocol.CodeCertificateRevoked)
 	r.prekey(5, now.Add(protocol.MaxPrekeyLifetime), nil)
 	e.want(put(5, 5), 200, "")
 
@@ -239,14 +239,14 @@ func TestTheClientRevokesItsEarlierCertificates(t *testing.T) {
 	}
 	// The working key from before: its pass is refused, and a prekey it
 	// signs at the highest serial there is, is refused too.
-	e.want(e.do("GET", "/v1/"+a.Address().String()+"/messages", nil, old), 401, protocol.CodeUnauthorized)
+	e.want(e.do("GET", "/v1/"+a.Address().String()+"/messages", nil, old), 401, protocol.CodeCertificateNotCurrent)
 	key, _ := age.GenerateX25519Identity()
 	top := &protocol.Prekey{Address: a.Address(), Serial: protocol.MaxSerial, Key: key.Recipient().String(), NotAfter: e.clock.Now().Add(time.Hour)}
 	sig, err := protocol.Sign(taken, top.Statement(), protocol.PrekeyNamespace(a.Address()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.want(e.do("PUT", "/v1/"+a.Address().String()+"/prekey", protocol.PrekeyRequest{Prekey: top.Statement(), PrekeySignature: sig}, e.passFor(taken, a.Address(), e.name())), 400, protocol.CodeBadKey)
+	e.want(e.do("PUT", "/v1/"+a.Address().String()+"/prekey", protocol.PrekeyRequest{Prekey: top.Statement(), PrekeySignature: sig}, e.passFor(taken, a.Address(), e.name())), 401, protocol.CodeCertificateRevoked)
 
 	send(t, a, b, "under A's second certificate")
 	res := receive(t, b)
@@ -306,7 +306,7 @@ func TestARevocationOfCertificatesOutlivesTheProcess(t *testing.T) {
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	r2 := *r
 	r2.e = e2
-	e2.want(e2.do("GET", r.path("/messages"), nil, r2.pass(1)), 401, protocol.CodeUnauthorized)
+	e2.want(e2.do("GET", r.path("/messages"), nil, r2.pass(1)), 401, protocol.CodeCertificateRevoked)
 	shown := e2.do("GET", r.path("/revocations"), nil, "")
 	e2.want(shown, 200, "")
 	var got protocol.Revocations
@@ -391,12 +391,12 @@ func TestTheRemedyRenewsWhenATakerSpentTheDaysRenewals(t *testing.T) {
 	for i := range l.RenewalsPerDay {
 		e.want(thief(inUse+uint64(i)+1), 200, "")
 	}
-	e.want(thief(inUse+uint64(l.RenewalsPerDay)+1), 429, protocol.CodeRateLimited) // the taker is out of renewals
+	e.want(thief(inUse+uint64(l.RenewalsPerDay)+1), 429, protocol.CodeRenewalsSpent) // the taker is out of renewals
 	r, err := a.RenewAndRevoke(ctx, protocol.Classic)
 	if err != nil || r == nil || r.NotRenewed != nil || r.Prekey == nil || r.Revoked == nil || !r.Revoked.Revokes(inUse) || r.Revoked.Revokes(r.Below) {
 		t.Fatalf("the owner's remedy after the taker's renewals: %+v, %v", r, err)
 	}
-	e.want(thief(inUse+100), 400, protocol.CodeBadKey)
+	e.want(thief(inUse+100), 401, protocol.CodeCertificateRevoked)
 	if _, cert := e.numbers(a.Address()); cert != r.Below {
 		t.Fatalf("the box stands at certificate %d, not the one the remedy made, %d", cert, r.Below)
 	}

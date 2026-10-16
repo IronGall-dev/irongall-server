@@ -322,7 +322,7 @@ func TestTwoProcesses(t *testing.T) {
 		st, ok := other.Held(b.Address())
 		return ok && st.Cert == rec.Cert
 	})
-	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, old); r.code() != protocol.CodeUnauthorized {
+	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, old); r.code() != protocol.CodeCertificateNotCurrent {
 		t.Fatalf("the old pass on the other process: %d %s", r.status, r.body)
 	}
 	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, tok()); r.status != http.StatusOK {
@@ -561,7 +561,7 @@ func TestPollStaysInMemory(t *testing.T) {
 	if r := poll(c, e2.pass(c)); r.status != http.StatusOK {
 		t.Fatalf("rekeyed box: %d %s", r.status, r.body)
 	}
-	if r := poll(c, old); r.code() != protocol.CodeUnauthorized {
+	if r := poll(c, old); r.code() != protocol.CodeCertificateNotCurrent {
 		t.Fatalf("the pass from before the renewal: %d %s", r.status, r.body)
 	}
 	if r := e.do(http.MethodDelete, "/v1/"+c.Address().String(), nil, e.pass(c)); r.status != http.StatusNoContent {

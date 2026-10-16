@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -175,20 +176,17 @@ func notStored(h http.Handler) http.Handler {
 }
 
 // dated dates every answer by the server's own clock, the one its checks
-// read. A client whose pass is refused for its time compares that date with
-// its own clock (PROTOCOL.md §0).
+// read. A client whose pass or statement is refused for its time compares
+// that date with its own clock (PROTOCOL.md §0): it is how a refusal for a
+// time says what this clock reads. Every check here is exact at this clock,
+// and a client makes what it sends with an hour of room, so a refusal for a
+// time is nearly always a clock that is off.
 func (s *Server) dated(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Date", s.now().UTC().Format(http.TimeFormat))
 		h.ServeHTTP(w, r)
 	})
 }
-
-// clock is what a refusal for a time says of the server's clock: the caller
-// sets its own beside it. Every check here is exact at this clock, and a
-// client makes what it sends with an hour of room (PROTOCOL.md §0), so a
-// refusal for a time is nearly always a clock that is off.
-func (s *Server) clock() string { return "the server's clock reads " + formatTime(s.now()) }
 
 // whenReady answers 503 until the store's memory is loaded: a poll answered
 // before then could read a count of zero that is not true.
@@ -329,7 +327,7 @@ func decodeBody(w http.ResponseWriter, r *http.Request, limit int64, v any) erro
 func readProblem(err error, limit int64) error {
 	var tooBig *http.MaxBytesError
 	if errors.As(err, &tooBig) {
-		return fail(protocol.CodeTooLarge, "send less", "the request body is over %d bytes", limit)
+		return fail(protocol.CodeTooLarge, "send less", "the request body is over %d bytes", limitValue(int(limit)))
 	}
 	return fail(protocol.CodeBadRequest, "", "the request body could not be read")
 }
@@ -343,9 +341,9 @@ func decodeJSON(data []byte, v any) error {
 	case err == nil:
 		return nil
 	case errors.Is(err, protocol.ErrNotBase64):
-		return fail(protocol.CodeBadEncoding, "base64 of the exact file bytes", "%v", err)
+		return failErr(protocol.CodeBadEncoding, "base64 of the exact file bytes", err)
 	default:
-		return fail(protocol.CodeBadRequest, "", "the body is not the JSON object expected: %v", err)
+		return failErr(protocol.CodeBadRequest, "", fmt.Errorf("the body is not the JSON object expected: %w", err))
 	}
 }
 
@@ -353,7 +351,7 @@ func decodeJSON(data []byte, v any) error {
 func required(fields ...any) error {
 	for i := 0; i+1 < len(fields); i += 2 {
 		if fields[i+1].(protocol.Bytes) == nil {
-			return fail(protocol.CodeBadRequest, "", "missing field %q", fields[i])
+			return fail(protocol.CodeBadRequest, "", "missing field %q", memberValue(fields[i].(string)))
 		}
 	}
 	return nil
@@ -566,16 +564,23 @@ func revoked() *problem {
 // fetchedAlready refuses a fetch of a message the box has fetched before, once
 // its allowance for that is spent (fetch in messages.go).
 func fetchedAlready(wait time.Duration) *problem {
-	p := fail(protocol.CodeRateLimited, "keep each message when you fetch it, then ack it (irongall recv does both); to fetch this one again, wait for Retry-After",
-		"this message was fetched before, and the box's allowance for fetching again is spent; retry in %ds", retrySeconds(wait))
+	p := fail(protocol.CodeRefetchSpent, "keep each message when you fetch it, then ack it (irongall recv does both); to fetch this one again, wait for Retry-After",
+		"this message was fetched before, and the box's allowance for fetching again is spent")
 	p.retryAfter = wait
 	return p
 }
 
-// rateLimited is a 429 whose detail also says how long to wait, so a client
-// that prints the detail shows it without reading Retry-After.
-func rateLimited(wait time.Duration, format string, args ...any) *problem {
-	p := fail(protocol.CodeRateLimited, "wait for Retry-After, then retry", format+"; retry in %ds", append(args, retrySeconds(wait))...)
+// rateLimited is a 429 for calls beyond a limit, with how long to wait in
+// Retry-After.
+func rateLimited(wait time.Duration, detail string) *problem {
+	return spent(protocol.CodeRateLimited, wait, detail)
+}
+
+// spent is a 429 of code, with how long to wait in Retry-After: a limit a
+// client meets otherwise than calls beyond one (a day's sends, renewals or
+// identity acts; a paced drain).
+func spent(code protocol.Code, wait time.Duration, format string, values ...value) *problem {
+	p := fail(code, "wait for Retry-After, then retry", format, values...)
 	p.retryAfter = wait
 	return p
 }

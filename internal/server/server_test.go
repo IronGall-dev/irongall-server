@@ -348,10 +348,10 @@ func TestRegistration(t *testing.T) {
 	e.want(e.do("PUT", r.path(""), protocol.RegisterRequest{Identity: reg.Identity, Prekey: reg.Prekey, PrekeySignature: byBare}, pass), 400, protocol.CodeBadKey)
 	long := e.raw()
 	long.prekey(1, now.Add(protocol.MaxPrekeyLifetime+time.Second), nil)
-	e.want(e.do("PUT", long.path(""), long.registration(1), long.pass(1)), 400, protocol.CodeBadKey)
+	e.want(e.do("PUT", long.path(""), long.registration(1), long.pass(1)), 400, protocol.CodePrekeyTime)
 	expired := e.raw()
 	expired.prekey(1, now, nil)
-	e.want(e.do("PUT", expired.path(""), expired.registration(1), expired.pass(1)), 400, protocol.CodeBadKey)
+	e.want(e.do("PUT", expired.path(""), expired.registration(1), expired.pass(1)), 400, protocol.CodePrekeyTime)
 
 	// The pass: there must be one, this box's, for this server, not run out,
 	// and under the certificate the statement is signed under. A statement
@@ -360,7 +360,7 @@ func TestRegistration(t *testing.T) {
 	e.want(e.do("PUT", r.path(""), reg, "Bearer igt1_abc"), 401, protocol.CodeUnauthorized)
 	e.want(e.do("PUT", r.path(""), reg, other.pass(1)), 401, protocol.CodeUnauthorized)
 	e.want(e.do("PUT", r.path(""), reg, e.passFor(r.work[1], r.id.Address(), "another.example")), 401, protocol.CodeUnauthorized)
-	e.want(e.do("PUT", r.path(""), reg, e.passFor(r.certify(2), r.id.Address(), e.name())), 401, protocol.CodeUnauthorized)
+	e.want(e.do("PUT", r.path(""), reg, e.passFor(r.certify(2), r.id.Address(), e.name())), 401, protocol.CodeCertificateNotCurrent)
 	e.clock.Add(-protocol.PassLifetime)
 	ranOut := r.pass(1)
 	e.clock.Add(protocol.PassLifetime)
@@ -443,7 +443,7 @@ func TestOwnerCalls(t *testing.T) {
 	e.want(e.do("GET", r.path("/messages"), nil, e.passFor(r.work[1], r.id.Address(), "another.example")), 401, protocol.CodeUnauthorized)
 	// A working key the identity certified, which the server never saw a
 	// prekey under, is not the box's current one.
-	e.want(e.do("GET", r.path("/messages"), nil, e.passFor(r.certify(2), r.id.Address(), e.name())), 401, protocol.CodeUnauthorized)
+	e.want(e.do("GET", r.path("/messages"), nil, e.passFor(r.certify(2), r.id.Address(), e.name())), 401, protocol.CodeCertificateNotCurrent)
 
 	empty := e.do("GET", r.path("/messages"), nil, pass)
 	e.want(empty, 200, "")
@@ -504,7 +504,7 @@ func TestOwnerCalls(t *testing.T) {
 	}
 	// The pass from before the new certificate is refused, though the server
 	// took it a moment ago; one under the new certificate is taken.
-	e.want(e.do("GET", r.path("/messages"), nil, pass), 401, protocol.CodeUnauthorized)
+	e.want(e.do("GET", r.path("/messages"), nil, pass), 401, protocol.CodeCertificateNotCurrent)
 	list := e.do("GET", r.path("/messages"), nil, r.pass(2))
 	e.want(list, 200, "")
 	if !bytes.Contains(list.body, []byte(`"count":1`)) {
@@ -558,27 +558,27 @@ func TestPrekeyRenewal(t *testing.T) {
 
 	e.want(put(1, 1), 200, "") // an identical retry of the current statement
 	r.prekey(2, now.Add(time.Hour), r.keys[1])
-	e.want(put(2, 2), 400, protocol.CodeBadKey) // the same key again
+	e.want(put(2, 2), 400, protocol.CodePrekeyNotNew) // the same key again
 	r.prekey(2, now.Add(time.Hour), nil)
 	// A good statement with no pass, with a pass under the box's current
 	// certificate and not its own, and with another box's pass.
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(2), ""), 401, protocol.CodeUnauthorized)
-	e.want(put(2, 1), 401, protocol.CodeUnauthorized)
+	e.want(put(2, 1), 401, protocol.CodeCertificateNotCurrent)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(2), unknown.pass(2)), 401, protocol.CodeUnauthorized)
 	old := r.pass(1)
 	e.want(e.do("GET", r.path("/messages"), nil, old), 200, "")
 	e.want(put(2, 2), 200, "")
 	// The box is now known by certificate 2: the pass under 1, taken a moment
 	// ago, is refused, and so is a statement under 1.
-	e.want(e.do("GET", r.path("/messages"), nil, old), 401, protocol.CodeUnauthorized)
+	e.want(e.do("GET", r.path("/messages"), nil, old), 401, protocol.CodeCertificateNotCurrent)
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 200, "")
 	r.prekeyUnder(r.work[1], 3, now.Add(time.Hour), nil)
-	e.want(put(3, 1), 400, protocol.CodeBadKey)
+	e.want(put(3, 1), 401, protocol.CodeCertificateNotCurrent)
 	// Another certificate of the current serial is not the current one.
 	current := r.work[2]
 	r.prekey(3, now.Add(time.Hour), nil)
 	r.prekeyUnder(r.certify(2), 3, now.Add(time.Hour), nil)
-	e.want(put(3, 2), 400, protocol.CodeBadKey)
+	e.want(put(3, 2), 401, protocol.CodeCertificateNotCurrent)
 	// A higher serial under the current certificate is taken.
 	r.work[2] = current
 	r.prekeyUnder(current, 3, now.Add(time.Hour), nil)
@@ -586,7 +586,7 @@ func TestPrekeyRenewal(t *testing.T) {
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 200, "")
 
 	r.prekey(4, now.Add(time.Hour), r.keys[1])
-	e.want(put(4, 4), 400, protocol.CodeBadKey) // a live retired key
+	e.want(put(4, 4), 400, protocol.CodePrekeyNotNew) // a live retired key
 	// Under the box's current certificate the serial must rise.
 	r.prekeyUnder(current, 3, now.Add(2*time.Hour), nil)
 	e.want(put(3, 2), 409, protocol.CodeConflict)
@@ -600,10 +600,10 @@ func TestPrekeyRenewal(t *testing.T) {
 	e.want(put(5, 2), 400, protocol.CodeBadKey)
 	e.clock.Add(protocol.MaxPrekeyLifetime)
 	r.prekeyUnder(current, 5, e.clock.Now().Add(time.Hour), nil)
-	e.want(e.do("PUT", r.path("/prekey"), r.upload(5), ""), 400, protocol.CodeBadKey)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(5), ""), 400, protocol.CodePrekeyTime)
 	// The box cannot poll under an ended certificate either, and comes back
 	// with a prekey under a new one.
-	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 401, protocol.CodeUnauthorized)
+	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 401, protocol.CodePassExpired)
 	r.prekey(5, e.clock.Now().Add(time.Hour), nil)
 	e.want(put(5, 5), 200, "")
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(5)), 200, "")
@@ -616,11 +616,11 @@ func TestPrekeyRenewal(t *testing.T) {
 	r.prekeyUnder(r.certify(6), 1, e.clock.Now().Add(time.Hour), nil)
 	e.want(put(1, 6), 200, "")
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(6)), 200, "")
-	e.want(e.do("GET", r.path("/messages"), nil, r.pass(5)), 401, protocol.CodeUnauthorized)
+	e.want(e.do("GET", r.path("/messages"), nil, r.pass(5)), 401, protocol.CodeCertificateNotCurrent)
 	r.prekeyUnder(r.work[6], 1, e.clock.Now().Add(2*time.Hour), nil)
 	e.want(put(1, 6), 409, protocol.CodeConflict)
 	r.prekeyUnder(r.work[5], 9, e.clock.Now().Add(time.Hour), nil)
-	e.want(put(9, 5), 400, protocol.CodeBadKey)
+	e.want(put(9, 5), 401, protocol.CodeCertificateNotCurrent)
 	r.prekeyUnder(r.work[6], 2, e.clock.Now().Add(time.Hour), nil)
 	e.want(put(2, 6), 200, "")
 }
@@ -722,7 +722,7 @@ func TestSendPipeline(t *testing.T) {
 	// never saw, and with its signature changed.
 	other := e.raw()
 	other.signer, other.id = signer(t, a), a.Identity()
-	e.want(e.do("POST", to, ok, e.passFor(other.certify(7), a.Address(), e.name())), 401, protocol.CodeUnauthorized)
+	e.want(e.do("POST", to, ok, e.passFor(other.certify(7), a.Address(), e.name())), 401, protocol.CodeCertificateNotCurrent)
 	e.clock.Add(-protocol.PassLifetime)
 	ranOut := e.pass(a)
 	e.clock.Add(protocol.PassLifetime)
@@ -812,8 +812,8 @@ func TestPerIPLimits(t *testing.T) {
 	if !errors.As(err, &ae) || ae.Problem.Code != protocol.CodeRateLimited {
 		t.Fatalf("second send in a minute from one IP: %v", err)
 	}
-	if !strings.Contains(ae.Problem.Detail, "; retry in "+strconv.Itoa(int(ae.RetryAfter/time.Second))+"s") {
-		t.Fatalf("the detail does not say the wait Retry-After gives (%s): %q", ae.RetryAfter, ae.Problem.Detail)
+	if ae.RetryAfter <= 0 || !strings.Contains(err.Error(), "the server asks to wait "+strconv.Itoa(int(ae.RetryAfter/time.Second))+" seconds") {
+		t.Fatalf("the error does not say the wait Retry-After gives (%s): %v", ae.RetryAfter, err)
 	}
 }
 
@@ -921,7 +921,7 @@ func TestRenewalLimits(t *testing.T) {
 	}
 	_, err := b.Rekey(ctx, "")
 	var ae *client.APIError
-	if !errors.As(err, &ae) || ae.Problem.Code != protocol.CodeRateLimited || ae.RetryAfter != 23*time.Hour {
+	if !errors.As(err, &ae) || ae.Problem.Code != protocol.CodeIdentityActsSpent || ae.RetryAfter != 23*time.Hour {
 		t.Fatalf("a fourth renewal in a day: %v", err)
 	}
 	cur, _ := e.store.Box(ctx, b.Address())

@@ -5,45 +5,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
 // Every error body is RFC 9457 Problem Details with the extension members
-// code and hint (PROTOCOL.md §13). The hint names the fix as a client command,
-// never a raw shell line a malicious server could alter; detail explains it
-// for generic clients.
-
-// titles are the problem titles, one per code.
-var titles = map[protocol.Code]string{
-	protocol.CodeBadRequest:         "Bad request",
-	protocol.CodeBadAddress:         "Bad address",
-	protocol.CodeBadEncoding:        "Bad encoding",
-	protocol.CodeIdentityMismatch:   "Identity mismatch",
-	protocol.CodeBadKey:             "Bad key",
-	protocol.CodeNotAge:             "Not an age file",
-	protocol.CodeWrongRecipientType: "Wrong recipient type",
-	protocol.CodeBadRevocation:      "Bad revocation",
-	protocol.CodeUnauthorized:       "Unauthorized",
-	protocol.CodePassExpired:        "Pass expired",
-	protocol.CodeUnknownSender:      "Unknown sender",
-	protocol.CodeSenderRevoked:      "Sender revoked",
-	protocol.CodeSenderNotAllowed:   "Sender not allowed",
-	protocol.CodeNoSuchMailbox:      "No such mailbox",
-	protocol.CodeNoSuchMessage:      "No such message",
-	protocol.CodeNotRevoked:         "Not revoked",
-	protocol.CodeConflict:           "Conflict",
-	protocol.CodeStalePrekey:        "Stale prekey",
-	protocol.CodePrekeyExpired:      "Prekey expired",
-	protocol.CodeRevoked:            "Revoked",
-	protocol.CodeTooLarge:           "Too large",
-	protocol.CodeRateLimited:        "Rate limited",
-	protocol.CodePairFull:           "Pair full",
-	protocol.CodeMailboxFull:        "Mailbox full",
-	protocol.CodeUnavailable:        "Unavailable",
-}
+// code and hint, and one member for each value the error carries
+// (PROTOCOL.md §13). Every value the detail names is one of those members
+// (AEP-193): fail takes the detail's values only as [value]s, each of which
+// sets its member, so a detail cannot carry a value its body does not. The
+// words, detail and hint, are for a person reading the body: a client needs
+// nothing from them, and shows none of them.
 
 // problem is an error to answer with.
 type problem struct {
@@ -51,30 +27,99 @@ type problem struct {
 	detail     string
 	hint       string
 	retryAfter time.Duration // 429 and 503
-	// pair_full only
-	unacked *int64
-	oldest  time.Time
+	values     []value
 }
 
 func (p *problem) Error() string { return string(p.code) + ": " + p.detail }
 
-func fail(code protocol.Code, hint, format string, args ...any) *problem {
-	return &problem{code: code, hint: hint, detail: fmt.Sprintf(format, args...)}
+// value is a value an error carries: formatted into its detail as any
+// operand is, and set as its own member of the body.
+type value struct {
+	v   any
+	set func(*protocol.Problem)
+}
+
+func (v value) Format(f fmt.State, verb rune) { _, _ = fmt.Fprintf(f, fmt.FormatString(f, verb), v.v) }
+
+func u64(n uint64) *uint64 { return &n }
+
+// limitValue is the limit hit: bytes, entries, or a day's count.
+func limitValue(n int) value {
+	return value{n, func(p *protocol.Problem) { p.Limit = u64(uint64(max(n, 0))) }}
+}
+
+func messagesValue(n int) value {
+	return value{n, func(p *protocol.Problem) { p.Messages = u64(uint64(max(n, 0))) }}
+}
+
+func versionValue(v uint64) value {
+	return value{v, func(p *protocol.Problem) { p.Version = u64(v) }}
+}
+
+func prekeySerialValue(v uint64) value {
+	return value{v, func(p *protocol.Problem) { p.PrekeySerial = u64(v) }}
+}
+
+func certificateSerialValue(v uint64) value {
+	return value{v, func(p *protocol.Problem) { p.CertificateSerial = u64(v) }}
+}
+
+func throughValue(v uint64) value {
+	return value{v, func(p *protocol.Problem) { p.Through = u64(v) }}
+}
+
+func keyTypesValue(ts []string) value {
+	return value{strings.Join(ts, ", "), func(p *protocol.Problem) { p.KeyTypes = slices.Clone(ts) }}
+}
+
+func keyTypeValue(t string) value {
+	return value{t, func(p *protocol.Problem) { p.KeyType = t }}
+}
+
+func memberValue(name string) value {
+	return value{name, func(p *protocol.Problem) { p.Member = name }}
+}
+
+func unackedValue(n int) value {
+	return value{n, func(p *protocol.Problem) { u := int64(n); p.Unacked = &u }}
+}
+
+func oldestValue(t time.Time) value {
+	s := t.UTC().Format(protocol.TimeLayout)
+	return value{s, func(p *protocol.Problem) { p.OldestExpiresAt = s }}
+}
+
+func fail(code protocol.Code, hint, format string, values ...value) *problem {
+	args := make([]any, len(values))
+	for i, v := range values {
+		args[i] = v
+	}
+	return &problem{code: code, hint: hint, detail: fmt.Sprintf(format, args...), values: values}
+}
+
+// failErr is a refusal whose detail is err's words: one of the protocol's
+// own errors, whose words are fixed. An unknown member it names is a value,
+// and set as one.
+func failErr(code protocol.Code, hint string, err error) *problem {
+	p := &problem{code: code, hint: hint, detail: err.Error()}
+	if name := protocol.UnknownMember(err); name != "" {
+		p.values = append(p.values, memberValue(name))
+	}
+	return p
 }
 
 func writeProblem(w http.ResponseWriter, p *problem) {
 	status := p.code.Status()
 	body := protocol.Problem{
 		Type:   p.code.TypeURI(),
-		Title:  titles[p.code],
+		Title:  p.code.Title(),
 		Status: int64(status),
 		Detail: p.detail,
 		Code:   p.code,
 		Hint:   p.hint,
 	}
-	if p.unacked != nil {
-		body.Unacked = p.unacked
-		body.OldestExpiresAt = p.oldest.UTC().Format(protocol.TimeLayout)
+	for _, v := range p.values {
+		v.set(&body)
 	}
 	h := w.Header()
 	h.Set("Content-Type", protocol.ProblemContentType)

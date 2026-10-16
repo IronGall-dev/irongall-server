@@ -47,9 +47,9 @@ func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 	acl, err := protocol.CheckACL(&doc, s.limits.ACLEntries)
 	switch {
 	case errors.Is(err, protocol.ErrACLTooLarge):
-		return fail(protocol.CodeTooLarge, "list fewer addresses: "+hintACL, "an ACL here holds at most %d entries, its two lists together", s.limits.ACLEntries)
+		return fail(protocol.CodeTooLarge, "list fewer addresses: "+hintACL, "an ACL here holds at most %d entries, its two lists together", limitValue(s.limits.ACLEntries))
 	case err != nil:
-		return fail(protocol.CodeBadRequest, hintACL, "%v", err)
+		return failErr(protocol.CodeBadRequest, hintACL, err)
 	}
 	b, err := s.box(r.Context(), a)
 	if err != nil {
@@ -59,12 +59,12 @@ func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 		return noSuchMailbox
 	}
 	if held := b.ACL.Document(); acl.Version <= *held.Version {
-		return fail(protocol.CodeConflict, "GET the same path for the version held, and send above it", "this box's ACL is at version %d, and a new one must be above it", *held.Version)
+		return fail(protocol.CodeConflict, "GET the same path for the version held, and send above it", "this box's ACL is at version %d, and a new one must be above it", versionValue(*held.Version))
 	}
 	b.ACL = acl
 	if err := s.store.UpdateBox(r.Context(), b); err != nil {
 		if errors.Is(err, ErrStale) {
-			return fail(protocol.CodeConflict, "retry", "the box changed during the request")
+			return fail(protocol.CodeBoxChanged, "retry", "the box changed during the request")
 		}
 		return err
 	}

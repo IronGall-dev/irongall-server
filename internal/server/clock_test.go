@@ -85,9 +85,10 @@ func TestTheTwoClocksFurthestApart(t *testing.T) {
 	}
 }
 
-// Further off, the box is refused, and the server's words state what its
-// clock reads and which way the caller's is likely off. For a pass refused
-// for its time the client adds the date on the answer beside its own clock.
+// Further off, the box is refused, and the client says in its own words what
+// the server dates its answer, beside its own clock: the server's words are
+// not shown (PROTOCOL.md §13), and the date on every answer is how the server
+// says what its clock reads.
 // A box that cannot register leaves nothing in the way of registering once
 // its clock is right.
 func TestABoxWhoseClockIsTooFarOffIsRefusedAndTold(t *testing.T) {
@@ -97,9 +98,9 @@ func TestABoxWhoseClockIsTooFarOffIsRefusedAndTold(t *testing.T) {
 		code protocol.Code
 		says []string
 	}{
-		{-11 * time.Minute, protocol.CodePassExpired, []string{"the pass has run out; the server's clock reads", "10 minutes or more behind the server's", "11m0s behind that"}},
-		{51 * time.Minute, protocol.CodePassExpired, []string{"more than 60 minutes from now; the server's clock reads", "more than 50 minutes ahead of the server's", "51m0s ahead of that"}},
-		{61 * time.Minute, protocol.CodeBadKey, []string{"has not begun; the server's clock reads", "more than an hour ahead of the server's", "irongall init for a new box"}},
+		{-11 * time.Minute, protocol.CodePassExpired, []string{"as not valid at its clock", "11m0s behind that", "10 minutes or more behind its own"}},
+		{51 * time.Minute, protocol.CodePassExpired, []string{"as not valid at its clock", "51m0s ahead of that", "more than 50 ahead"}},
+		{61 * time.Minute, protocol.CodePrekeyTime, []string{"not valid at its clock", "1h1m0s ahead of that", "more than an hour ahead of it"}},
 	} {
 		e := newEnv(t, relaxed())
 		off, dir := c.off, t.TempDir()
@@ -173,8 +174,8 @@ func TestABoxWhoseClockGoesBackFetchesNothing(t *testing.T) {
 }
 
 // The server takes a prekey statement that ends up to an hour past the 33
-// days a client asks for, and refuses one a second longer, stating its
-// clock. And it dates every answer by that clock.
+// days a client asks for, and refuses one a second longer. And it dates every
+// answer by that clock, which is how a refusal for a time states it.
 func TestThePrekeyCeilingAndTheDateOnAnAnswer(t *testing.T) {
 	e := newEnv(t, relaxed())
 	now := e.clock.Now()
@@ -186,15 +187,12 @@ func TestThePrekeyCeilingAndTheDateOnAnAnswer(t *testing.T) {
 		{protocol.PrekeyLifetime, http.StatusCreated, ""},
 		{protocol.PrekeyLifetime + 2*time.Second, http.StatusCreated, ""},
 		{protocol.MaxPrekeyLifetime, http.StatusCreated, ""},
-		{protocol.MaxPrekeyLifetime + time.Second, http.StatusBadRequest, protocol.CodeBadKey},
+		{protocol.MaxPrekeyLifetime + time.Second, http.StatusBadRequest, protocol.CodePrekeyTime},
 	} {
 		r := e.raw()
 		r.prekey(1, now.Add(c.ends), nil)
 		rep := e.do("PUT", r.path(""), r.registration(1), r.pass(1))
 		e.want(rep, c.status, c.code)
-		if c.code != "" && !strings.Contains(string(rep.body), "the server's clock reads "+now.UTC().Format(protocol.TimeLayout)) {
-			t.Errorf("a prekey ending %v from now: the refusal does not state the server's clock: %s", c.ends, rep.body)
-		}
 		if got, want := rep.header.Get("Date"), now.UTC().Format(http.TimeFormat); got != want {
 			t.Errorf("a prekey ending %v from now: the answer is dated %q, and the server's clock reads %q", c.ends, got, want)
 		}

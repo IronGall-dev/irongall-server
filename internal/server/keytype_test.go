@@ -60,13 +60,13 @@ func TestABoxOfTheOptionalKeyType(t *testing.T) {
 	// Ed25519 box signs for this address.
 	q, ed := e.rawP256().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
 	e.want(e.do("GET", p.path("/messages"), nil, q.pass(1)), 401, protocol.CodeUnauthorized)
-	e.want(e.do("GET", p.path("/messages"), nil, e.passFor(ed.work[1], p.id.Address(), e.name())), 401, protocol.CodeUnauthorized)
+	e.want(e.do("GET", p.path("/messages"), nil, e.passFor(ed.work[1], p.id.Address(), e.name())), 401, protocol.CodeCertificateNotCurrent)
 
 	// A new certificate, by a prekey published under it: the old one's
 	// passes stop.
 	p.prekey(2, now.Add(protocol.MaxPrekeyLifetime), nil)
 	e.want(e.do("PUT", p.path("/prekey"), p.upload(2), p.pass(2)), 200, "")
-	e.want(e.do("GET", p.path("/messages"), nil, p.pass(1)), 401, protocol.CodeUnauthorized)
+	e.want(e.do("GET", p.path("/messages"), nil, p.pass(1)), 401, protocol.CodeCertificateNotCurrent)
 	e.want(e.do("GET", p.path("/messages"), nil, p.pass(2)), 200, "")
 
 	// A certificate another P-256 key signed for this address is no
@@ -155,7 +155,7 @@ func TestACertificateOnRecordThatTheIdentityDidNotSign(t *testing.T) {
 			t.Fatal(err)
 		}
 		pass := e.passFor(under, a, e.name())
-		e.want(e.do("GET", victim.path("/messages"), nil, pass), 401, protocol.CodeUnauthorized)
+		e.want(e.do("GET", victim.path("/messages"), nil, pass), 401, protocol.CodeCertificateNotCurrent)
 		// Control: the first two steps take it. It carries the certificate
 		// on record, and that certificate's working key signed it.
 		p, err := protocol.ParsePass(pass)
@@ -167,7 +167,7 @@ func TestACertificateOnRecordThatTheIdentityDidNotSign(t *testing.T) {
 		}
 		// And the box's own pass, under the certificate its identity did
 		// sign, is no longer under the one on record.
-		e.want(e.do("GET", victim.path("/messages"), nil, victim.pass(1)), 401, protocol.CodeUnauthorized)
+		e.want(e.do("GET", victim.path("/messages"), nil, victim.pass(1)), 401, protocol.CodeCertificateNotCurrent)
 	}
 }
 
@@ -203,7 +203,7 @@ func TestARememberedPassEndsWithItsCertificate(t *testing.T) {
 	e.clock.Add(4 * time.Minute)
 	e.want(e.do("GET", r.path("/messages"), nil, pass), 200, "")
 	e.clock.Add(2 * time.Minute) // the certificate has ended, and the pass has four minutes left
-	e.want(e.do("GET", r.path("/messages"), nil, pass), 401, protocol.CodeUnauthorized)
+	e.want(e.do("GET", r.path("/messages"), nil, pass), 401, protocol.CodePassExpired)
 }
 
 // passCarrying is a pass of box a that names cert as the key that signed it,
