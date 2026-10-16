@@ -254,26 +254,64 @@ func TestAFloorNoHigherIsAnsweredWithoutACheck(t *testing.T) {
 	e.want(e.do("PUT", r.path("/revocations"), higher, ""), http.StatusTooManyRequests, protocol.CodeRateLimited)
 }
 
-// The identity's acts are counted per box (Limits.IdentityActsPerDay): a
-// raise of the floor, and a renewal under a later certificate. The
-// revocation of the address is never counted, so nothing keeps an owner
-// from ending a box.
-func TestTheIdentitysActsAreCounted(t *testing.T) {
+// The identity's acts are counted per box, each kind on its own, so neither
+// holds back the other: its new certificates (Limits.CertificatesPerDay) and
+// its raises of the revocation of certificates
+// (Limits.CertificateRevocationsPerDay). A renewal while the box's current
+// certificate is revoked is not counted: it replaces what a counted raise
+// revoked. The revocation of the address is counted against no box, so
+// nothing keeps an owner from ending a box.
+func TestTheIdentitysActsAreCountedApart(t *testing.T) {
 	l := relaxed()
-	l.IdentityActsPerDay = 1
+	l.CertificatesPerDay, l.CertificateRevocationsPerDay = 1, 1
 	e := newEnv(t, l)
 	now := e.clock.Now()
 	e.clock.Add(now.Truncate(24 * time.Hour).Add(25 * time.Hour).Sub(now)) // 01:00 UTC, far from a day's end
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
-	e.want(e.do("PUT", r.path("/revocations"), r.certs(1), ""), http.StatusOK, "") // the day's one act
-	r.prekey(5, e.clock.Now().Add(protocol.PrekeyLifetime), nil)
-	e.want(e.do("PUT", r.path("/prekey"), r.upload(5), r.pass(5)), http.StatusTooManyRequests, protocol.CodeIdentityActsSpent)
-	e.want(e.do("PUT", r.path("/revocations"), r.certs(3), ""), http.StatusTooManyRequests, protocol.CodeIdentityActsSpent)
+	until := e.clock.Now().Add(protocol.PrekeyLifetime)
+	r.prekey(5, until, nil)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(5), r.pass(5)), http.StatusOK, "") // the day's one certificate
+	r.prekey(6, until, nil)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(6), r.pass(6)), http.StatusTooManyRequests, protocol.CodeCertificatesSpent)
+	e.want(e.do("PUT", r.path("/revocations"), r.certs(5), ""), http.StatusOK, "") // the day's one raise, which no certificate spent
+	e.want(e.do("PUT", r.path("/revocations"), r.certs(7), ""), http.StatusTooManyRequests, protocol.CodeCertificateRevocationsSpent)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(6), r.pass(6)), http.StatusOK, "") // replaces certificate 5, which is revoked
+	r.prekey(8, until, nil)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(8), r.pass(8)), http.StatusTooManyRequests, protocol.CodeCertificatesSpent) // 6 is not revoked
 	rev, err := protocol.SignRevocation(r.signer, r.id.Address())
 	if err != nil {
 		t.Fatal(err)
 	}
 	e.want(e.do("PUT", r.path("/revocations"), protocol.Revocations{Identity: r.id.Document(), Revocation: rev}, ""), http.StatusCreated, "")
+}
+
+// A taker who holds a box's working key can spend the box's calls with its
+// pass, and so hold back a renewal (this repo's #35). It cannot hold back the
+// identity's raise of the revocation of certificates, which carries no pass
+// and spends a count no renewal spends. Once that is taken, the taken pass is
+// refused, the box's calls come back, and the renewal that replaces the
+// revoked certificate is taken, with the identity's certificates for the day
+// spent.
+func TestATakerCannotHoldTheRemedyBack(t *testing.T) {
+	l := relaxed()
+	l.CallBurst, l.CallRefill = DefaultLimits().CallBurst, DefaultLimits().CallRefill
+	l.CertificatesPerDay, l.CertificateRevocationsPerDay = 1, 1
+	e := newEnv(t, l)
+	now := e.clock.Now()
+	e.clock.Add(now.Truncate(24 * time.Hour).Add(25 * time.Hour).Sub(now)) // 01:00 UTC, far from a day's end
+	r, other := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+	until := e.clock.Now().Add(protocol.PrekeyLifetime)
+	r.prekey(1000, until, nil)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(1000), r.pass(1000)), http.StatusOK, "") // the day's one certificate
+	taken := r.pass(1000)
+	for e.do("GET", other.path("/identity"), nil, taken).status == http.StatusOK {
+	}
+	r.prekey(2000, until, nil)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(2000), r.pass(2000)), http.StatusTooManyRequests, protocol.CodeRateLimited) // held back by the taker
+	e.want(e.do("PUT", r.path("/revocations"), r.certs(1000), ""), http.StatusOK, "")
+	e.want(e.do("GET", other.path("/identity"), nil, taken), http.StatusUnauthorized, protocol.CodeCertificateRevoked)
+	e.clock.Add(l.CallRefill)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(2000), r.pass(2000)), http.StatusOK, "")
 }
 
 // A pass that fails costs signature checks that nothing paid for, so it is

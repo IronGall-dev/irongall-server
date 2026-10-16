@@ -195,7 +195,7 @@ What changes:
 
 **Every limit, who pays for it, the order of checks and the known weaknesses → [`LIMITS.md`](LIMITS.md).** What is architecture about them:
 - **Every budget and count is per process,** in memory, because a poll can't afford a round trip: with N processes a box could spend N times each. Sharding by address at the edge (§ Extreme scale) or sticky routing would put each box's calls on one process; with neither, each process is to enforce a 1/N share (not built: one process enforces the whole of each), which keeps the bill ceiling, and rules at an edge in front can sit on top, keyed by /64 for IPv6.
-- **The per-pair cap (`-pair-cap`) and the box total are global**: they read layer 1's marks, which the stream feeds on every process, 1–2 s behind, with no extra writes; a process's own sends count at once. **Sends per sender a day, and the renewal and identity counts,** are each process's own today. Every accepted send and every renewal arrives on the stream, so each process can count across all of them: that is stage 2, not built.
+- **The per-pair cap (`-pair-cap`) and the box total are global**: they read layer 1's marks, which the stream feeds on every process, 1–2 s behind, with no extra writes; a process's own sends count at once. **Sends per sender a day, and the counts of renewals, certificates and raises of a revocation of certificates,** are each process's own today. Every accepted send and every renewal arrives on the stream, so each process can count across all of them: that is stage 2, not built.
 - **The passes remembered are per process,** so with N processes a box's new pass is checked once on each it calls.
 
 ### Background jobs

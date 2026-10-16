@@ -362,14 +362,14 @@ func TestARecordsStandingKnowsItsRevokedCertificates(t *testing.T) {
 
 // A holder of a box's working key spends the box's renewals for the day, and
 // holds nothing by it: a renewal under a later certificate is the identity's
-// act, counted apart (Limits.IdentityActsPerDay), so the owner's remedy renews
+// act, counted apart (Limits.CertificatesPerDay), so the owner's remedy renews
 // and revokes the taken certificate the same day. From then on this server
 // takes nothing more under that certificate.
 func TestTheRemedyRenewsWhenATakerSpentTheDaysRenewals(t *testing.T) {
 	ctx := context.Background()
 	l := relaxed()
 	l.RenewalsPerDay = DefaultLimits().RenewalsPerDay
-	l.IdentityActsPerDay = DefaultLimits().IdentityActsPerDay
+	l.CertificatesPerDay = DefaultLimits().CertificatesPerDay
 	e := newEnv(t, l)
 	now := e.clock.Now()
 	e.clock.Add(now.Truncate(24 * time.Hour).Add(25 * time.Hour).Sub(now)) // 01:00 UTC, far from a day's end

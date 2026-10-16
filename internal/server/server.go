@@ -76,8 +76,9 @@ type Server struct {
 	receives *buckets // per box: new messages it takes
 	drained  *buckets // per box: its first fetches of held messages
 	sends    daily    // per sender
-	renewals daily    // per box
-	acts     daily    // per box: what only its identity can do
+	renewals daily    // per box: renewals under its current certificate
+	certs    daily    // per box: renewals under a later certificate, which only its identity can make
+	raises   daily    // per box: raises of its revocation of certificates, which only its identity can make
 	// inFlight counts the sends let past the pair and box caps and not yet
 	// stored, by the recipient's first byte (reserveCaps).
 	inFlight [256]inFlight
@@ -577,8 +578,8 @@ func rateLimited(wait time.Duration, detail string) *problem {
 }
 
 // spent is a 429 of code, with how long to wait in Retry-After: a limit a
-// client meets otherwise than calls beyond one (a day's sends, renewals or
-// identity acts; a paced drain).
+// client meets otherwise than calls beyond one (a day's sends, renewals,
+// certificates or raises of a revocation of certificates; a paced drain).
 func spent(code protocol.Code, wait time.Duration, format string, values ...value) *problem {
 	p := fail(code, "wait for Retry-After, then retry", format, values...)
 	p.retryAfter = wait

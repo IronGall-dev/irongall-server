@@ -905,7 +905,7 @@ func TestRenewalLimits(t *testing.T) {
 	// its renewals is its identity's act, counted under that limit: a
 	// renewal under the current certificate counts under the other
 	// (TestTheRemedyRenewsWhenATakerSpentTheDaysRenewals).
-	l.RenewalsPerDay, l.IdentityActsPerDay, l.RetiredKept = 3, 3, 2
+	l.RenewalsPerDay, l.CertificatesPerDay, l.RetiredKept = 3, 3, 2
 	e := newEnv(t, l)
 	ctx := context.Background()
 	now := e.clock.Now()
@@ -921,7 +921,7 @@ func TestRenewalLimits(t *testing.T) {
 	}
 	_, err := b.Rekey(ctx, "")
 	var ae *client.APIError
-	if !errors.As(err, &ae) || ae.Problem.Code != protocol.CodeIdentityActsSpent || ae.RetryAfter != 23*time.Hour {
+	if !errors.As(err, &ae) || ae.Problem.Code != protocol.CodeCertificatesSpent || ae.RetryAfter != 23*time.Hour {
 		t.Fatalf("a fourth renewal in a day: %v", err)
 	}
 	cur, _ := e.store.Box(ctx, b.Address())

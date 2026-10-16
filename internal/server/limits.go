@@ -28,15 +28,16 @@ type Limits struct {
 	MissesPerMinute      int // per IP: reads of the boxes table that find no box, and checks that fail (decided: 10 for now)
 
 	// Budgets: a burst at once and one more each refill (LIMITS.md).
-	ReceiveBurst       int           // per box: new messages it takes, from all senders together (decided: 50, on); an account lifts it
-	ReceiveRefill      time.Duration // (decided: 6 s, ten a minute)
-	DrainBurst         int           // per box: its first fetches of held messages, spent only by its own calls (decided: 50, on); an account lifts it
-	DrainRefill        time.Duration // (decided: 6 s, ten a minute)
-	CallBurst          int           // per box: its calls with its pass that no other budget counts [tunable]; an account lifts it
-	CallRefill         time.Duration // [tunable]
-	PublicBurst        int           // per IP: calls with no pass [tunable]
-	PublicRefill       time.Duration // [tunable]
-	IdentityActsPerDay int           // per box, per UTC day: renewals under a later certificate and raises of the floor (decided: 10, as renewals)
+	ReceiveBurst                 int           // per box: new messages it takes, from all senders together (decided: 50, on); an account lifts it
+	ReceiveRefill                time.Duration // (decided: 6 s, ten a minute)
+	DrainBurst                   int           // per box: its first fetches of held messages, spent only by its own calls (decided: 50, on); an account lifts it
+	DrainRefill                  time.Duration // (decided: 6 s, ten a minute)
+	CallBurst                    int           // per box: its calls with its pass that no other budget counts [tunable]; an account lifts it
+	CallRefill                   time.Duration // [tunable]
+	PublicBurst                  int           // per IP: calls with no pass [tunable]
+	PublicRefill                 time.Duration // [tunable]
+	CertificatesPerDay           int           // per box, per UTC day: renewals under a later certificate, but for one that replaces a revoked certificate (decided: 10, as renewals)
+	CertificateRevocationsPerDay int           // per box, per UTC day: raises of its revocation of certificates (decided 2026-10-16 to be counted apart; 10, as the count it was split from) [tunable]
 
 	// ACLEntries is the most entries a box's ACL holds, its two lists
 	// together [tunable]: a box's record, with its ACL, is held in the box
@@ -56,29 +57,30 @@ type Limits struct {
 // tunables that have one. Tunables with no proposed value are off.
 func DefaultLimits() Limits {
 	return Limits{
-		MaxSize:              64 << 10,
-		PairCap:              10,
-		BoxCap:               1000,
-		SendsPerDay:          20,
-		PollBurst:            10,
-		PollRefill:           50 * time.Second,
-		PollAfter:            60,
-		RenewalsPerDay:       10,
-		RetiredKept:          10,
-		RegistrationsPerHour: 10,
-		MissesPerMinute:      10,
-		ReceiveBurst:         50,
-		ReceiveRefill:        6 * time.Second,
-		DrainBurst:           50,
-		DrainRefill:          6 * time.Second,
-		CallBurst:            50,
-		CallRefill:           6 * time.Second,
-		PublicBurst:          10,
-		PublicRefill:         50 * time.Second,
-		IdentityActsPerDay:   10,
-		ACLEntries:           500,
-		BodyTimeout:          20 * time.Second,
-		BodyMinRate:          500,
+		MaxSize:                      64 << 10,
+		PairCap:                      10,
+		BoxCap:                       1000,
+		SendsPerDay:                  20,
+		PollBurst:                    10,
+		PollRefill:                   50 * time.Second,
+		PollAfter:                    60,
+		RenewalsPerDay:               10,
+		RetiredKept:                  10,
+		RegistrationsPerHour:         10,
+		MissesPerMinute:              10,
+		ReceiveBurst:                 50,
+		ReceiveRefill:                6 * time.Second,
+		DrainBurst:                   50,
+		DrainRefill:                  6 * time.Second,
+		CallBurst:                    50,
+		CallRefill:                   6 * time.Second,
+		PublicBurst:                  10,
+		PublicRefill:                 50 * time.Second,
+		CertificatesPerDay:           10,
+		CertificateRevocationsPerDay: 10,
+		ACLEntries:                   500,
+		BodyTimeout:                  20 * time.Second,
+		BodyMinRate:                  500,
 	}
 }
 

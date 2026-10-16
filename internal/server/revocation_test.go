@@ -151,7 +151,7 @@ func TestRevocation(t *testing.T) {
 	// Nothing brings it back: not a registration, not a new prekey, and a
 	// second revocation changes nothing. Whatever is sent for a revoked box
 	// is answered from its record, with no check: nothing could change it.
-	if _, err := a.Rekey(ctx, protocol.Classic); client.Code(err) != protocol.CodeRevoked {
+	if _, err := a.Rekey(ctx, protocol.Classic); !errors.As(err, &gone) || !gone.Own {
 		t.Fatalf("a revoked box's renewal: %v", err)
 	}
 	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
@@ -167,7 +167,8 @@ func TestAClosedBoxIsRevoked(t *testing.T) {
 	e.want(e.do("DELETE", "/v1/"+a.Address().String(), nil, e.pass(a)), 204, "")
 	e.want(e.do("GET", revocationPath(a.Address()), nil, ""), 404, protocol.CodeNotRevoked)
 	e.want(e.do("PUT", revocationPath(a.Address()), record(t, a), ""), 201, "")
-	if _, err := a.Rekey(ctx, protocol.Classic); client.Code(err) != protocol.CodeRevoked {
+	var gone *client.RevokedError
+	if _, err := a.Rekey(ctx, protocol.Classic); !errors.As(err, &gone) || !gone.Own {
 		t.Fatalf("a prekey for a box closed and then revoked: %v", err)
 	}
 	e.want(e.do("GET", revocationPath(a.Address()), nil, ""), 200, "")

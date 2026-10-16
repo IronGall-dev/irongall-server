@@ -266,11 +266,19 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	// A renewal under the box's current certificate counts against the
 	// box's renewals; one under a later certificate is its identity's act,
 	// counted apart, so whoever holds the current working key and spends the
-	// day's renewals does not hold back the identity's.
+	// day's renewals does not hold back the identity's. One while the box's
+	// current certificate is revoked is not counted: it replaces what the
+	// identity revoked, each raise of which is counted (revoke), as Let's
+	// Encrypt exempts a renewal that names the certificate it replaces.
 	now := s.now()
 	count, limit, code, what := &s.renewals, s.limits.RenewalsPerDay, protocol.CodeRenewalsSpent, "this box has renewed its prekey %d times today"
 	if cert.Serial() > b.CertSerial {
-		count, limit, code, what = &s.acts, s.limits.IdentityActsPerDay, protocol.CodeIdentityActsSpent, "this box's identity has certified %d new working keys or revoked certificates today"
+		count, limit, code, what = &s.certs, s.limits.CertificatesPerDay, protocol.CodeCertificatesSpent, "this box's identity has certified %d new working keys today"
+		if replaces, err := b.listed(b.CertSerial); err != nil {
+			return err
+		} else if replaces {
+			limit = 0 // never limits, and nothing is taken to give back
+		}
 	}
 	if ok, wait := count.take(h, now, limit); !ok {
 		return spent(code, wait, what, limitValue(limit))
@@ -355,9 +363,10 @@ const (
 // through a lower serial than the one held is refused, and the same one again
 // changes nothing. From then on no pass and no prekey statement under a
 // revoked certificate is taken, and nobody is told to encrypt to a prekey
-// under one. A raise of it is the identity's act, counted per box with a
-// renewal under a later certificate (Limits.IdentityActsPerDay); the
-// revocation of the address is never counted.
+// under one. A raise of it is the identity's act, counted per box on its own
+// (Limits.CertificateRevocationsPerDay), so no renewal holds it back; the
+// renewal that replaces the certificate it revokes is then not counted
+// (prekey). The revocation of the address is counted against no box.
 //
 // A body may carry both. What could change nothing is answered from the
 // record before any signature is checked: anything for a box already
@@ -459,14 +468,14 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 		b.State, b.Revocation = Revoked, req.Revocation
 		status = http.StatusCreated
 	} else if raised {
-		if ok, wait := s.acts.take(h, now, s.limits.IdentityActsPerDay); !ok {
-			return spent(protocol.CodeIdentityActsSpent, wait, "this box's identity has certified %d new working keys or revoked certificates today", limitValue(s.limits.IdentityActsPerDay))
+		if ok, wait := s.raises.take(h, now, s.limits.CertificateRevocationsPerDay); !ok {
+			return spent(protocol.CodeCertificateRevocationsSpent, wait, "this box's identity has raised its revocation of certificates %d times today", limitValue(s.limits.CertificateRevocationsPerDay))
 		}
 	}
 	if raised || req.Revocation != nil {
 		if err := s.store.UpdateBox(r.Context(), b); err != nil {
 			if raised && req.Revocation == nil {
-				s.acts.give(h, now, s.limits.IdentityActsPerDay)
+				s.raises.give(h, now, s.limits.CertificateRevocationsPerDay)
 			}
 			if errors.Is(err, ErrStale) {
 				return fail(protocol.CodeBoxChanged, "retry", "the box changed during the request")
