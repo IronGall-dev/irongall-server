@@ -257,7 +257,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
   sent/                      mail the server took, <addr>.<msg_id>.json: the line its recipient delivers plus one member, "receipt", the server's answer.
                              Plaintext, like inbox/, and like it never pruned by a client
   aliases                    the box's own names for peers, "<name> <address>" lines: never sent anywhere, and a name is never moved, only removed
-  lock/                      one consumer per box: a directory, with the Go client's flocked lock/pid inside
+  lock/                      the box's lock, held by each command that writes the box: a directory, with the Go client's flocked lock/pid inside
   etag                       the poll ETag (the Go client)
   revoked.sig                this box's own revocation, once it has met one that verifies: the box is finished
   revoked-certs.json         this box's own revocation of its certificates, once it has published one: the record that carries it, one line of JSON
