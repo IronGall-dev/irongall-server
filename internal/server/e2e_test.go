@@ -128,7 +128,7 @@ func send(t *testing.T, from, to *client.Box, body string) *protocol.Receipt {
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	return r
+	return &r.Receipt
 }
 
 func receive(t *testing.T, b *client.Box) *client.Result {
