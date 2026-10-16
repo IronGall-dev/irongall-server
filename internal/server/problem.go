@@ -98,11 +98,11 @@ func fail(code protocol.Code, hint, format string, values ...value) *problem {
 }
 
 // failErr is a refusal whose detail is err's words: one of the protocol's
-// own errors, whose words are fixed. An unknown member it names is a value,
-// and set as one.
+// own errors, whose words are fixed. A member it names, unknown or holding a
+// value its call does not take, is a value, and set as one.
 func failErr(code protocol.Code, hint string, err error) *problem {
 	p := &problem{code: code, hint: hint, detail: err.Error()}
-	if name := protocol.UnknownMember(err); name != "" {
+	if name := protocol.Member(err); name != "" {
 		p.values = append(p.values, memberValue(name))
 	}
 	return p

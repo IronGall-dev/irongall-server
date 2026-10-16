@@ -76,10 +76,18 @@ func TestRevocation(t *testing.T) {
 		"a name twice":                              {bytes.Replace(recJSON, []byte(`{`), []byte(`{"revocation":"eA==",`), 1), protocol.CodeBadRequest},
 		"a second value after it":                   {append(append([]byte{}, recJSON...), "{}"...), protocol.CodeBadRequest},
 		"base64 with its unused bits set":           {unusedBitsSet(t, recJSON), protocol.CodeBadEncoding},
+		"a record of another type":                  {bytes.Replace(recJSON, []byte(`"type":"revocation_record"`), []byte(`"type":"revocation"`), 1), protocol.CodeBadRequest},
 	} {
 		if r := e.do("PUT", path, bad.body, ""); r.status != 400 || r.code() != bad.code {
 			t.Errorf("%s: %d %s, want 400 %s: %s", name, r.status, r.code(), bad.code, r.body)
 		}
+	}
+	// A record of another type is refused by name, as a member the body does
+	// not have is.
+	other := e.do("PUT", path, bytes.Replace(recJSON, []byte(`"type":"revocation_record"`), []byte(`"type":""`), 1), "")
+	var p protocol.Problem
+	if err := json.Unmarshal(other.body, &p); err != nil || other.status != 400 || p.Code != protocol.CodeBadRequest || p.Member != "type" {
+		t.Errorf("a record whose type is empty: %d %s", other.status, other.body)
 	}
 	// A pass does not revoke, nor does it help: the signature is the authority.
 	e.want(e.do("PUT", path, protocol.Revocations{Identity: docA, Revocation: sign(a, a.Address(), protocol.RevokeNamespace(a.Address()))}, passA), 400, protocol.CodeBadRevocation)
@@ -119,8 +127,8 @@ func TestRevocation(t *testing.T) {
 		t.Fatalf("what the server shows for a revoked box does not verify: %v", err)
 	}
 	var members map[string]json.RawMessage
-	if err := json.Unmarshal(shown.body, &members); err != nil || len(members) != 2 {
-		t.Errorf("the record served has %d members, want identity and revocation: %s", len(members), shown.body)
+	if err := json.Unmarshal(shown.body, &members); err != nil || len(members) != 3 || !bytes.HasPrefix(shown.body, []byte(`{"type":"revocation_record",`)) {
+		t.Errorf("the record served has %d members, want its type first, then identity and revocation: %s", len(members), shown.body)
 	}
 
 	// The clients meet it and check it for themselves.

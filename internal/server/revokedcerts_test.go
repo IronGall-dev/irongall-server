@@ -116,8 +116,8 @@ func TestRevokedCertificates(t *testing.T) {
 		t.Fatalf("what the server shows for a box with its certificates revoked does not verify: %+v, %v", l, err)
 	}
 	var members map[string]json.RawMessage
-	if err := json.Unmarshal(shown.body, &members); err != nil || len(members) != 3 || members["revocation"] != nil {
-		t.Errorf("the record served has %d members, want identity, the statement and its signature: %s", len(members), shown.body)
+	if err := json.Unmarshal(shown.body, &members); err != nil || len(members) != 4 || members["revocation"] != nil || string(members["type"]) != `"revocation_record"` || !bytes.HasPrefix(shown.body, []byte(`{"type":"revocation_record",`)) {
+		t.Errorf("the record served has %d members, want its type first, then identity, the statement and its signature: %s", len(members), shown.body)
 	}
 	e.want(e.do("GET", r.path("/identity"), nil, ""), 200, "")
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 200, "")
@@ -192,8 +192,8 @@ func TestRevokedCertificates(t *testing.T) {
 	shown = e.do("GET", other.path("/revocations"), nil, "")
 	e.want(shown, 200, "")
 	members = nil
-	if err := json.Unmarshal(shown.body, &members); err != nil || len(members) != 4 {
-		t.Errorf("the record served for a revoked box that had its certificates revoked has %d members, want 4: %s", len(members), shown.body)
+	if err := json.Unmarshal(shown.body, &members); err != nil || len(members) != 5 || string(members["type"]) != `"revocation_record"` {
+		t.Errorf("the record served for a revoked box that had its certificates revoked has %d members, want its type and 4: %s", len(members), shown.body)
 	}
 	e.want(e.do("GET", other.path("/identity"), nil, ""), 410, protocol.CodeRevoked)
 	e.want(e.do("PUT", other.path("/revocations"), other.certs(2), ""), 410, protocol.CodeRevoked)

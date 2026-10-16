@@ -181,7 +181,7 @@ printf 'waiting in the box that is revoked\n' | gocli "$V2" send "$V1L" > /dev/n
 out=$(recipe "$V1" "ig_revoke ${V1A:0:63}" 2>&1); [ $? -ne 0 ] && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V1A/identity")" = 200 ] \
   && ok "the recipe does not revoke without the address in full, and nothing is published" || bad "revoke with a short address: $out"
 out=$(recipe "$V1" "ig_revoke $V1A" 2>&1) && [ "$out" = "$(revoked_line $V1A)" ] && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V1A/identity")" = 410 ] \
-  && curl -sf "$IG_BASE/v1/$V1A/revocations" | jq -e 'keys == ["identity","revocation"]' > /dev/null \
+  && curl -sf "$IG_BASE/v1/$V1A/revocations" | jq -e 'keys == ["identity","revocation","type"] and .type == "revocation_record"' > /dev/null \
   && ok "the recipe revokes its box: 410 from then on, and the server shows the record to anyone" || bad "recipe revoke: $out"
 out=$(gocli "$V2" recv 2>&1); [ $? -eq 0 ] && grep -q '"code":"revoked"' <<< "$out" && ! grep -q '"body"' <<< "$out" && [ -s "$V2/peers/$V1A/revoke.sig" ] \
   && ok "the Go client refuses mail from the box the recipe revoked, and keeps the revocation it checked" || bad "Go recv from a revoked box: $out"
@@ -199,7 +199,7 @@ out=$(recipe "$V4" "ig_recv" 2>&1); [ $? -eq 0 ] && grep -q '"code":"revoked"' <
   && ok "the recipe refuses mail from the box the Go client revoked, and keeps the revocation it checked" || bad "recipe recv from a revoked box: $out"
 out=$(recipe "$V4" "ig_send $V3L '$work/body7'" 2>&1); [ $? -ne 0 ] && grep -q "REVOKED" <<< "$out" && ok "the recipe sends nothing to it: REVOKED" || bad "recipe send to a revoked box: $out"
 # A record made in advance revokes with no box and no key, by either client or by curl; what is not one is refused.
-gocli "$V5" revocation make "$work/v5.json" > /dev/null 2>&1 && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V5A/identity")" = 200 ] && ok "a record is made, and nothing is published" || bad "Go revocation"
+gocli "$V5" revocation make > "$work/v5.json" 2> /dev/null && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$V5A/identity")" = 200 ] && ok "a record is made, and nothing is published" || bad "Go revocation"
 jq -c --arg s "$(printf 'revoke it' | base64)" '.revocation = $s' "$work/v5.json" > "$work/v5-junk.json"
 [ "$(curl -s -X PUT -H 'Content-Type: application/json' --data-binary "@$work/v5-junk.json" "$IG_BASE/v1/$V5A/revocations" | jq -r .code)" = bad_revocation ] \
   && [ "$(curl -s -X PUT -H 'Content-Type: application/json' --data-binary "@$work/v5.json" "$IG_BASE/v1/$V4A/revocations" | jq -r .code)" = identity_mismatch ] \
@@ -217,7 +217,7 @@ put(){ curl -s -o "$work/put.json" -w '%{http_code}' -X PUT -H 'Content-Type: ap
 printf 'under the first certificate\n' > "$work/body8"
 gocli "$W1" send "$W2L" < "$work/body8" > /dev/null 2> "$work/err" && gocli "$W1" send "$W3L" < "$work/body8" > /dev/null 2>> "$work/err" && recipe "$W2" "ig_send $W3L '$work/body8'" 2>> "$work/err" || bad "revoked certificates: the first sends: $(cat "$work/err")"
 # The Go client renews and revokes every certificate before its new one. Each client is shown the revocation, checks it, and refuses what the old one signed.
-out=$(gocli "$W1" cert revoke-earlier 2>&1) && curl -sf "$IG_BASE/v1/$W1A/revocations" | jq -e 'keys == ["identity","revoked_certificates","revoked_certificates_signature"]' > /dev/null \
+out=$(gocli "$W1" cert revoke-earlier 2>&1) && curl -sf "$IG_BASE/v1/$W1A/revocations" | jq -e 'keys == ["identity","revoked_certificates","revoked_certificates_signature","type"]' > /dev/null \
   && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$W1A/identity")" = 200 ] \
   && ok "the Go client renews and revokes its earlier certificates: the server shows the revocation to anyone, and the address goes on" || bad "cert revoke-earlier: $out"
 printf 'under the second certificate\n' > "$work/body8b"
@@ -276,7 +276,7 @@ out=$(gocli "$X1" revocation publish "$X1A" 2>&1) && [ "$out" = "$(revoked_line 
   && cmp -s <(curl -s "$REV/v1/$X1A/revocations" | jq -S .) <(curl -s "$IG_BASE/v1/$X1A/revocations" | jq -S .) \
   && ok "each client publishes its revocation at this server and at the revocation server, which then serve the same record" || bad "revoke at both: $out / ${out2:-}"
 # A revocation this server was never told of: the record goes to the revocation server alone, and this server goes on serving the box.
-gocli "$X3" revocation make "$work/x3.json" > /dev/null 2>&1 && [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/json' --data-binary "@$work/x3.json" "$REV/v1/$X3A/revocations")" = 201 ] \
+gocli "$X3" revocation make > "$work/x3.json" 2> /dev/null && [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/json' --data-binary "@$work/x3.json" "$REV/v1/$X3A/revocations")" = 201 ] \
   && [ "$(at "$IG_BASE" "$X3A")" = 404 ] && [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$X3A/identity")" = 200 ] || bad "a revocation at the revocation server alone"
 printf 'to an address its owner ended\n' > "$work/body9"
 gocli "$X5" send "$X3L" < "$work/body9" > /dev/null 2> "$work/err" && ok "the control: a box that asks this server alone posts to the revoked address, and this server takes it" || bad "the control: $(cat "$work/err")"
@@ -284,7 +284,7 @@ out=$(gocli "$X6" send "$X3L" < "$work/body9" 2>&1); [ $? -ne 0 ] && grep -q "RE
   && out=$(recipe "$X4" "ig_send $X3L '$work/body9'" 2>&1); [ $? -ne 0 ] && grep -q "REVOKED: $X3A is revoked" <<< "$out" && [ -s "$X4/peers/$X3A/revoke.sig" ] \
   && ok "a revocation this server never held is shown to each client by the revocation server: it is checked and kept, and nothing is posted" || bad "a hidden revocation: $out"
 # The revocation of certificates goes to both, and a box that never met its owner is shown it by either.
-out=$(gocli "$X6" cert revoke-earlier 2>&1) && [ "$(curl -s "$REV/v1/$X6A/revocations" | jq -r 'keys | join(",")')" = "identity,revoked_certificates,revoked_certificates_signature" ] \
+out=$(gocli "$X6" cert revoke-earlier 2>&1) && [ "$(curl -s "$REV/v1/$X6A/revocations" | jq -r 'keys | join(",")')" = "identity,revoked_certificates,revoked_certificates_signature,type" ] \
   && cmp -s <(curl -s "$REV/v1/$X6A/revocations" | jq -r .revoked_certificates) <(curl -s "$IG_BASE/v1/$X6A/revocations" | jq -r .revoked_certificates) \
   && ok "cert revoke-earlier publishes the revocation of certificates at both servers" || bad "a revocation of certificates at both: $out"
 # The revocation server gone: mail goes, the owner is told, and a revocation is at this server and reported as not everywhere.
