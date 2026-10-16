@@ -152,7 +152,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 
 	// 7. The box takes new mail on this prekey, and from this sender.
 	if rcpt.Prekey.Expired(now) {
-		return fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall rekey); retry later", "this box's prekey has expired")
+		return fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall prekey renew); retry later", "this box's prekey has expired")
 	}
 	// A prekey under a certificate the box's identity has revoked is one
 	// nobody may encrypt to. The cure is an expired prekey's: the owner
@@ -160,7 +160,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	if listed, err := rcpt.listed(rcpt.CertSerial); err != nil {
 		return err
 	} else if listed {
-		return fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall rekey); retry later", "this box's prekey is signed under a certificate its identity revoked")
+		return fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall prekey renew); retry later", "this box's prekey is signed under a certificate its identity revoked")
 	}
 	// A box takes mail from a sender whose identity its client can verify:
 	// one on an Ed25519 key always, and otherwise what it declared with its
@@ -214,7 +214,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	if rlim.ReceiveBurst > 0 {
 		recv, ok, wait := s.receives.reserve(ctx, to.String(), s.now)
 		if !ok {
-			p := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail a minute: post it again after Retry-After (irongall flush does, unchanged)", "the box has taken as much new mail as it takes for now; retry in %ds", retrySeconds(wait))
+			p := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail a minute: post it again after Retry-After (irongall outbox flush does, unchanged)", "the box has taken as much new mail as it takes for now; retry in %ds", retrySeconds(wait))
 			p.retryAfter = wait
 			return p
 		}

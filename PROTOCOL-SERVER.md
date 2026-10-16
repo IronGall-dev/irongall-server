@@ -114,7 +114,7 @@
 
 ## §6.5. Accounts
 
-- **`DELETE /v1/<A>/account`** (with the pass) → `204`, in an account or not. `irongall adopt --leave`. An account drops a box the same way from its side (the operator's `irongalld account drop`, until accounts have users).
+- **`DELETE /v1/<A>/account`** (with the pass) → `204`, in an account or not. `irongall account leave`. An account drops a box the same way from its side (the operator's `irongalld account drop`, until accounts have users).
 - **The adopt key** is computed, never stored: `K = "iga1_" + base64url(kid ‖ id ‖ n ‖ account ‖ mac)`, no padding, with `id` 16 random bytes, `n` the account id's length (a u8) and `mac = HMAC-SHA-256(K_kid, "irongall-adopt-v1" ‖ kid ‖ id ‖ n ‖ account)`. The account's table holds only the key's uses left and its expiry. A key that is not ours, spent, expired or deleted (revoked) is `403 adopt_key_refused`.
 - **What an account changes:** an unmetered account's boxes (the echo account) have no daily send limit and the largest cap (`-account-max-size`), and are never charged. Until credit is built, a metered account's boxes have the free limits. Over the sender's own cap, a send is refused before its body is read.
 

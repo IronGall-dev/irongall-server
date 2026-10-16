@@ -26,7 +26,7 @@ func (s *Server) aclBodyLimit() int64 {
 }
 
 // hintACL names what writes an ACL: the client does, from its own lists.
-const hintACL = "irongall allow and irongall block write this box's ACL from its own lists"
+const hintACL = "irongall peer allow and irongall peer block write this box's ACL from its own lists"
 
 // putACL is PUT /v1/<address>/acl (with the pass): the box's sender ACL,
 // replaced whole by one of a higher version (PROTOCOL.md §6.2). Then the

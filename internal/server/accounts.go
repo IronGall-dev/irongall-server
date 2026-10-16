@@ -73,7 +73,7 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
 		case errors.Is(err, ErrKeyRefused):
 			return keyRefused()
 		case errors.Is(err, ErrStale):
-			return fail(protocol.CodeConflict, "retry: irongall adopt", "the box changed during the request")
+			return fail(protocol.CodeConflict, "retry: irongall account adopt", "the box changed during the request")
 		case err != nil:
 			return err
 		}
@@ -103,7 +103,7 @@ func (s *Server) leave(w http.ResponseWriter, r *http.Request) error {
 	if b.Account != "" {
 		switch err := s.store.Leave(r.Context(), b); {
 		case errors.Is(err, ErrStale):
-			return fail(protocol.CodeConflict, "retry: irongall adopt --leave", "the box changed during the request")
+			return fail(protocol.CodeConflict, "retry: irongall account leave", "the box changed during the request")
 		case err != nil:
 			return err
 		}

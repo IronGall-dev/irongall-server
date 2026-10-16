@@ -102,7 +102,7 @@ func unauthorized(hint, format string, args ...any) *problem {
 // that certificate is not taken, and the box has no other until it publishes
 // a prekey under a new one, which needs no pass under the old.
 func listedCertificate() *problem {
-	return unauthorized("publish a new prekey, which comes with a new certificate: irongall rekey", "the box's current certificate is one its identity revoked")
+	return unauthorized("publish a new prekey, which comes with a new certificate: irongall prekey renew", "the box's current certificate is one its identity revoked")
 }
 
 // The hints of a 401: what a client does about it.
@@ -187,11 +187,11 @@ func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert
 	under, err := p.VerifyUnder(cert, name, now)
 	switch {
 	case errors.Is(err, protocol.ErrCertificate):
-		return unauthorized("sign the pass with the working key of the box's newest prekey; if that key is lost, irongall rekey", "the pass is not under the box's current certificate")
+		return unauthorized("sign the pass with the working key of the box's newest prekey; if that key is lost, irongall prekey renew", "the pass is not under the box's current certificate")
 	case errors.Is(err, protocol.ErrCertificateNotBegun):
-		return unauthorized("a certificate starts an hour before it is made: check this machine's clock, then irongall rekey", "the certificate the pass is signed under has not begun; %s", s.clock())
+		return unauthorized("a certificate starts an hour before it is made: check this machine's clock, then irongall prekey renew", "the certificate the pass is signed under has not begun; %s", s.clock())
 	case errors.Is(err, protocol.ErrCertificateTime):
-		return unauthorized("publish a new prekey, which comes with a new certificate: irongall rekey", "the certificate the pass is signed under has ended; %s", s.clock())
+		return unauthorized("publish a new prekey, which comes with a new certificate: irongall prekey renew", "the certificate the pass is signed under has ended; %s", s.clock())
 	case err != nil:
 		return unauthorized(hintNewPass, "the pass is not this box's for this server")
 	}
@@ -205,7 +205,7 @@ func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert
 		if s.log != nil {
 			s.log.Printf("box %s: the certificate on record does not verify against the identity on record: %v", redact("/"+a.String()), err)
 		}
-		return unauthorized("publish a new prekey, which comes with a new certificate: irongall rekey", "the box's certificate on record does not verify against its identity")
+		return unauthorized("publish a new prekey, which comes with a new certificate: irongall prekey renew", "the box's certificate on record does not verify against its identity")
 	}
 	// A pass is never good for longer than the certificate it is under.
 	until := p.NotAfter

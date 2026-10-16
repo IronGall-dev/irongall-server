@@ -119,9 +119,9 @@ func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol
 	case cur.State == Revoked:
 		return revoked()
 	case cur.State == Closed:
-		return fail(protocol.CodeConflict, "closed: reopen it with a new prekey, irongall rekey", "this box is closed")
+		return fail(protocol.CodeConflict, "closed: reopen it with a new prekey, irongall prekey renew", "this box is closed")
 	case !bytes.Equal(cur.Identity, req.Identity) || !bytes.Equal(cur.Statement, req.Prekey) || !bytes.Equal(cur.Signature, req.PrekeySignature):
-		return fail(protocol.CodeConflict, "registered: to replace its prekey, irongall rekey", "this address is registered with another prekey")
+		return fail(protocol.CodeConflict, "registered: to replace its prekey, irongall prekey renew", "this address is registered with another prekey")
 	}
 	if err := s.checkPassBounded(r, cur.Addr, string(id.PublicKey().Marshal()), cur.Cert); err != nil {
 		return err
@@ -141,19 +141,19 @@ func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol
 // one of these is nearly always the caller's clock, and a new statement
 // signed by the same clock would be refused the same way.
 func (s *Server) checkPrekey(id *protocol.Identity, statement, sig []byte) (*protocol.Prekey, *protocol.Certificate, error) {
-	const ahead = "this machine's clock reads more than an hour ahead of the server's: check it, then irongall init for a new box, irongall rekey for one in use"
+	const ahead = "this machine's clock reads more than an hour ahead of the server's: check it, then irongall init for a new box, irongall prekey renew for one in use"
 	p, cert, err := protocol.VerifyPrekey(id, statement, sig, s.now())
 	switch {
 	case errors.Is(err, protocol.ErrCertificateNotBegun):
 		return nil, nil, fail(protocol.CodeBadKey, "a certificate starts an hour before it is made, so "+ahead, "%v; %s", err, s.clock())
 	case errors.Is(err, protocol.ErrCertificateTime):
-		return nil, nil, fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "%v; %s", err, s.clock())
+		return nil, nil, fail(protocol.CodeBadKey, "sign a new prekey statement: irongall prekey renew", "%v; %s", err, s.clock())
 	case err != nil:
-		return nil, nil, fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "%v", err)
+		return nil, nil, fail(protocol.CodeBadKey, "sign a new prekey statement: irongall prekey renew", "%v", err)
 	}
 	if err := p.CheckLifetime(s.now()); err != nil {
 		if p.Expired(s.now()) {
-			return nil, nil, fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "%v; %s", err, s.clock())
+			return nil, nil, fail(protocol.CodeBadKey, "sign a new prekey statement: irongall prekey renew", "%v; %s", err, s.clock())
 		}
 		return nil, nil, fail(protocol.CodeBadKey, "a client signs a prekey for 33 days, so "+ahead, "%v; %s", err, s.clock())
 	}
@@ -201,7 +201,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	key := string(id.PublicKey().Marshal())
-	refusedRevoked := fail(protocol.CodeBadKey, "certify a new working key at a higher serial: irongall rekey", "the statement is signed under a certificate this box's identity revoked")
+	refusedRevoked := fail(protocol.CodeBadKey, "certify a new working key at a higher serial: irongall prekey renew", "the statement is signed under a certificate this box's identity revoked")
 	// An identical retry: it was verified when it was stored, so only its
 	// pass is checked, and nothing changes. A certificate the identity has
 	// revoked signs nothing this server takes, the box's current statement
@@ -231,7 +231,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 		if err := s.failed(r); err != nil {
 			return err
 		}
-		return fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "%v", err)
+		return fail(protocol.CodeBadKey, "sign a new prekey statement: irongall prekey renew", "%v", err)
 	}
 	if listed, err := b.listed(o.CertSerial); err != nil {
 		return err
@@ -239,10 +239,10 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 		return refusedRevoked
 	}
 	if o.CertSerial < b.CertSerial || (o.CertSerial == b.CertSerial && o.Cert != b.Cert) {
-		return fail(protocol.CodeBadKey, "certify a new working key at a higher serial: irongall rekey", "the certificate's serial must be above %d, or the certificate be the box's current one", b.CertSerial)
+		return fail(protocol.CodeBadKey, "certify a new working key at a higher serial: irongall prekey renew", "the certificate's serial must be above %d, or the certificate be the box's current one", b.CertSerial)
 	}
 	if o.CertSerial == b.CertSerial && o.Serial <= b.Prekey.Serial {
-		return fail(protocol.CodeConflict, "a newer prekey is already published: irongall rekey takes the next serial", "under the box's current certificate the serial must be above %d", b.Prekey.Serial)
+		return fail(protocol.CodeConflict, "a newer prekey is already published: irongall prekey renew takes the next serial", "under the box's current certificate the serial must be above %d", b.Prekey.Serial)
 	}
 	m, err := s.miss(r)
 	if err != nil {
@@ -250,7 +250,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	}
 	p, cert, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
 	if err == nil && (cert.Serial() != o.CertSerial || certHash(cert) != o.Cert || p.Serial != o.Serial) {
-		err = fail(protocol.CodeBadKey, "sign a new prekey statement: irongall rekey", "the statement does not read the same verified as unverified")
+		err = fail(protocol.CodeBadKey, "sign a new prekey statement: irongall prekey renew", "the statement does not read the same verified as unverified")
 	}
 	if err != nil {
 		m.keep()
@@ -285,7 +285,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	keyHash := sha256.Sum256([]byte(p.Key))
 	retired := slices.DeleteFunc(b.Retired, func(x Retired) bool { return !now.Before(x.NotAfter) })
 	if keyHash == sha256.Sum256([]byte(b.Prekey.Key)) || slices.ContainsFunc(retired, func(x Retired) bool { return x.KeyHash == keyHash }) {
-		return fail(protocol.CodeBadKey, "every prekey must be a NEW key: irongall rekey makes one", "this key was already published")
+		return fail(protocol.CodeBadKey, "every prekey must be a NEW key: irongall prekey renew makes one", "this key was already published")
 	}
 	if now.Before(b.Prekey.NotAfter) {
 		retired = append(retired, Retired{Type: b.Prekey.Type(), NotAfter: b.Prekey.NotAfter, KeyHash: sha256.Sum256([]byte(b.Prekey.Key))})
@@ -300,7 +300,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	b.State = Active                                // a closed box reopens
 	if err := s.store.UpdateBox(r.Context(), b); err != nil {
 		if errors.Is(err, ErrStale) {
-			return fail(protocol.CodeConflict, "retry: irongall rekey", "the box changed during the request")
+			return fail(protocol.CodeConflict, "retry: irongall prekey renew", "the box changed during the request")
 		}
 		return err
 	}
@@ -335,8 +335,8 @@ func (s *Server) identity(w http.ResponseWriter, r *http.Request) error {
 // What to do about a body that is not a revocation of the address, or not
 // one of its certificates.
 const (
-	hintRevocation   = "a revocation is the identity key's own signature over its fixed statement, with the identity document: irongall revocation makes the record"
-	hintRevokedCerts = "a revocation of certificates is signed by the identity key itself, and sent with the identity document: irongall rekey --revoke-earlier makes and publishes one"
+	hintRevocation   = "a revocation is the identity key's own signature over its fixed statement, with the identity document: irongall revocation make prints the record"
+	hintRevokedCerts = "a revocation of certificates is signed by the identity key itself, and sent with the identity document: irongall cert revoke-earlier makes and publishes one"
 )
 
 // revoke is PUT /v1/<address>/revocations: the identity document with what
