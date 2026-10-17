@@ -38,6 +38,8 @@ go run ./cmd/irongalld serve --dev
 
 `serve --dev` is the whole server on an in-memory store, with no AWS, listening on `127.0.0.1:8080`: nothing survives a restart. Point a client at it with `IRONGALL_BASE=http://127.0.0.1:8080`.
 
+`test/interop.sh` runs both clients from the checkout beside this one against a real `serve --dev`: mail both ways, renewal, revocation, certificates and the sender ACL. Its header says what it needs, and how to test post-quantum boxes when the packaged age is older than 1.3.
+
 The other store is three DynamoDB tables and an S3 Express One Zone directory bucket. `irongalld serve -h` lists every flag, and `PROTOCOL-SERVER.md` §7 has the layout. That mode also needs `-names`, the names clients call the server by: a box's pass is made for one server by name, and the server takes one only on a request that calls it by a name of its own (`PROTOCOL-SERVER.md` §6.1b).
 
 ## Contributing

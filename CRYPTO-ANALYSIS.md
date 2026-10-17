@@ -227,7 +227,7 @@ Confidentiality, sender authenticity and key authenticity hold even against us. 
 
 ## The operator's power
 
-We can stop or slow mail, and we see its metadata. We cannot read it, forge it, re-attribute it, or swap anyone's keys.
+We can stop or slow mail, and we see its metadata. We cannot read it, forge it, re-attribute it, or swap anyone's keys. The specification's own list is irongall-client's `PROTOCOL.md` §9; this table adds what holds each line.
 
 | We CAN | We CANNOT |
 | --- | --- |

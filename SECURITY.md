@@ -32,6 +32,6 @@ gh api repos/IronGall-dev/irongall-server/security-advisories/reports \
 | **Revocation is kept as the identity signed it,** and answered for an address it covers before anything else | `revocation_test.go`, `revokedcerts_test.go` |
 | **Every error is tested over raw HTTP against the spec's status map,** and both clients run end to end against the real server | `internal/server/*_test.go` (the list is `PROTOCOL-SERVER.md` §11), `e2e_test.go`; `test/interop.sh` for the shell client |
 
-**Run them:** check the two repos out side by side as `README.md` § Build and run says, then `go test ./...` and `test/interop.sh`.
+**Run them:** `README.md` § Build and run.
 
 **Where the rest is:** the threat model, the properties, the operator's power, the residual risks and the open questions for reviewers are [`CRYPTO-ANALYSIS.md`](CRYPTO-ANALYSIS.md). Every limit and where it is weak is [`LIMITS.md`](LIMITS.md); start there to break one.
