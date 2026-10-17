@@ -316,9 +316,15 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// identity is GET /v1/<address>/identity. It answers for closed boxes too, so
-// an owner can read its own serial to reopen.
-func (s *Server) identity(w http.ResponseWriter, r *http.Request) error {
+// getBox is GET /v1/<address>, the one read of a box: everything a sender
+// needs before it posts, which is the identity document, the current prekey
+// statement with its signature, the key types the box declared with it, and
+// the revocation of its certificates held (PROTOCOL.md §4.1). It answers for
+// closed boxes too, so an owner can read its own serial to reopen. A revoked
+// box is 410 with its record, which proves itself: a client takes "revoked"
+// on nothing less, and needs no second call for it. Like every lookup it
+// takes a pass or none (spendLookup).
+func (s *Server) getBox(w http.ResponseWriter, r *http.Request) error {
 	if err := s.spendLookup(r); err != nil {
 		return err
 	}
@@ -333,9 +339,12 @@ func (s *Server) identity(w http.ResponseWriter, r *http.Request) error {
 	case b == nil:
 		return noSuchMailbox
 	case b.State == Revoked:
-		return revoked()
+		return revokedWith(&protocol.Revocations{Identity: b.Identity, Revocation: b.Revocation, RevokedCertificates: b.RevokedCerts, RevokedCertificatesSignature: b.RevokedCertsSig})
 	}
-	writeJSON(w, http.StatusOK, protocol.IdentityResponse{Identity: b.Identity, Prekey: b.Statement, PrekeySignature: b.Signature, SenderKeyTypes: b.SenderKeyTypes})
+	writeJSON(w, http.StatusOK, protocol.BoxResponse{
+		Identity: b.Identity, Prekey: b.Statement, PrekeySignature: b.Signature, SenderKeyTypes: b.SenderKeyTypes,
+		RevokedCertificates: b.RevokedCerts, RevokedCertificatesSignature: b.RevokedCertsSig,
+	})
 	return nil
 }
 
@@ -502,37 +511,6 @@ func (s *Server) deleteHeld(ctx context.Context, b *Box) error {
 		return err
 	}
 	return s.store.DeleteMessages(ctx, b.Addr)
-}
-
-// revocations is GET /v1/<address>/revocations: what this server holds that
-// the address's identity signed about it, which is its revocation, its
-// revocation of its certificates, both or neither. It asks for no pass and tells
-// nothing a 410 or a refused pass does not already tell; what it adds is the
-// proof.
-func (s *Server) revocations(w http.ResponseWriter, r *http.Request) error {
-	if err := s.spendLookup(r); err != nil {
-		return err
-	}
-	h, err := pathAddr(r)
-	if err != nil {
-		return err
-	}
-	b, err := s.lookup(r, h)
-	switch {
-	case err != nil:
-		return err
-	case b == nil:
-		return noSuchMailbox
-	}
-	rec := protocol.Revocations{Identity: b.Identity, RevokedCertificates: b.RevokedCerts, RevokedCertificatesSignature: b.RevokedCertsSig}
-	if b.State == Revoked {
-		rec.Revocation = b.Revocation
-	}
-	if len(rec.Revocation) == 0 && len(rec.RevokedCertificates) == 0 {
-		return fail(protocol.CodeNotRevoked, "nothing to do: this server holds no revocation of that address", "no revocation of this address is held here")
-	}
-	writeJSON(w, http.StatusOK, rec)
-	return nil
 }
 
 // closeBox is DELETE /v1/<address> (with the pass): unacked mail is deleted

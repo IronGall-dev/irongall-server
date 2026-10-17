@@ -11,7 +11,7 @@ import (
 // recCache is a bounded LRU of records, each at a rev. The stream replaces or
 // evicts an entry when its record changes; a record never moves back to an
 // older rev. Two are kept: box records (ARCHITECTURE.md § Memory, for
-// sends and /identity) and account records (for a sender's limits).
+// sends and reads of a box) and account records (for a sender's limits).
 type recCache[K comparable, V any] struct {
 	mu  sync.Mutex
 	max int // 0: no cache

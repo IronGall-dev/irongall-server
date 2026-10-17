@@ -199,7 +199,7 @@ func TestThePrekeyCeilingAndTheDateOnAnAnswer(t *testing.T) {
 	}
 	// The clock the answers are dated by is the one the checks read, wherever it is set.
 	e.clock.Add(100 * 24 * time.Hour)
-	if got, want := e.do("GET", e.raw().path("/identity"), nil, "").header.Get("Date"), e.clock.Now().UTC().Format(http.TimeFormat); got != want {
+	if got, want := e.do("GET", e.raw().path(""), nil, "").header.Get("Date"), e.clock.Now().UTC().Format(http.TimeFormat); got != want {
 		t.Errorf("an answer is dated %q, and the server's clock reads %q", got, want)
 	}
 }

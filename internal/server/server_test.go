@@ -261,8 +261,8 @@ func TestASignatureIsBounded(t *testing.T) {
 	r.prekey(1, now.Add(protocol.PrekeyLifetime), nil)
 	r.sig[1] = pad(r.sig[1], protocol.MaxSignature)
 	e.want(e.do("PUT", r.path(""), r.registration(1), r.pass(1)), 201, "")
-	var got protocol.IdentityResponse
-	if err := json.Unmarshal(e.do("GET", r.path("/identity"), nil, "").body, &got); err != nil || !bytes.Equal(got.PrekeySignature, r.sig[1]) {
+	var got protocol.BoxResponse
+	if err := json.Unmarshal(e.do("GET", r.path(""), nil, "").body, &got); err != nil || !bytes.Equal(got.PrekeySignature, r.sig[1]) {
 		t.Errorf("the signature is not served as it was sent: %v", err)
 	}
 
@@ -479,15 +479,16 @@ func TestOwnerCalls(t *testing.T) {
 	e.clock.Add(time.Second)
 	e.want(e.do("GET", r.path("/messages"), nil, ahead), 200, "")
 
-	// Close: mail deleted, owner calls 404, /identity still answers so the
-	// owner can read its serial; a new prekey reopens it, in use at once.
+	// Close: mail deleted, owner calls 404, the read of the box still answers
+	// so the owner can read its serial; a new prekey reopens it, in use at
+	// once.
 	a := e.box(protocol.Classic)
 	if _, err := a.Send(context.Background(), r.id.Address(), "deleted by close"); err != nil {
 		t.Fatal(err)
 	}
 	e.want(e.do("DELETE", r.path(""), nil, pass), 204, "")
 	e.want(e.do("GET", r.path("/messages"), nil, pass), 404, protocol.CodeNoSuchMailbox)
-	e.want(e.do("GET", r.path("/identity"), nil, ""), 200, "")
+	e.want(e.do("GET", r.path(""), nil, ""), 200, "")
 	e.want(e.do("PUT", r.path(""), r.registration(1), pass), 409, protocol.CodeConflict)
 	if _, err := a.Send(context.Background(), r.id.Address(), "to a closed box"); client.Code(err) != protocol.CodeNoSuchMailbox {
 		t.Fatalf("send to a closed box: %v", err)
@@ -757,21 +758,22 @@ func TestSendPipeline(t *testing.T) {
 		t.Fatalf("a fetched message: %s", fetched.body)
 	}
 
-	// Revoked boxes, set by hand: this test puts B back afterwards, which no
+	// Revoked boxes, set by hand, each with the revocation its identity
+	// signed as the route keeps it: this test puts B back afterwards, which no
 	// route does. The route itself is TestRevocation.
-	for _, box := range []protocol.Address{a.Address(), b.Address()} {
-		rec, _ := e.store.Box(ctx, box)
-		rec.State = Revoked
+	for _, box := range []*client.Box{a, b} {
+		rec, _ := e.store.Box(ctx, box.Address())
+		rec.State, rec.Revocation = Revoked, record(t, box).Revocation
 		_ = e.store.UpdateBox(ctx, rec)
 	}
 	e.want(e.do("POST", to+"/messages", seal(pqRecipient), pass), 403, protocol.CodeSenderRevoked)
 	e.want(e.do("POST", to+"/messages", seal(pqRecipient), e.pass(d)), 410, protocol.CodeRevoked)
-	e.want(e.do("GET", "/v1/"+a.Address().String()+"/identity", nil, ""), 410, protocol.CodeRevoked)
+	e.want(e.do("GET", "/v1/"+a.Address().String(), nil, ""), 410, protocol.CodeRevoked)
 	e.want(e.do("GET", "/v1/"+a.Address().String()+"/messages", nil, pass), 410, protocol.CodeRevoked)
 
 	// An expired recipient prekey.
 	rec, _ := e.store.Box(ctx, b.Address())
-	rec.State = Active
+	rec.State, rec.Revocation = Active, nil
 	_ = e.store.UpdateBox(ctx, rec)
 	e.clock.Add(protocol.MaxPrekeyLifetime)
 	e.want(e.do("POST", to+"/messages", seal(pqRecipient), e.pass(d)), 409, protocol.CodePrekeyExpired)

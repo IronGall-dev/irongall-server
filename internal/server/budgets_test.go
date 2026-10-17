@@ -135,10 +135,10 @@ func errorsAs(err error, ae **client.APIError) bool {
 	return false
 }
 
-// A lookup is its caller's to pay for: with a pass, the box's calls
-// (Limits.CallBurst); with none, its address's calls with no pass
-// (Limits.PublicBurst), as the page a link opens is. A pass that does not
-// verify is refused, not taken as none.
+// A lookup, the read of a box, is its caller's to pay for, once for each
+// read: with a pass, the box's calls (Limits.CallBurst); with none, its
+// address's calls with no pass (Limits.PublicBurst), as the page a link
+// opens is. A pass that does not verify is refused, not taken as none.
 func TestLookupsArePaidByTheirCaller(t *testing.T) {
 	t.Run("with a pass", func(t *testing.T) {
 		l := relaxed()
@@ -147,15 +147,15 @@ func TestLookupsArePaidByTheirCaller(t *testing.T) {
 		l.CallBurst, l.CallRefill = 2, time.Minute
 		e2, _ := counted(t, e, l)
 		pass := e2.pass(a)
-		for _, p := range []string{"/identity", "/revocations"} {
-			r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+p, nil, pass)
-			if r.status == http.StatusTooManyRequests {
-				t.Fatalf("%s: refused within the box's calls: %s", p, r.body)
+		read := "/v1/" + b.Address().String()
+		for i := range l.CallBurst {
+			if r := e2.do(http.MethodGet, read, nil, pass); r.status != http.StatusOK {
+				t.Fatalf("read %d of %d: refused within the box's calls: %d %s", i+1, l.CallBurst, r.status, r.body)
 			}
 		}
-		e2.want(e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/identity", nil, pass), http.StatusTooManyRequests, protocol.CodeRateLimited)
-		e2.want(e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/identity", nil, ""), http.StatusOK, "") // the address's calls are its own
-		e2.want(e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/identity", nil, "irongall-pass nonsense"), http.StatusUnauthorized, protocol.CodeUnauthorized)
+		e2.want(e2.do(http.MethodGet, read, nil, pass), http.StatusTooManyRequests, protocol.CodeRateLimited)
+		e2.want(e2.do(http.MethodGet, read, nil, ""), http.StatusOK, "") // the address's calls are its own
+		e2.want(e2.do(http.MethodGet, read, nil, "irongall-pass nonsense"), http.StatusUnauthorized, protocol.CodeUnauthorized)
 	})
 	t.Run("with none", func(t *testing.T) {
 		l := relaxed()
@@ -163,12 +163,13 @@ func TestLookupsArePaidByTheirCaller(t *testing.T) {
 		b := e.box(protocol.Classic)
 		l.PublicBurst, l.PublicRefill = 2, time.Minute
 		e2, _ := counted(t, e, l)
-		e2.want(e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/identity", nil, ""), http.StatusOK, "")
+		read := "/v1/" + b.Address().String()
+		e2.want(e2.do(http.MethodGet, read, nil, ""), http.StatusOK, "")
 		page := e2.do(http.MethodGet, protocol.LinkPath+b.Address().String(), nil, "")
 		if page.status != http.StatusOK {
 			t.Fatalf("the link page: %d", page.status)
 		}
-		e2.want(e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/revocations", nil, ""), http.StatusTooManyRequests, protocol.CodeRateLimited)
+		e2.want(e2.do(http.MethodGet, read, nil, ""), http.StatusTooManyRequests, protocol.CodeRateLimited)
 		if r := e2.do(http.MethodGet, protocol.LinkPath+b.Address().String(), nil, ""); r.status != http.StatusTooManyRequests || r.header.Get("Retry-After") == "" {
 			t.Fatalf("the link page past the address's calls: %d", r.status)
 		}
@@ -218,7 +219,7 @@ func TestAStatementOutOfOrderIsRefusedBeforeItsSignature(t *testing.T) {
 		t.Fatalf("a statement under a revoked certificate: %s", got.body)
 	}
 	var nobody protocol.Address
-	e.want(e.do(http.MethodGet, "/v1/"+nobody.String()+"/identity", nil, ""), http.StatusNotFound, protocol.CodeNoSuchMailbox) // the address's one miss is still there
+	e.want(e.do(http.MethodGet, "/v1/"+nobody.String(), nil, ""), http.StatusNotFound, protocol.CodeNoSuchMailbox) // the address's one miss is still there
 }
 
 // Registration never changes a box, so a box the process holds is answered
@@ -305,12 +306,12 @@ func TestATakerCannotHoldTheRemedyBack(t *testing.T) {
 	r.prekey(1000, until, nil)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(1000), r.pass(1000)), http.StatusOK, "") // the day's one certificate
 	taken := r.pass(1000)
-	for e.do("GET", other.path("/identity"), nil, taken).status == http.StatusOK {
+	for e.do("GET", other.path(""), nil, taken).status == http.StatusOK {
 	}
 	r.prekey(2000, until, nil)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(2000), r.pass(2000)), http.StatusTooManyRequests, protocol.CodeRateLimited) // held back by the taker
 	e.want(e.do("PUT", r.path("/revocations"), r.certs(1000), ""), http.StatusOK, "")
-	e.want(e.do("GET", other.path("/identity"), nil, taken), http.StatusUnauthorized, protocol.CodeCertificateRevoked)
+	e.want(e.do("GET", other.path(""), nil, taken), http.StatusUnauthorized, protocol.CodeCertificateRevoked)
 	e.clock.Add(l.CallRefill)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(2000), r.pass(2000)), http.StatusOK, "")
 }
@@ -493,7 +494,7 @@ func TestLookupsOfOneAddressShareARead(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resp, err := http.Get(srv.URL + "/v1/" + nobody.String() + "/identity")
+			resp, err := http.Get(srv.URL + "/v1/" + nobody.String())
 			if err != nil {
 				return
 			}

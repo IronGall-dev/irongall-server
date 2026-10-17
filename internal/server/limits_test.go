@@ -222,20 +222,20 @@ func TestMissesPerIP(t *testing.T) {
 		a[0], a[1] = 1, i
 		return a
 	}
-	identity := func(a protocol.Address) reply {
-		return e2.do(http.MethodGet, "/v1/"+a.String()+"/identity", nil, "")
+	read := func(a protocol.Address) reply {
+		return e2.do(http.MethodGet, "/v1/"+a.String(), nil, "")
 	}
 	for range 3 {
-		e2.want(identity(b.Address()), http.StatusOK, "")
+		e2.want(read(b.Address()), http.StatusOK, "")
 	}
 	pass := e2.pass(b)
 	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, pass); r.status != http.StatusOK { // a pass this process now remembers
 		t.Fatalf("the owner's poll: %d %s", r.status, r.body)
 	}
-	e2.want(identity(nobody(1)), http.StatusNotFound, protocol.CodeNoSuchMailbox)
+	e2.want(read(nobody(1)), http.StatusNotFound, protocol.CodeNoSuchMailbox)
 	e2.want(e2.do(http.MethodGet, "/v1/"+nobody(2).String()+"/messages", nil, e2.pass(b)), http.StatusNotFound, protocol.CodeNoSuchMailbox) // a call with a pass, naming no box
 	before := cs.reads.Load()
-	r := identity(nobody(3))
+	r := read(nobody(3))
 	e2.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
 	if !strings.Contains(string(r.body), "named no box") || r.header.Get("Retry-After") != "30" {
 		t.Fatalf("a third miss in a minute: Retry-After %q, %s", r.header.Get("Retry-After"), r.body)
@@ -244,7 +244,7 @@ func TestMissesPerIP(t *testing.T) {
 		t.Fatalf("%d storage calls from an address past its misses", n-before)
 	}
 	for range 3 {
-		e2.want(identity(b.Address()), http.StatusOK, "") // a live box, held in memory: not a miss
+		e2.want(read(b.Address()), http.StatusOK, "") // a live box, held in memory: not a miss
 	}
 	// A pass the process remembers is answered from memory, whatever its
 	// address has spent; a new one costs signature checks, and an address
@@ -256,8 +256,8 @@ func TestMissesPerIP(t *testing.T) {
 	e2.want(e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e2.pass(b)), http.StatusTooManyRequests, protocol.CodeRateLimited)
 	e.clock.Add(-time.Second)
 	e.clock.Add(30 * time.Second) // one back
-	e2.want(identity(nobody(4)), http.StatusNotFound, protocol.CodeNoSuchMailbox)
-	e2.want(identity(nobody(5)), http.StatusTooManyRequests, protocol.CodeRateLimited)
+	e2.want(read(nobody(4)), http.StatusNotFound, protocol.CodeNoSuchMailbox)
+	e2.want(read(nobody(5)), http.StatusTooManyRequests, protocol.CodeRateLimited)
 }
 
 // An address at its count of misses still makes a box and uses it: a
@@ -269,9 +269,9 @@ func TestANewBoxIsUsedWhateverItsAddressMissed(t *testing.T) {
 	e := newEnv(t, l)
 	var nobody protocol.Address
 	nobody[0] = 2
-	e.want(e.do(http.MethodGet, "/v1/"+nobody.String()+"/identity", nil, ""), http.StatusNotFound, protocol.CodeNoSuchMailbox)
+	e.want(e.do(http.MethodGet, "/v1/"+nobody.String(), nil, ""), http.StatusNotFound, protocol.CodeNoSuchMailbox)
 	nobody[1] = 1
-	e.want(e.do(http.MethodGet, "/v1/"+nobody.String()+"/identity", nil, ""), http.StatusTooManyRequests, protocol.CodeRateLimited)
+	e.want(e.do(http.MethodGet, "/v1/"+nobody.String(), nil, ""), http.StatusTooManyRequests, protocol.CodeRateLimited)
 	b := e.box(protocol.Classic)
 	if r := e.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e.pass(b)); r.status != http.StatusOK {
 		t.Fatalf("the new box's poll: %d %s", r.status, r.body)
@@ -286,18 +286,18 @@ func TestARememberedMissIsFree(t *testing.T) {
 	l.MissesPerMinute = 1
 	e2, cs := counted(t, e, l)
 	nobody := e.raw().id.Address()
-	identity := func(a protocol.Address) reply {
-		return e2.do(http.MethodGet, "/v1/"+a.String()+"/identity", nil, "")
+	read := func(a protocol.Address) reply {
+		return e2.do(http.MethodGet, "/v1/"+a.String(), nil, "")
 	}
-	e2.want(identity(nobody), http.StatusNotFound, protocol.CodeNoSuchMailbox) // the read, and the address's one miss
+	e2.want(read(nobody), http.StatusNotFound, protocol.CodeNoSuchMailbox) // the read, and the address's one miss
 	before := cs.reads.Load()
 	for range 5 {
-		e2.want(identity(nobody), http.StatusNotFound, protocol.CodeNoSuchMailbox)
+		e2.want(read(nobody), http.StatusNotFound, protocol.CodeNoSuchMailbox)
 	}
 	if n := cs.reads.Load(); n != before {
 		t.Fatalf("%d storage calls for a box remembered as missing", n-before)
 	}
-	e2.want(identity(e.raw().id.Address()), http.StatusTooManyRequests, protocol.CodeRateLimited) // another address needs a read
+	e2.want(read(e.raw().id.Address()), http.StatusTooManyRequests, protocol.CodeRateLimited) // another address needs a read
 }
 
 // A message is fetched once and kept. Its first fetch is never limited; a

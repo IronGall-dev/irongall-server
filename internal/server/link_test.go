@@ -30,7 +30,7 @@ func TestNoPagesButTheLinkPage(t *testing.T) {
 			t.Errorf("GET %s: %d", p, resp.StatusCode)
 		}
 	}
-	resp, err := http.Get(srv.URL + "/v1/" + strings.Repeat("0", 64) + "/identity")
+	resp, err := http.Get(srv.URL + "/v1/" + strings.Repeat("0", 64))
 	if err != nil {
 		t.Fatal(err)
 	}

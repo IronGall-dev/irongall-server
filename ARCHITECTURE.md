@@ -115,7 +115,7 @@ A set keyed by message id absorbs all three. The penciled Redis count cache was 
 - the standing of every box this process has used: its state, its identity's public key, the SHA-256 of its current certificate, and the record's rev. It is what a pass is checked against with no read (`PROTOCOL-SERVER.md` §6.1b);
 - the pass each box showed last, until it runs out, so that a call carrying it again is a lookup;
 - the poll buckets;
-- an LRU of box records for sends and `/identity`, which the stream invalidates. A record carries its box's ACL, two sorted lists of 32-byte addresses that `-acl-entries` bounds, so a send's check of it reads nothing more (`PROTOCOL-SERVER.md` §6.2);
+- an LRU of box records for sends and reads of a box, which the stream invalidates. A record carries its box's ACL, two sorted lists of 32-byte addresses that `-acl-entries` bounds, so a send's check of it reads nothing more (`PROTOCOL-SERVER.md` §6.2);
 - an LRU of account records, as many as box records, for a sender in an account (`PROTOCOL.md` §6.5): filled on first use by a strongly consistent read, refreshed or evicted by the accounts stream;
 - the server MAC keys, from the 0600 secrets file: they make adopt keys (`PROTOCOL.md` §6.5).
 
@@ -131,7 +131,7 @@ That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go map
 | Send `POST /v1/<addr>/messages` | The sender's pass, before the body is read; its record for its account (the LRU, or one GetItem); GetItem (the dedupe check), S3 PUT, then one conditional PutItem: the header and the dedupe record are one item (`PROTOCOL-SERVER.md` §7) | Cheapest check first (`PROTOCOL.md` §4.5); the caps read layer 1. No signature on the message is checked: it is inside the ciphertext |
 | Register `PUT /v1/<addr>` | Four signature checks (the certificate and the statement under it, then the pass under it and the certificate again), then DynamoDB PutItem | The box is in use from this one write |
 | New prekey `PUT …/prekey` | The record (the LRU, or one GetItem), the same four checks, DynamoDB UpdateItem | The authority is the statement's own certificate and a pass under it: no pass under the box's current certificate is needed |
-| `/identity` | The LRU; DynamoDB on a miss | Never cached in front of the server: every API answer says `no-store` (`PROTOCOL-SERVER.md` §6.3, §12) |
+| Read a box `GET /v1/<addr>` | The LRU; DynamoDB on a miss. A revoked box is `410` with the record it keeps | Never cached in front of the server: every API answer says `no-store` (`PROTOCOL-SERVER.md` §6.3, §12) |
 | ACL `PUT …/acl` | The pass, the record (the LRU, or one GetItem), one conditional UpdateItem; then, only if memory shows the box holding mail and the deny list is not empty, one Query of the live index and the deletes of what it denies | Replaced whole, only by a higher version (`PROTOCOL-SERVER.md` §6.2) |
 | ACL `GET …/acl` | The pass, the record (the LRU, or one GetItem) | The record's ACL, or the open one of a box with none |
 
@@ -275,9 +275,9 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
 
 **The library does it once, so every client above behaves the same:**
 1. **Resolve a peer.**
-   - Fetch `/identity`. At first contact check `sha256(identity document) == address`; a pin always wins.
-   - Verify the prekey statement under a certificate of that identity (`PROTOCOL.md` §2b), and refuse a lower prekey serial, a lower certificate serial or an expired `not_after`. A new peer is pinned only after that.
-   - On `409 stale_prekey`, re-fetch and seal the same envelope again.
+   - Read the box, `GET /v1/<addr>`, and keep what verifies of the revocations it carries. At first contact check `sha256(identity document) == address`; a pin always wins.
+   - Verify the prekey statement under a certificate of that identity (`PROTOCOL.md` §2b), and refuse a lower prekey serial, a lower certificate serial, a certificate the identity revoked or an expired `not_after`. A new peer is pinned only after that.
+   - On `409 stale_prekey`, read the box again and seal the same envelope again.
 2. **Send.**
    - Take a link, an address or one of the box's aliases as the destination: a name is 1 to 32 of `a-z`, `0-9`, `.`, `_` and `-`, so it is never an address or a link, and a name with two addresses names neither.
    - Build the envelope `{v, from, to, sent_at, msg_id, identity, body}`, with `subject`, `in_reply_to` and `supersedes` when the sender gives them (one that is not a `msg_id` is refused before anything is built). `identity` is the sender's identity document.

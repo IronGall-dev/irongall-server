@@ -307,13 +307,13 @@ func TestTheSenderKeyTypesABoxDeclared(t *testing.T) {
 	}
 	served := func(r *raw) []string {
 		t.Helper()
-		var ir protocol.IdentityResponse
-		rep := e.do("GET", r.path("/identity"), nil, "")
+		var br protocol.BoxResponse
+		rep := e.do("GET", r.path(""), nil, "")
 		e.want(rep, 200, "")
-		if err := json.Unmarshal(rep.body, &ir); err != nil {
+		if err := json.Unmarshal(rep.body, &br); err != nil {
 			t.Fatal(err)
 		}
-		return ir.SenderKeyTypes
+		return br.SenderKeyTypes
 	}
 	sendTo := func(from, to *raw, serial uint64) reply {
 		t.Helper()

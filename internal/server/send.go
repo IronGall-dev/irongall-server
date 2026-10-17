@@ -172,7 +172,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	}
 	// A prekey is named by both serials: its own, and its certificate's.
 	if *req.PrekeySerial != rcpt.Prekey.Serial || *req.CertificateSerial != rcpt.CertSerial {
-		return fail(protocol.CodeStalePrekey, "a newer prekey exists: fetch GET /v1/<address>/identity and re-encrypt the same envelope (irongall does this)", "the box's current prekey is serial %d, under certificate %d", prekeySerialValue(rcpt.Prekey.Serial), certificateSerialValue(rcpt.CertSerial))
+		return fail(protocol.CodeStalePrekey, "a newer prekey exists: read GET /v1/<address> again and re-encrypt the same envelope (irongall does this)", "the box's current prekey is serial %d, under certificate %d", prekeySerialValue(rcpt.Prekey.Serial), certificateSerialValue(rcpt.CertSerial))
 	}
 	if p := checkStanzas(stanzas, rcpt); p != nil {
 		return p

@@ -151,12 +151,11 @@ type route struct {
 // (TestTheRoutesAreTheDescriptions).
 func (s *Server) routes() []route {
 	return []route{
+		{"GET /v1/{addr}", s.getBox},
 		{"PUT /v1/{addr}", s.register},
 		{"DELETE /v1/{addr}", s.closeBox},
-		{"GET /v1/{addr}/identity", s.identity},
 		{"PUT /v1/{addr}/prekey", s.prekey},
 		{"PUT /v1/{addr}/revocations", s.revoke},
-		{"GET /v1/{addr}/revocations", s.revocations},
 		{"PUT /v1/{addr}/acl", s.putACL},
 		{"GET /v1/{addr}/acl", s.getACL},
 		{"PUT /v1/{addr}/account", s.adopt},
@@ -579,6 +578,14 @@ var noSuchMailbox = fail(protocol.CodeNoSuchMailbox, "check the address", "no bo
 
 func revoked() *problem {
 	return fail(protocol.CodeRevoked, "the box you named is revoked, forever: ask its owner for their new address", "this box is revoked")
+}
+
+// revokedWith is revoked carrying the record this server holds, as the read
+// of a box answers it (getBox).
+func revokedWith(rec *protocol.Revocations) *problem {
+	p := revoked()
+	p.record = rec
+	return p
 }
 
 // fetchedAlready refuses a fetch of a message the box has fetched before, once

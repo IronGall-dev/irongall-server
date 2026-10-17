@@ -43,9 +43,9 @@ sequenceDiagram
     participant B as Recipient B
     B->>S: 1. identity + prekey signed by a certified working key, with B's pass
     Note over S: hash ✓, certificate ✓<br/>prekey signature ✓, pass ✓<br/>box in use
-    A->>S: 2. fetch B's identity
-    S->>A: 3. identity + signed prekey
-    Note over A: sha256 = B's address ✓<br/>certificate, prekey signature ✓<br/>serials, expiry ✓
+    A->>S: 2. read B's box
+    S->>A: 3. identity + signed prekey<br/>+ revocations held
+    Note over A: sha256 = B's address ✓<br/>certificate, prekey signature ✓<br/>serials, revocations, expiry ✓
     Note over A: sign the envelope, for B only<br/>encrypt envelope + signature<br/>to the prekey (age PQ)
     A->>S: 4. ciphertext, with A's pass
     Note over S: pass ✓, shape ✓<br/>store — NEVER decrypts,<br/>sees no signature on the mail
@@ -165,10 +165,11 @@ A send signs the envelope with the recipient bound into the signature, then encr
 
 **Sending, A to B**
 
-1. `GET /v1/<B>/identity` returns B's identity document and current signed prekey. A checks:
+1. `GET /v1/<B>`, the one read of B's box, returns B's identity document, its current signed prekey, and the revocation of its certificates the server holds; a revoked B is `410` with its revocation record. A keeps a revocation that verifies under B's identity, and refuses B for good on one of the address. A checks:
    - the identity hash against B's address;
    - the certificate, and the prekey signature under it, in a namespace bound to B;
    - that neither the prekey's serial nor the certificate's is lower than any seen before;
+   - that the certificate is not one B's identity has revoked, by the revocation A holds (`PROTOCOL.md` §6.3a);
    - that `not_after` has not passed.
 
    A pins B's identity at first contact, and only once all of it passed.

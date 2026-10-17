@@ -28,6 +28,7 @@ type problem struct {
 	hint       string
 	retryAfter time.Duration // 429 and 503
 	values     []value
+	record     *protocol.Revocations // revoked, on the read of a box
 }
 
 func (p *problem) Error() string { return string(p.code) + ": " + p.detail }
@@ -121,6 +122,7 @@ func writeProblem(w http.ResponseWriter, p *problem) {
 	for _, v := range p.values {
 		v.set(&body)
 	}
+	body.Record = p.record
 	h := w.Header()
 	h.Set("Content-Type", protocol.ProblemContentType)
 	if status == http.StatusUnauthorized {

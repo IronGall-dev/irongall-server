@@ -17,10 +17,49 @@ import (
 
 // Revocation (PROTOCOL.md §6.3) as this server enforces it: the identity's
 // own signature over the fixed statement ends a box for good, with no pass,
-// and nothing else does. The server keeps the signature and serves it, so
-// that nobody has to take its word that a box is revoked.
+// and nothing else does. The server keeps the signature and serves it, in
+// the 410 a read of the box answers, so that nobody has to take its word
+// that a box is revoked.
 
 func revocationPath(a protocol.Address) string { return "/v1/" + a.String() + "/revocations" }
+
+func boxPath(a protocol.Address) string { return "/v1/" + a.String() }
+
+// held is the revocation record a read of a box (GET /v1/<address>) shows,
+// read as a client reads it: the 200's revocation of certificates, or the
+// 410's record. Nil when it shows none.
+func held(t *testing.T, r reply) *protocol.Revocations {
+	t.Helper()
+	switch r.status {
+	case 200:
+		var b protocol.BoxResponse
+		if err := protocol.Unmarshal(r.body, &b); err != nil {
+			t.Fatalf("the read of a box: %v: %s", err, r.body)
+		}
+		return b.Record()
+	case 410:
+		var p protocol.Problem
+		if err := protocol.Unmarshal(r.body, &p); err != nil {
+			t.Fatalf("the read of a revoked box: %v: %s", err, r.body)
+		}
+		return p.Record
+	}
+	t.Fatalf("the read of a box: %d %s", r.status, r.body)
+	return nil
+}
+
+// recordOf is the record a 410 carries as it was written, and its members.
+func recordOf(t *testing.T, r reply) ([]byte, map[string]json.RawMessage) {
+	t.Helper()
+	var p struct {
+		Record json.RawMessage `json:"record"`
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(r.body, &p); err != nil || json.Unmarshal(p.Record, &members) != nil {
+		t.Fatalf("no record in %s", r.body)
+	}
+	return p.Record, members
+}
 
 // record is a box's own revocation, as its owner makes it.
 func record(t *testing.T, b *client.Box) *protocol.Revocations {
@@ -41,10 +80,16 @@ func TestRevocation(t *testing.T) {
 	passA := e.pass(a)
 	rec := record(t, a)
 	path := revocationPath(a.Address())
+	read := boxPath(a.Address())
 
-	// Nothing is held about a box that is not revoked, or about no box.
-	e.want(e.do("GET", path, nil, ""), 404, protocol.CodeNotRevoked)
-	e.want(e.do("GET", revocationPath(protocol.Address{1}), nil, ""), 404, protocol.CodeNoSuchMailbox)
+	// Nothing is held about a box that is not revoked: its read is 200 and
+	// shows none. There is none of no box.
+	unrevoked := e.do("GET", read, nil, "")
+	e.want(unrevoked, 200, "")
+	if got := held(t, unrevoked); got != nil {
+		t.Fatalf("a box nobody revoked is read with a revocation: %s", unrevoked.body)
+	}
+	e.want(e.do("GET", boxPath(protocol.Address{1}), nil, ""), 404, protocol.CodeNoSuchMailbox)
 
 	// What is not a revocation of A, each of it well signed by someone.
 	docA, docB := a.Identity().Document(), b.Identity().Document()
@@ -94,7 +139,11 @@ func TestRevocation(t *testing.T) {
 	e.want(e.do("PUT", path, protocol.Revocations{Identity: docA, Revocation: sign(a, a.Address(), protocol.RevokeNamespace(a.Address()))}, passA), 400, protocol.CodeBadRevocation)
 	e.want(e.do("PUT", revocationPath(protocol.Address{1}), rec, ""), 400, protocol.CodeIdentityMismatch)
 	// After all of that the box is as it was.
-	e.want(e.do("GET", path, nil, ""), 404, protocol.CodeNotRevoked)
+	unrevoked = e.do("GET", read, nil, "")
+	e.want(unrevoked, 200, "")
+	if got := held(t, unrevoked); got != nil {
+		t.Fatalf("what was refused is shown: %s", unrevoked.body)
+	}
 	if n, _, _ := e.store.Count(ctx, a.Address()); n != 1 {
 		t.Fatalf("A holds %d messages before it is revoked, want 1", n)
 	}
@@ -114,21 +163,20 @@ func TestRevocation(t *testing.T) {
 		t.Errorf("a revoked box still holds %d messages", n)
 	}
 
-	// Everyone is told, and anyone who asks is shown why.
-	e.want(e.do("GET", "/v1/"+a.Address().String()+"/identity", nil, ""), 410, protocol.CodeRevoked)
+	// Everyone is told, and anyone who reads the box is shown why: its 410
+	// carries the record.
+	shown := e.do("GET", read, nil, "")
+	e.want(shown, 410, protocol.CodeRevoked)
 	e.want(e.do("GET", "/v1/"+a.Address().String()+"/messages", nil, passA), 410, protocol.CodeRevoked)
 	e.want(e.do("DELETE", "/v1/"+a.Address().String(), nil, passA), 410, protocol.CodeRevoked)
-	shown := e.do("GET", path, nil, "")
-	e.want(shown, 200, "")
-	var got protocol.Revocations
-	if err := json.Unmarshal(shown.body, &got); err != nil {
-		t.Fatal(err)
+	got := held(t, shown)
+	if got == nil {
+		t.Fatalf("a revoked box is read with no record: %s", shown.body)
 	}
-	if id, err := protocol.VerifyRevocation(a.Address(), got.Identity, got.Revocation); err != nil || id.Address() != a.Address() {
+	if id, err := protocol.VerifyRevocation(a.Address(), got.Identity, got.Revocation); err != nil || id.Address() != a.Address() || !bytes.Equal(got.Revocation, rec.Revocation) {
 		t.Fatalf("what the server shows for a revoked box does not verify: %v", err)
 	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(shown.body, &members); err != nil || len(members) != 3 || !bytes.HasPrefix(shown.body, []byte(`{"type":"revocation_record",`)) {
+	if written, members := recordOf(t, shown); len(members) != 3 || !bytes.HasPrefix(written, []byte(`{"type":"revocation_record",`)) {
 		t.Errorf("the record served has %d members, want its type first, then identity and revocation: %s", len(members), shown.body)
 	}
 
@@ -157,7 +205,7 @@ func TestRevocation(t *testing.T) {
 	}
 	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
 	e.want(e.do("PUT", path, protocol.Revocations{Identity: docA, Revocation: []byte("revoke it")}, ""), 410, protocol.CodeRevoked)
-	e.want(e.do("GET", "/v1/"+a.Address().String()+"/identity", nil, ""), 410, protocol.CodeRevoked)
+	e.want(e.do("GET", read, nil, ""), 410, protocol.CodeRevoked)
 }
 
 // A closed box can be revoked, and then no prekey reopens it.
@@ -166,13 +214,67 @@ func TestAClosedBoxIsRevoked(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a := e.box(protocol.Classic)
 	e.want(e.do("DELETE", "/v1/"+a.Address().String(), nil, e.pass(a)), 204, "")
-	e.want(e.do("GET", revocationPath(a.Address()), nil, ""), 404, protocol.CodeNotRevoked)
-	e.want(e.do("PUT", revocationPath(a.Address()), record(t, a), ""), 201, "")
+	closed := e.do("GET", boxPath(a.Address()), nil, "")
+	e.want(closed, 200, "")
+	if got := held(t, closed); got != nil {
+		t.Fatalf("a closed box nobody revoked is read with a revocation: %s", closed.body)
+	}
+	rec := record(t, a)
+	e.want(e.do("PUT", revocationPath(a.Address()), rec, ""), 201, "")
 	var gone *client.RevokedError
 	if _, err := a.Rekey(ctx, protocol.Classic); !errors.As(err, &gone) || !gone.Own {
 		t.Fatalf("a prekey for a box closed and then revoked: %v", err)
 	}
-	e.want(e.do("GET", revocationPath(a.Address()), nil, ""), 200, "")
+	shown := e.do("GET", boxPath(a.Address()), nil, "")
+	e.want(shown, 410, protocol.CodeRevoked)
+	if got := held(t, shown); got == nil || !bytes.Equal(got.Revocation, rec.Revocation) {
+		t.Fatalf("a box closed and then revoked is read without its revocation: %s", shown.body)
+	}
+}
+
+// A revoked box is read as its record: 410 revoked, carrying all this server
+// holds that the identity signed about the address, which is the revocation,
+// and the revocation of its certificates beside it when one was put. Each
+// part is the bytes that were put, and verifies, so a client takes "revoked"
+// from the one read with no second call and on none of the server's word.
+func TestARevokedBoxIsReadAsItsRecord(t *testing.T) {
+	e := newEnv(t, relaxed())
+	alone, withCerts := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+	certs := withCerts.certs(1)
+	e.want(e.do("PUT", withCerts.path("/revocations"), certs, ""), 200, "")
+	for name, c := range map[string]struct {
+		box     *raw
+		put     protocol.Revocations
+		members int
+	}{
+		"revoked alone":                         {alone, protocol.Revocations{Identity: alone.id.Document()}, 3},
+		"revoked with its certificates revoked": {withCerts, certs, 5},
+	} {
+		var err error
+		if c.put.Revocation, err = protocol.SignRevocation(c.box.signer, c.box.id.Address()); err != nil {
+			t.Fatal(err)
+		}
+		e.want(e.do("PUT", c.box.path("/revocations"), c.put, ""), 201, "")
+		shown := e.do("GET", c.box.path(""), nil, "")
+		e.want(shown, 410, protocol.CodeRevoked)
+		got := held(t, shown)
+		if got == nil || !bytes.Equal(got.Identity, c.box.id.Document()) || !bytes.Equal(got.Revocation, c.put.Revocation) ||
+			!bytes.Equal(got.RevokedCertificates, c.put.RevokedCertificates) || !bytes.Equal(got.RevokedCertificatesSignature, c.put.RevokedCertificatesSignature) {
+			t.Errorf("%s: the record is not what was put: %s", name, shown.body)
+			continue
+		}
+		if id, err := protocol.VerifyRevocation(c.box.id.Address(), got.Identity, got.Revocation); err != nil || id.Address() != c.box.id.Address() {
+			t.Errorf("%s: the revocation in the record does not verify: %v", name, err)
+		}
+		if len(c.put.RevokedCertificates) > 0 {
+			if l, err := protocol.VerifyRevokedCertificates(c.box.id.Address(), got.Identity, got.RevokedCertificates, got.RevokedCertificatesSignature); err != nil || l.Through != 1 {
+				t.Errorf("%s: the revocation of certificates in the record does not verify: %+v, %v", name, l, err)
+			}
+		}
+		if written, members := recordOf(t, shown); len(members) != c.members || !bytes.HasPrefix(written, []byte(`{"type":"revocation_record",`)) {
+			t.Errorf("%s: the record has %d members, want its type first and %d more: %s", name, len(members), c.members-1, shown.body)
+		}
+	}
 }
 
 // A body that is not a revocation costs the server a signature check that
@@ -192,7 +294,7 @@ func TestJunkRevocationsAreLimited(t *testing.T) {
 	if limited.header.Get("Retry-After") == "" {
 		t.Error("a limited revocation carries no Retry-After")
 	}
-	e.want(e.do("GET", "/v1/"+a.Address().String()+"/identity", nil, ""), 200, "")
+	e.want(e.do("GET", boxPath(a.Address()), nil, ""), 200, "")
 	e.clock.Add(protocol.MaxSkew) // long past the limit's minute
 	e.want(e.do("PUT", path, record(t, a), ""), 201, "")
 }
@@ -210,13 +312,12 @@ func TestNoAnswerOfTheAPIIsStored(t *testing.T) {
 			t.Errorf("%s: Cache-Control %q, want no-store", what, got)
 		}
 	}
-	check(e.do("GET", base+"/identity", nil, ""), "an identity")
-	check(e.do("GET", base+"/revocations", nil, ""), "a 404")
+	check(e.do("GET", base, nil, ""), "a box")
+	check(e.do("GET", boxPath(protocol.Address{1}), nil, ""), "a 404")
 	check(e.do("GET", base+"/messages", nil, e.pass(a)), "a list")
 	check(e.do("GET", base+"/messages", nil, ""), "a 401")
 	e.want(e.do("PUT", base+"/revocations", record(t, a), ""), 201, "")
-	check(e.do("GET", base+"/identity", nil, ""), "a 410")
-	check(e.do("GET", base+"/revocations", nil, ""), "a revocation")
+	check(e.do("GET", base, nil, ""), "a 410 with its revocation")
 	if got := e.do("GET", protocol.LinkPath+a.Address().String(), nil, "").header.Get("Cache-Control"); got == "no-store" || got == "" {
 		t.Errorf("the link page: Cache-Control %q", got)
 	}
@@ -245,12 +346,11 @@ func TestARevocationOutlivesTheProcess(t *testing.T) {
 	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: later, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: later.Ready}).Handler()))
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
-	e2.want(e2.do("GET", "/v1/"+a.Address().String()+"/identity", nil, ""), 410, protocol.CodeRevoked)
-	shown := e2.do("GET", revocationPath(a.Address()), nil, "")
-	e2.want(shown, 200, "")
-	var got protocol.Revocations
-	if err := json.Unmarshal(shown.body, &got); err != nil {
-		t.Fatal(err)
+	shown := e2.do("GET", boxPath(a.Address()), nil, "")
+	e2.want(shown, 410, protocol.CodeRevoked)
+	got := held(t, shown)
+	if got == nil {
+		t.Fatalf("a later process reads a revoked box with no record: %s", shown.body)
 	}
 	if _, err := protocol.VerifyRevocation(a.Address(), got.Identity, got.Revocation); err != nil || string(got.Revocation) != string(rec.Revocation) {
 		t.Fatalf("what a later process shows for a revoked box: %v", err)
