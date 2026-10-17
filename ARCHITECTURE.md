@@ -249,7 +249,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
   peers/<addr>/              the pinned identity document, the highest prekey serial and certificate serial seen, the last statement fetched.
                              Made on a send once the peer's prekey statement verified, and on a receive once a message from it passed every check
   seen                       ciphertext hash, sent_at, from, msg_id: 33 days (PROTOCOL §5)
-  outbox/                    each signed envelope line and its sealed bytes awaiting a receipt, re-POSTed unchanged
+  outbox/                    each signed envelope line awaiting a receipt, and nothing else: a seal is made for each post and never kept
   outbox/failed/             entries that can never be delivered: refused for good, or older than 33 days
   inbox/, quarantine/        accepted mail, one line of JSON each built from the checked fields; refused mail, never delivered (PROTOCOL §5).
                              Both named by the SHA-256 of the ciphertext as computed locally, never the server's id.
@@ -277,14 +277,14 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
 1. **Resolve a peer.**
    - Fetch `/identity`. At first contact check `sha256(identity document) == address`; a pin always wins.
    - Verify the prekey statement under a certificate of that identity (`PROTOCOL.md` §2b), and refuse a lower prekey serial, a lower certificate serial or an expired `not_after`. A new peer is pinned only after that.
-   - On `409 stale_prekey`, re-fetch and re-encrypt the same envelope.
+   - On `409 stale_prekey`, re-fetch and seal the same envelope again.
 2. **Send.**
    - Take a link, an address or one of the box's aliases as the destination: a name is 1 to 32 of `a-z`, `0-9`, `.`, `_` and `-`, so it is never an address or a link, and a name with two addresses names neither.
    - Build the envelope `{v, from, to, sent_at, msg_id, identity, body}`, with `subject`, `in_reply_to` and `supersedes` when the sender gives them (one that is not a `msg_id` is refused before anything is built). `identity` is the sender's identity document.
-   - Sign the envelope's line with the working key, in the recipient's namespace; put the signature after it, pad the two for the prekey's type so that the ciphertext is a whole number of blocks, and encrypt that with age to the prekey (`PROTOCOL.md` §4.3a, §4.4). The outbox keeps the signed line.
-   - Write the result to the outbox, then POST it with the prekey's two serials, its own and its certificate's (`prekey_serial` and `certificate_serial`, both required: the server takes mail only for the current prekey), carrying the box's pass.
-   - On a receipt, keep the envelope and the receipt in `sent/`, and only then delete the outbox entry: a crash in between posts it again, gets the original receipt and records it again. The echo box deletes its own: its state is in memory.
-   - A retry re-POSTs the same bytes. A failed entry never blocks the others; one that can never be delivered moves to `outbox/failed/`, and one older than 33 days, the TTL, is never posted (the server would take it; the recipient refuses it).
+   - Sign the envelope's line with the working key, in the recipient's namespace; put the signature after it, pad the two for the prekey's type so that the ciphertext is a whole number of blocks, and encrypt that with age to the prekey (`PROTOCOL.md` §4.3a, §4.4). The outbox keeps the signed line, and the seal is made for the post alone.
+   - POST it with the prekey's two serials, its own and its certificate's (`prekey_serial` and `certificate_serial`, both required: the server takes mail only for the current prekey), carrying the box's pass.
+   - On a receipt, keep the envelope and the receipt in `sent/`, and only then delete the outbox entry: a crash in between posts it again, as a new ciphertext the recipient delivers once. The echo box deletes its own: its state is in memory.
+   - A retry seals the envelope afresh, to what the box holds then (`PROTOCOL.md` §4.5): a message that waited goes under the recipient's statement in use, and a post whose answer was lost costs one more send. A failed entry never blocks the others; one that can never be delivered moves to `outbox/failed/`, and one older than 33 days, the TTL, is never posted (the server would take it; the recipient refuses it).
 3. **Receive.**
    - Take the lock, send a conditional GET, and drain every page.
    - Skip ids already acked. Fetch the rest, and treat a 404 as already gone.

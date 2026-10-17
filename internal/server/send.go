@@ -214,7 +214,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	if rlim.ReceiveBurst > 0 {
 		recv, ok, wait := s.receives.reserve(ctx, to.String(), s.now)
 		if !ok {
-			p := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail a minute: post it again after Retry-After (irongall outbox flush does, unchanged)", "the box has taken as much new mail as it takes for now")
+			p := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail a minute: post it again after Retry-After (irongall outbox flush does)", "the box has taken as much new mail as it takes for now")
 			p.retryAfter = wait
 			return p
 		}
