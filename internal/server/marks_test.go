@@ -3,10 +3,8 @@ package server
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -15,103 +13,54 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
-// zeroSubset returns indexes of a non-empty subset of xs whose XOR is zero,
-// by Gaussian elimination over GF(2)^64: what any sender can do with the
-// first 8 bytes of ids it chose, given 65 of them.
-func zeroSubset(xs []uint64) []int {
-	type row struct {
-		v    uint64
-		from map[int]bool
-	}
-	var basis [64]*row // by the highest bit set
-	for i, x := range xs {
-		r := &row{x, map[int]bool{i: true}}
-		for bit := 63; bit >= 0 && r.v != 0; bit-- {
-			if r.v>>bit&1 == 0 {
-				continue
-			}
-			b := basis[bit]
-			if b == nil {
-				basis[bit] = r
-				break
-			}
-			r.v ^= b.v
-			for k, in := range b.from {
-				if in {
-					r.from[k] = !r.from[k]
-				}
-			}
-		}
-		if r.v == 0 {
-			var out []int
-			for k, in := range r.from {
-				if in {
-					out = append(out, k)
-				}
-			}
-			return out
-		}
-	}
-	return nil
-}
-
-// A sender cannot make a box that holds mail look empty
-// (IronGall-dev/irongall-server#10): ciphertexts whose ids' first 8 bytes
-// XOR to zero, sent to an empty box, leave it a version and an ETag of its
-// own, and the owner's client lists and delivers them.
-func TestASenderCannotForgeAnEmptyBox(t *testing.T) {
+// A list carries no ETag and reads no If-None-Match (PROTOCOL.md §5.1):
+// every poll is a page with the box's count and poll_after, so no answer can
+// stand for an empty box's, and none leaves out when to poll next. It
+// replaces the test that a sender could not steer a box's version to an
+// empty one's (IronGall-dev/irongall-server#10), which an ETag made of that
+// version needed.
+func TestAListIsNeverNotModified(t *testing.T) {
 	l := relaxed()
 	l.PairCap, l.BoxCap = 0, 0
 	e := newEnv(t, l)
 	from, to := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
-	var bodies [][]byte
-	var prefixes []uint64
-	for range 70 {
+	poll := func(ifNoneMatch string) (*http.Response, protocol.MessageList) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, e.srv.URL+to.path("/messages"), nil)
+		req.Header.Set("Authorization", to.pass(1))
+		if ifNoneMatch != "" {
+			req.Header.Set("If-None-Match", ifNoneMatch)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var list protocol.MessageList
+		if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+			t.Fatalf("%d: %v", resp.StatusCode, err)
+		}
+		return resp, list
+	}
+	// "0-0000000000000000" is what an empty box's ETag was.
+	tags := []string{"", "*", `"0-0000000000000000"`, `W/"0-0000000000000000"`}
+	for _, tag := range tags {
+		if resp, list := poll(tag); resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != "" || list.Count != 0 || list.PollAfter != int64(l.PollAfter) {
+			t.Fatalf("an empty box, If-None-Match %q: %d, ETag %q, %+v", tag, resp.StatusCode, resp.Header.Get("ETag"), list)
+		}
+	}
+	const n = 3
+	for range n {
 		var ct bytes.Buffer
 		w, _ := age.Encrypt(&ct, to.keys[1].Recipient())
 		_, _ = io.WriteString(w, `{"v":1}`)
 		_ = w.Close()
-		id := sha256.Sum256(ct.Bytes())
-		bodies, prefixes = append(bodies, ct.Bytes()), append(prefixes, prefix8(id[:]))
+		e.want(e.do(http.MethodPost, to.path("/messages"), sealedTo(1, 1, ct.Bytes()), from.pass(1)), http.StatusCreated, "")
 	}
-	subset := zeroSubset(prefixes)
-	var x uint64
-	for _, i := range subset {
-		x ^= prefixes[i]
-	}
-	if len(subset) == 0 || x != 0 {
-		t.Fatalf("no subset of plain prefixes XORs to zero: %v", subset)
-	}
-	empty := e.do(http.MethodGet, to.path("/messages"), nil, to.pass(1))
-	e.want(empty, http.StatusOK, "")
-	one := uint64(1)
-	for _, i := range subset {
-		e.want(e.do(http.MethodPost, to.path("/messages"), protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: bodies[i]}, from.pass(1)), http.StatusCreated, "")
-	}
-	full := e.do(http.MethodGet, to.path("/messages"), nil, to.pass(1))
-	e.want(full, http.StatusOK, "")
-	if full.header.Get("ETag") == empty.header.Get("ETag") {
-		t.Fatalf("a box holding %d messages has the empty box's ETag %s", len(subset), full.header.Get("ETag"))
-	}
-	// Each half holds by itself: the count, and a version made of tags no
-	// sender can steer to zero.
-	var n int
-	var version uint64
-	if _, err := fmt.Sscanf(full.header.Get("ETag"), `"%d-%016x"`, &n, &version); err != nil || n != len(subset) || version == 0 {
-		t.Fatalf("the ETag %s: count %d, version %016x (%v), want %d and not zero", full.header.Get("ETag"), n, version, err, len(subset))
-	}
-	req, _ := http.NewRequest(http.MethodGet, e.srv.URL+to.path("/messages"), nil)
-	req.Header.Set("Authorization", to.pass(1))
-	req.Header.Set("If-None-Match", empty.header.Get("ETag"))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var list protocol.MessageList
-	_ = json.NewDecoder(resp.Body).Decode(&list)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || list.Count != int64(len(subset)) {
-		t.Fatalf("a poll with the empty box's ETag: %d, count %d, want 200 and %d", resp.StatusCode, list.Count, len(subset))
+	for _, tag := range tags {
+		if resp, list := poll(tag); resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != "" || list.Count != n || len(list.Messages) != n || list.PollAfter != int64(l.PollAfter) {
+			t.Fatalf("a box holding %d, If-None-Match %q: %d, ETag %q, %+v", n, tag, resp.StatusCode, resp.Header.Get("ETag"), list)
+		}
 	}
 }
 

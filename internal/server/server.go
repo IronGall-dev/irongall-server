@@ -40,8 +40,9 @@ type Config struct {
 	// peer is always the client.
 	TrustedProxies []netip.Prefix
 	// Names are the names clients call this server by: the host of its URL,
-	// lowercase, with its port if it has one. A pass is taken only on a
-	// request whose Host is one of them (PROTOCOL.md §6.1b). None: any Host
+	// lowercase, with its port only when that is not the scheme's default. A
+	// pass is taken only on a request whose Host, written so, is one of them
+	// (PROTOCOL.md §6.1b). None: any Host
 	// is taken, which is for the dev server and tests only, since a pass
 	// made for another server would then pass here.
 	Names []string
@@ -177,7 +178,7 @@ func (s *Server) Handler() http.Handler {
 		api.HandleFunc(r.pattern, s.handle(r.h))
 	}
 	mux := http.NewServeMux()
-	mux.Handle(linkRoute, s.publicPage(linkPage()))
+	mux.Handle(linkRoute, s.publicPage(s.linkPage()))
 	mux.Handle("/v1/", notStored(s.whenReady(api)))
 	return s.accessLog(s.dated(mux))
 }
@@ -227,16 +228,26 @@ func (s *Server) whenReady(h http.Handler) http.Handler {
 // clientIP is the address per-IP limits key on: the CF-Connecting-IP of a
 // request from a trusted proxy, otherwise the peer's own address.
 func (s *Server) clientIP(r *http.Request) string {
+	if s.fromProxy(r) {
+		if ip, err := netip.ParseAddr(strings.TrimSpace(r.Header.Get("CF-Connecting-IP"))); err == nil {
+			return ip.String()
+		}
+	}
+	return peerHost(r)
+}
+
+// fromProxy reports whether the request's peer is one of the trusted
+// proxies, whose headers about the client are believed.
+func (s *Server) fromProxy(r *http.Request) bool {
+	peer, err := netip.ParseAddr(peerHost(r))
+	return err == nil && slices.ContainsFunc(s.proxies, func(p netip.Prefix) bool { return p.Contains(peer.Unmap()) })
+}
+
+// peerHost is the address of the request's peer, without its port.
+func peerHost(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		host = r.RemoteAddr
-	}
-	peer, err := netip.ParseAddr(host)
-	if err != nil || !slices.ContainsFunc(s.proxies, func(p netip.Prefix) bool { return p.Contains(peer.Unmap()) }) {
-		return host
-	}
-	if ip, err := netip.ParseAddr(strings.TrimSpace(r.Header.Get("CF-Connecting-IP"))); err == nil {
-		return ip.String()
+		return r.RemoteAddr
 	}
 	return host
 }
@@ -322,14 +333,40 @@ func (p *pacedWriter) Write(b []byte) (int, error) {
 // Unwrap lets http.ResponseController reach the connection.
 func (p *pacedWriter) Unwrap() http.ResponseWriter { return p.ResponseWriter }
 
-// pathAddr reads the address in the URL path: 64 hex characters, folded to
-// lowercase.
-func pathAddr(r *http.Request) (protocol.Address, error) {
-	a, err := protocol.ParseAddress(strings.ToLower(r.PathValue("addr")))
+// pathAddr reads the address in the URL path, 64 lowercase hex characters:
+// one box has one URL, so any other form, uppercase among them, is no
+// address. Then it holds the query to params, the parameters the call takes
+// (queryOf).
+func pathAddr(r *http.Request, params ...string) (protocol.Address, error) {
+	a, err := protocol.ParseAddress(r.PathValue("addr"))
 	if err != nil {
-		return a, fail(protocol.CodeBadAddress, "an address is 64 hex characters", "the path does not name an address")
+		return a, fail(protocol.CodeBadAddress, "an address is 64 lowercase hex characters", "the path does not name an address")
+	}
+	if _, err := queryOf(r, params...); err != nil {
+		return a, err
 	}
 	return a, nil
+}
+
+// queryOf reads the query of a call that takes params: each at most once,
+// and no other (PROTOCOL.md §13). A parameter the call does not know, or one
+// given twice, is refused as a member a body should not hold is, and named
+// in member.
+func queryOf(r *http.Request, params ...string) (map[string]string, error) {
+	q, err := protocol.ParseQuery(r.URL.RawQuery, params...)
+	if err != nil {
+		return nil, queryProblem(err, "")
+	}
+	return q, nil
+}
+
+// queryProblem is the answer to a query a call does not take, with hint.
+func queryProblem(err error, hint string) error {
+	var qe *protocol.QueryError
+	if !errors.As(err, &qe) || qe.Param == "" {
+		return fail(protocol.CodeBadRequest, hint, "the query does not parse")
+	}
+	return fail(protocol.CodeBadRequest, hint, "the query parameter %s is not one this call takes, is given twice, or is not of its form", memberValue(qe.Param))
 }
 
 // decodeBody reads a JSON request body of at most limit bytes into v: exactly
@@ -564,7 +601,7 @@ func (s *Server) spendOwner(ctx context.Context, a protocol.Address) error {
 // is public about a box (PROTOCOL.md §4.1): with a pass it is the calling
 // box's, once the pass is checked; with none, its address's.
 func (s *Server) spendLookup(r *http.Request) error {
-	if r.Header.Get("Authorization") == "" {
+	if auth, one := authorization(r); one && auth == "" {
 		return s.spendPublic(r)
 	}
 	from, err := s.sender(r)

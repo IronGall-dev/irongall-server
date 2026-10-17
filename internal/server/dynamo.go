@@ -962,8 +962,7 @@ func (s *DynamoStore) DeleteFrom(ctx context.Context, box protocol.Address, from
 
 // List implements Store: a Query of the live index over its live key range.
 // A page read just after a write may miss it while memory's count has it;
-// the Go client saves an ETag only for an empty box, so it lists again at
-// its next poll.
+// a client lists at every poll, so the next one has it.
 func (s *DynamoStore) List(ctx context.Context, box protocol.Address, after *Cursor, limit int) ([]Header, error) {
 	lo := s.liveFrom()
 	in := s.liveQuery(box, lo, s.consistent)
@@ -1001,12 +1000,11 @@ func (s *DynamoStore) UseMarkKey(key [32]byte) { s.idx.key = key }
 
 // Count implements Store: from memory, after the box's load on its first
 // use.
-func (s *DynamoStore) Count(ctx context.Context, box protocol.Address) (int, uint64, error) {
+func (s *DynamoStore) Count(ctx context.Context, box protocol.Address) (int, error) {
 	if err := s.ensure(ctx, box); err != nil {
-		return 0, 0, err
+		return 0, err
 	}
-	n, v := s.idx.count(box, s.nowMs())
-	return n, v, nil
+	return s.idx.count(box, s.nowMs()), nil
 }
 
 // PairCount implements Store: from memory, after the box's load on its

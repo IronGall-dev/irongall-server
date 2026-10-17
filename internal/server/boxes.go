@@ -403,7 +403,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	if hasCerts {
 		err = required("revoked_certificates", req.RevokedCertificates, "revoked_certificates_signature", req.RevokedCertificatesSignature)
 	} else {
-		err = required("revocation", req.Revocation)
+		err = required("revocation_signature", req.Revocation)
 	}
 	if err != nil {
 		return err
@@ -506,7 +506,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 // deleteHeld deletes the mail of revoked box b while memory shows the box
 // holding any: a delete that failed when it was revoked is done again.
 func (s *Server) deleteHeld(ctx context.Context, b *Box) error {
-	n, _, err := s.store.Count(ctx, b.Addr)
+	n, err := s.store.Count(ctx, b.Addr)
 	if err != nil || n == 0 {
 		return err
 	}

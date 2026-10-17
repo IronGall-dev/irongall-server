@@ -34,7 +34,7 @@ func aclReply(t *testing.T, r reply) protocol.ACLDocument {
 // sealTo is a send to box to, as the server sees one: an age file to its
 // current prekey under both its serials. What is inside is the recipient's
 // to judge, so a test needs nothing more.
-func (e *env) sealTo(to *client.Box) protocol.SendRequest {
+func (e *env) sealTo(to *client.Box) sealed {
 	e.t.Helper()
 	b, err := e.store.Box(context.Background(), to.Address())
 	if err != nil {
@@ -52,7 +52,7 @@ func (e *env) sealTo(to *client.Box) protocol.SendRequest {
 	_, _ = io.WriteString(w, `{"v":1}`)
 	_ = w.Close()
 	serial, under := e.numbers(to.Address())
-	return protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &under, Ciphertext: ct.Bytes()}
+	return sealedTo(serial, under, ct.Bytes())
 }
 
 // A box's ACL is the box's own to read and replace, whole and only upward;
@@ -207,7 +207,7 @@ func TestACLDenyPurges(t *testing.T) {
 	if count(a) != 0 || count(c) != 1 {
 		t.Fatalf("after denying a: %d from a, %d from c", count(a), count(c))
 	}
-	if n, _, err := e.store.Count(ctx, b.Address()); err != nil || n != 1 {
+	if n, err := e.store.Count(ctx, b.Address()); err != nil || n != 1 {
 		t.Fatalf("the box holds %d, %v", n, err)
 	}
 	retry := e.do("POST", to+"/messages", first, e.pass(a))
@@ -219,7 +219,7 @@ func TestACLDenyPurges(t *testing.T) {
 
 	// Deny "*": everything goes, and nothing more comes.
 	e.want(e.do("PUT", to+"/acl", aclOf(2, []string{"*"}, []string{"*"}), e.pass(b)), 200, "")
-	if n, _, err := e.store.Count(ctx, b.Address()); err != nil || n != 0 {
+	if n, err := e.store.Count(ctx, b.Address()); err != nil || n != 0 {
 		t.Fatalf("after denying everyone the box holds %d, %v", n, err)
 	}
 	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(c)), 403, protocol.CodeSenderNotAllowed)

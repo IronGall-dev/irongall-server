@@ -13,8 +13,7 @@ import (
 // MemStore is the dev server's store: everything in memory, nothing
 // persisted. Expired messages and dedupe records vanish at their ExpiresAt.
 type MemStore struct {
-	now     func() time.Time
-	markKey [32]byte // set once, before use (UseMarkKey)
+	now func() time.Time
 
 	mu       sync.Mutex
 	boxes    map[protocol.Address]*Box
@@ -251,19 +250,15 @@ func (s *MemStore) DeleteFrom(_ context.Context, box protocol.Address, from func
 	return nil
 }
 
-// UseMarkKey implements Store.
-func (s *MemStore) UseMarkKey(key [32]byte) { s.markKey = key }
+// UseMarkKey implements Store. This store keeps each message by its whole
+// id, and tags none.
+func (s *MemStore) UseMarkKey([32]byte) {}
 
 // Count implements Store.
-func (s *MemStore) Count(_ context.Context, box protocol.Address) (int, uint64, error) {
+func (s *MemStore) Count(_ context.Context, box protocol.Address) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var v uint64
-	m := s.live(box)
-	for id := range m {
-		v ^= markTag(&s.markKey, id)
-	}
-	return len(m), v, nil
+	return len(s.live(box)), nil
 }
 
 // PairCount implements Store.

@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
@@ -41,8 +42,10 @@ func TestNoPagesButTheLinkPage(t *testing.T) {
 }
 
 // A box's link opens a page for any 64 lowercase hex characters, the form
-// clients take, while the API is still 503: fixed text and the address, kept
-// out of Referer headers and search engines. Anything else is 404.
+// clients take, while the API is still 503: fixed text, the address and the
+// link, kept out of Referer headers and search engines. Anything else is
+// 404. A server with no names of its own (the dev server's) names itself as
+// the request does.
 func TestLinkPage(t *testing.T) {
 	keys, _ := NewDevKeys()
 	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Ready: func() bool { return false }}).Handler()))
@@ -66,7 +69,7 @@ func TestLinkPage(t *testing.T) {
 		h.Get("Referrer-Policy") != "no-referrer" || h.Get("X-Robots-Tag") != "noindex" || !strings.HasPrefix(h.Get("Content-Security-Policy"), "default-src 'none';") {
 		t.Fatalf("GET /to/<address>: %d %v", resp.StatusCode, h)
 	}
-	for _, want := range []string{"<code>" + a + "</code>", "echo hello | irongall send https://irongall.dev/to/" + a + "</code>", `<meta name="robots" content="noindex">`} {
+	for _, want := range []string{"<code>" + a + "</code>", "echo hello | irongall send " + srv.URL + "/to/" + a + "</code>", `<meta property="og:url" content="` + srv.URL + "/to/" + a + `">`, `<meta name="robots" content="noindex">`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("the page lacks %q", want)
 		}
@@ -87,13 +90,64 @@ func TestLinkPage(t *testing.T) {
 	}
 }
 
+// The page names the server that serves it, never one server for all: by
+// the name the request calls it by when that is one of its own, and else by
+// the first of them, and by the scheme the caller reached it by, which a
+// trusted proxy in front says in X-Forwarded-Proto and nobody else can.
+func TestTheLinkPageNamesItsOwnServer(t *testing.T) {
+	keys, _ := NewDevKeys()
+	for _, c := range []struct {
+		name    string
+		proxies []netip.Prefix
+		host    string
+		proto   string
+		want    string
+	}{
+		{"its own name, through TLS in front", loopback, "mail.example", "https", "https://mail.example"},
+		{"its other name, with a port", loopback, "mail.example:8443", "https", "https://mail.example:8443"},
+		{"the default port left out, in any case", loopback, "MAIL.example:443", "HTTPS", "https://mail.example"},
+		{"plain http in front", loopback, "mail.example", "http", "http://mail.example"},
+		{"a scheme that is neither", loopback, "mail.example", "gopher", "http://mail.example"},
+		{"the first of a list", loopback, "mail.example", "https, http", "https://mail.example"},
+		{"a name not its own", loopback, "evil.example", "https", "https://mail.example"},
+		{"no proxy is trusted", nil, "mail.example", "https", "http://mail.example"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(),
+				Names: []string{"mail.example", "mail.example:8443"}, TrustedProxies: c.proxies}).Handler()))
+			defer srv.Close()
+			a := strings.Repeat("0a", 32)
+			req, _ := http.NewRequest(http.MethodGet, srv.URL+"/to/"+a, nil)
+			req.Host = c.host
+			req.Header.Set("X-Forwarded-Proto", c.proto)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			link := c.want + "/to/" + a
+			if resp.StatusCode != http.StatusOK || !strings.Contains(string(b), "<code>echo hello | irongall send "+link+"</code>") ||
+				!strings.Contains(string(b), `<meta property="og:url" content="`+link+`">`) {
+				t.Errorf("the page does not name %s:\n%s", link, b)
+			}
+		})
+	}
+}
+
+var loopback = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
+
 // The page's command is the client README's: the echo box's link renders to
-// a line of the README, at the address the client code carries.
+// a line of the README, at the address the client code carries, on a server
+// called irongall.dev through TLS in front of it.
 func TestLinkPageCommandIsInTheClientREADME(t *testing.T) {
 	keys, _ := NewDevKeys()
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed()}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Names: []string{"irongall.dev"}, TrustedProxies: loopback}).Handler()))
 	defer srv.Close()
-	resp, err := http.Get(srv.URL + "/to/" + client.EchoAddress)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/to/"+client.EchoAddress, nil)
+	req.Host = "irongall.dev"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

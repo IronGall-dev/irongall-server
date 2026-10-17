@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	htmltemplate "html/template"
 	"net/http"
+	"strings"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
@@ -21,12 +22,12 @@ const pageMaxAge = "public, max-age=300"
 var toHTML string
 
 // linkPage serves the page a box's link opens, <server>/to/<address>: what
-// irongall is, for whoever was handed the link. It is fixed text and the
-// address, never text a box supplied, for any 64 lowercase hex characters,
-// the form clients take; it reads no store, so it answers before the API is
-// ready. The link is a send capability: the page keeps it out of Referer
-// headers and search engines.
-func linkPage() http.Handler {
+// irongall is, for whoever was handed the link. It is fixed text, the
+// address and the link itself, never text a box supplied, for any 64
+// lowercase hex characters, the form clients take; it reads no store, so it
+// answers before the API is ready. The link is a send capability: the page
+// keeps it out of Referer headers and search engines.
+func (s *Server) linkPage() http.Handler {
 	t := htmltemplate.Must(htmltemplate.New("to.html").Option("missingkey=error").Parse(toHTML))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a, err := protocol.ParseAddress(r.PathValue("addr"))
@@ -35,7 +36,7 @@ func linkPage() http.Handler {
 			return
 		}
 		var b bytes.Buffer
-		if err := t.Execute(&b, struct{ Addr string }{a.String()}); err != nil {
+		if err := t.Execute(&b, struct{ Addr, Link string }{a.String(), s.linkBase(r) + protocol.LinkPath + a.String()}); err != nil {
 			http.Error(w, "the page did not render", http.StatusInternalServerError)
 			return
 		}
@@ -48,4 +49,35 @@ func linkPage() http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		w.Write(b.Bytes()) //nolint:errcheck,gosec // the client went away
 	})
+}
+
+// linkBase is this server as a box's link names it: by the scheme the caller
+// reached it by, and by the name the caller called it by when that is one of
+// its own (serverName), as a client's base URL names it; called by any other
+// name, by the first of its own. So each server's page names that server,
+// and never one a request made up.
+func (s *Server) linkBase(r *http.Request) string {
+	name, ours := s.serverName(r)
+	if !ours {
+		name = s.names[0] // with no names configured, every name is ours
+	}
+	return s.scheme(r) + "://" + name
+}
+
+// scheme is the scheme the caller reached this server by: https over TLS to
+// this server, or what a trusted proxy says in X-Forwarded-Proto, which TLS
+// ending in front sets to the scheme its client used (Cloudflare does, and
+// overwrites a client's own); otherwise http. From any other peer the header
+// is ignored, as CF-Connecting-IP is.
+func (s *Server) scheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if s.fromProxy(r) {
+		first, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
+		if p := strings.ToLower(strings.TrimSpace(first)); p == "https" || p == "http" {
+			return p
+		}
+	}
+	return "http"
 }

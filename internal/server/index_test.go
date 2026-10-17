@@ -42,8 +42,8 @@ func TestIndex(t *testing.T) {
 		x.insert(box, k1, now)
 		x.insert(box, k1, now) // the stream's echo of our own write
 		x.insert(box, k2, now)
-		if n, v := x.count(box, now); n != 2 || v != 1^2 {
-			t.Fatalf("count %d, version %d", n, v)
+		if n := x.count(box, now); n != 2 || !x.holds(box, k1.tag, now) || !x.holds(box, k2.tag, now) {
+			t.Fatalf("count %d", n)
 		}
 		if n, oldest := x.pair(box, 10, now); n != 2 || oldest != k1.exp {
 			t.Fatalf("pair %d, oldest %d", n, oldest)
@@ -58,7 +58,7 @@ func TestIndex(t *testing.T) {
 		x.insert(box, k1, now)
 		x.remove(box, k1.tag, k1.exp, now, false) // our ack
 		x.insert(box, k1, now)                    // the stream's late insert
-		if n, _ := x.count(box, now); n != 0 {
+		if n := x.count(box, now); n != 0 {
 			t.Fatal("the acked message came back")
 		}
 		x.remove(box, k1.tag, k1.exp, now, true) // the removal's echo clears the tomb
@@ -71,7 +71,7 @@ func TestIndex(t *testing.T) {
 		x := loaded(t, box, boxRead{})
 		x.remove(box, k1.tag, k1.exp, now, false)
 		x.insert(box, k1, now)
-		if n, _ := x.count(box, now); n != 0 {
+		if n := x.count(box, now); n != 0 {
 			t.Fatal("the acked message came back")
 		}
 	})
@@ -91,14 +91,14 @@ func TestIndex(t *testing.T) {
 		x := loaded(t, box, boxRead{})
 		x.insert(box, k1, now)
 		x.insert(box, k2, now)
-		if n, v := x.count(box, k1.exp-1); n != 2 || v != 1^2 {
+		if n := x.count(box, k1.exp-1); n != 2 || !x.holds(box, k1.tag, k1.exp-1) || !x.holds(box, k2.tag, k1.exp-1) {
 			t.Fatalf("before expiry: %d", n)
 		}
-		if n, v := x.count(box, k1.exp); n != 1 || v != 2 {
-			t.Fatalf("at expiry: %d, version %d", n, v)
+		if n := x.count(box, k1.exp); n != 1 || !x.holds(box, k2.tag, k1.exp) {
+			t.Fatalf("at expiry: %d", n)
 		}
 		x.insert(box, mark{tag: 3, id: 3, exp: now}, now)
-		if n, _ := x.count(box, now); n != 1 {
+		if n := x.count(box, now); n != 1 {
 			t.Fatal("an expired insert counted")
 		}
 	})
@@ -110,7 +110,7 @@ func TestIndex(t *testing.T) {
 		again := mark{tag: k1.tag, id: k1.id, from: k1.from, exp: k1.exp + 1000}
 		x.insert(box, again, k1.exp)
 		x.remove(box, k1.tag, k1.exp, k1.exp, true)
-		if n, _ := x.count(box, k1.exp); n != 1 {
+		if n := x.count(box, k1.exp); n != 1 {
 			t.Fatal("the resent message was removed")
 		}
 	})
@@ -157,7 +157,7 @@ func TestIndexLoad(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if n, _ := x.count(box, now); n != 0 {
+		if n := x.count(box, now); n != 0 {
 			t.Fatal("a change before the load was kept")
 		}
 		if st, _ := x.standing(box); st.State != Active {
@@ -178,7 +178,7 @@ func TestIndexLoad(t *testing.T) {
 			})
 		}()
 		<-reading
-		if n, _ := x.count(box, now); n != 0 {
+		if n := x.count(box, now); n != 0 {
 			t.Fatal("counted while loading")
 		}
 		x.remove(box, k1.tag, k1.exp, now, true) // acked meanwhile
@@ -188,8 +188,8 @@ func TestIndexLoad(t *testing.T) {
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
-		if n, v := x.count(box, now); n != 1 || v != k2.id {
-			t.Fatalf("count %d, version %d: the queued changes were not applied after the load", n, v)
+		if n := x.count(box, now); n != 1 || !x.holds(box, k2.tag, now) {
+			t.Fatalf("count %d: the queued changes were not applied after the load", n)
 		}
 		if st, _ := x.standing(box); st.Cert != [32]byte{1} {
 			t.Fatal("the queued standing was not applied")
@@ -250,7 +250,7 @@ func TestIndexLoad(t *testing.T) {
 		if err := x.ensure(ctx, box, func() (boxRead, error) { return boxRead{exists: true}, nil }); err != nil {
 			t.Fatal(err)
 		}
-		if n, _ := x.count(box, now); n != 0 {
+		if n := x.count(box, now); n != 0 {
 			t.Fatal("a failed load's queued change was applied")
 		}
 		if _, ok := x.standing(box); !ok {

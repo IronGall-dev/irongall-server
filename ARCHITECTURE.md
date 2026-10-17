@@ -72,7 +72,7 @@ flowchart LR
 
 | Layer | Holds | Size (estimate) | Used for | Under memory pressure |
 |---|---|---|---|---|
-| **1. Counts** — always resident | For each box WITH mail, one 40-byte mark per live message (a keyed tag, id, sender, expiry, a count of its fetches) | 48 to 64 B per live message, plus 271 B per loaded box on an Ed25519 identity (measured 2026-10-15, with the tag; 32 to 51 B before it) | **Every poll:** the exact count, the ETag, the per-pair and box caps | Never shed: it IS the poll. If it doesn't fit, that's capacity, because every process holds all of it |
+| **1. Counts** — always resident | For each box WITH mail, one 40-byte mark per live message (a keyed tag, id, sender, expiry, a count of its fetches) | 48 to 64 B per live message, plus 271 B per loaded box on an Ed25519 identity (measured 2026-10-15, with the tag; 32 to 51 B before it) | **Every poll:** the exact count, the per-pair and box caps | Never shed: it IS the poll. If it doesn't fit, that's capacity, because every process holds all of it |
 | **2. Listings** — optional | Full metadata for recently listed boxes: id, sender, size, received_at | ~100 B per message | Serving a list from memory | Shrinks first (an LRU under a byte budget), down to off; lists then come from DynamoDB |
 
 ```go
@@ -85,8 +85,7 @@ type mark struct { // layer 1
 }
 
 type Mailbox struct { // layer 1, a sketch: the marks of a box with mail. A loaded box with none holds only its standing
-	marks   []mark // live messages only
-	version uint64 // XOR of the tags: with the count, the ETag, identical on every process
+	marks []mark // live messages only
 }
 
 type Listing struct { // layer 2: optional, LRU under a byte budget
@@ -100,16 +99,15 @@ type Listing struct { // layer 2: optional, LRU under a byte budget
 - messages expire with no event at all.
 
 A set keyed by message id absorbs all three. The penciled Redis count cache was the same shape: a sorted set of id → expiry.
-- **A mark is known by a keyed tag, not by its id's first eight bytes.** The id is the SHA-256 of a ciphertext its sender chose, so those bytes are the sender's to steer: XOR is linear, and among 65 messages a sender finds a subset whose prefixes XOR to zero by elimination, with no hashing work, which made a full box's version an empty one's; and an id that only shared a held message's prefix passed for it, so a forged ack wrote to storage (this repo's #10). The tag is HMAC-SHA-256 of the whole id under a key derived from the server's keys (HKDF), which nobody outside the server can compute, and the ETag carries the count beside the version. A new current key changes every box's version once, and a client lists again.
-- The same marks give the per-pair cap (`from`) and the ETag (`version`), so the poll needs nothing else.
+- **A mark is known by a keyed tag, not by its id's first eight bytes.** The id is the SHA-256 of a ciphertext its sender chose, so those bytes are the sender's to steer: an id that only shared a held message's prefix passed for it, so a forged ack wrote to storage (this repo's #10). The tag is HMAC-SHA-256 of the whole id under a key derived from the server's keys (HKDF), which nobody outside the server can compute. The same issue found that a box's version, the XOR of the prefixes, could be steered to an empty box's, which mattered while the list's `ETag` was made of it: since 2026-10-17 the list has no `ETag` and no `304`, and memory keeps no version.
+- The same marks give the per-pair cap (`from`), so the poll needs nothing else.
 
 **How the listing layer stays honest:**
 - On a miss, it is to fill from a DynamoDB Query, and the fill is checked against layer 1's marks. A fill that raced a stream update is dropped, not cached.
 - A stream insert updates a cached listing. For an uncached box, it only touches the marks.
 - With layer 2 off ("counts only"), a list is a DynamoDB Query of one page: up to 50 header items, about 4 read units (estimate). It reads only the live key range (`received_at` > now − TTL), so a header past its expiry that the TTL has not yet deleted is never read.
-- **Request-path reads are eventually consistent.** A stale read costs a retry or one poll: a page read just after a write can miss it while memory counts it, and the Go client saves an ETag only for an empty box, so it lists again next poll. The conditional writes keep the data right. **Only a box's load into memory is strongly consistent** (§ Startup).
-  - With ETag/`304`, a well-behaved client lists only when its mailbox changed, so that's about one Query per message.
-  - A client that ignores ETags pays a Query per poll, capped by the poll rate and the page size.
+- **Request-path reads are eventually consistent.** A stale read costs a retry or one poll: a page read just after a write can miss it while memory counts it, and a client lists at every poll, so the next one has it. The conditional writes keep the data right. **Only a box's load into memory is strongly consistent** (§ Startup).
+  - The list has no `ETag` and no `304` (`PROTOCOL.md` §5.1), which would carry no `poll_after`, so a poll of a box that holds mail is a Query of one page, capped by the poll rate and the page size. An empty box's poll is memory's count alone, either way.
 
 **The rest of each process's memory:**
 - the standing of every box this process has used: its state, its identity's public key, the SHA-256 of its current certificate, and the record's rev. It is what a pass is checked against with no read (`PROTOCOL-SERVER.md` §6.1b);
@@ -125,10 +123,10 @@ That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go map
 
 | Call | Touches | Notes |
 |---|---|---|
-| Poll / list `GET …/messages` | The pass, from memory. Layer 1 for the count and ETag; the page from one DynamoDB Query (from layer 2 once it is built) | Empty: the precomputed empty body. `If-None-Match` equal to the version: `304`. Every list response carries `count`, an `ETag`, pages of 50 and `poll_after` (the delivery contract, decided; `PROTOCOL.md` §5.1) |
-| Fetch `GET …/messages/<id>` | Memory first: an id the box does not hold is `404` with no storage call, and a fetch of a message this process has served before takes from the box's allowance (`PROTOCOL.md` §5.7). Then DynamoDB GetItem of the message item by `box, id`, S3 Express GET | Memory can say a message is absent, never that it is there: the read decides. A live item whose body is gone leaves the list and is answered as gone |
+| Poll / list `GET …/messages` | The pass, from memory. Layer 1 for the count; the page from one DynamoDB Query (from layer 2 once it is built) | Empty: the empty page, built from the count alone. Every list response is a page, with `count`, up to 50 messages and `poll_after`, and no `ETag` (the delivery contract, decided; `PROTOCOL.md` §5.1) |
+| Fetch `GET …/messages/<id>` | Memory first: an id the box does not hold is `404` with no storage call, and a fetch of a message this process has served before takes from the box's allowance (`PROTOCOL.md` §5.7). Then DynamoDB GetItem of the message item by `box, id`, S3 Express GET | The answer is the ciphertext's bytes, `application/octet-stream`, and nothing else: who sent it and when are the list's. Memory can say a message is absent, never that it is there: the read decides. A live item whose body is gone leaves the list and is answered as gone |
 | Ack `DELETE …/messages/<id>` | Memory first, as for a fetch (an id not held is `404`); then S3 DELETE, then a conditional UpdateItem that removes `live` (`PROTOCOL-SERVER.md` §7) | Both steps are safe to repeat. Applied to local memory at once; the stream tells the others |
-| Send `POST /v1/<addr>/messages` | The sender's pass, before the body is read; its record for its account (the LRU, or one GetItem); GetItem (the dedupe check), S3 PUT, then one conditional PutItem: the header and the dedupe record are one item (`PROTOCOL-SERVER.md` §7) | Cheapest check first (`PROTOCOL.md` §4.5); the caps read layer 1. No signature on the message is checked: it is inside the ciphertext |
+| Send `POST /v1/<addr>/messages?prekey_serial=…&certificate_serial=…` | The sender's pass, before the body is read; its record for its account (the LRU, or one GetItem); GetItem (the dedupe check), S3 PUT, then one conditional PutItem: the header and the dedupe record are one item (`PROTOCOL-SERVER.md` §7) | Cheapest check first (`PROTOCOL.md` §4.5): the address and the serials in the query before the body, which is the ciphertext's bytes, read to the sender's cap; the caps read layer 1. No signature on the message is checked: it is inside the ciphertext |
 | Register `PUT /v1/<addr>` | Four signature checks (the certificate and the statement under it, then the pass under it and the certificate again), then DynamoDB PutItem | The box is in use from this one write |
 | New prekey `PUT …/prekey` | The record (the LRU, or one GetItem), the same four checks, DynamoDB UpdateItem | The authority is the statement's own certificate and a pass under it: no pass under the box's current certificate is needed |
 | Read a box `GET /v1/<addr>` | The LRU; DynamoDB on a miss. A revoked box is `410` with the record it keeps | Never cached in front of the server: every API answer says `no-store` (`PROTOCOL-SERVER.md` §6.3, §12) |
@@ -143,7 +141,7 @@ sequenceDiagram
   participant D as DynamoDB
   participant P2 as irongalld (others)
   participant B as recipient
-  A->>P1: POST /v1/B/messages with prekey_serial, certificate_serial and ciphertext, carrying A's pass
+  A->>P1: POST /v1/B/messages?prekey_serial&certificate_serial, the ciphertext as the body, carrying A's pass
   P1->>P1: check the pass (from memory once seen), parse, stanza check
   P1->>D: GetItem B, id (dedupe)
   P1->>S3: PUT B/id
@@ -151,8 +149,8 @@ sequenceDiagram
   P1->>P1: apply to its own memory
   P1->>A: 201 id, received_at, expires_at, and Location
   D-->>P2: stream record (about 1 to 2 s)
-  B->>P2: GET /v1/B/messages with If-None-Match
-  P2->>B: 200 with count and ETag, or 304
+  B->>P2: GET /v1/B/messages
+  P2->>B: 200 with count, a page and poll_after
 ```
 
 ### Following the stream
@@ -258,12 +256,11 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
                              Plaintext, like inbox/, and like it never pruned by a client
   aliases                    the box's own names for peers, "<name> <address>" lines: never sent anywhere, and a name is never moved, only removed
   lock/                      the box's lock, held by each command that writes the box: a directory, with the Go client's flocked lock/pid inside
-  etag                       the poll ETag (the Go client)
   revoked.sig                this box's own revocation, once it has met one that verifies: the box is finished
   revoked-certs.json         this box's own revocation of its certificates, once it has published one: the record that carries it, one line of JSON
 ```
 
-**`irongall.sh` uses this layout**, with no `etag`, with `peers/<addr>/signers` beside each pinned identity, and with scratch files in the box's root that mean nothing between commands (`*.json`, `msg.*`, `self.*`, `new.doc`, `body.txt`); neither client writes a revocation of its own box unasked, and each keeps one it has verified (`peers/<addr>/revoke.sig`), and the highest revocation of a peer's certificates it has verified (`peers/<addr>/revoked-certs.json`, the record that carries it). And `test/interop.sh` runs one box with both clients.
+**`irongall.sh` uses this layout**, with `peers/<addr>/signers` beside each pinned identity, and with scratch files in the box's root that mean nothing between commands (`*.json`, `msg.*`, `self.*`, `new.doc`, `body.txt`); neither client writes a revocation of its own box unasked, and each keeps one it has verified (`peers/<addr>/revoke.sig`), and the highest revocation of a peer's certificates it has verified (`peers/<addr>/revoked-certs.json`, the record that carries it). And `test/interop.sh` runs one box with both clients.
 
 | Client | What it is | Built on |
 |---|---|---|
@@ -286,8 +283,8 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
    - On a receipt, keep the envelope and the receipt in `sent/`, and only then delete the outbox entry: a crash in between posts it again, as a new ciphertext the recipient delivers once. The echo box deletes its own: its state is in memory.
    - A retry seals the envelope afresh, to what the box holds then (`PROTOCOL.md` §4.5): a message that waited goes under the recipient's statement in use, and a post whose answer was lost costs one more send. A failed entry never blocks the others; one that can never be delivered moves to `outbox/failed/`, and one older than 33 days, the TTL, is never posted (the server would take it; the recipient refuses it).
 3. **Receive.**
-   - Take the lock, send a conditional GET, and drain every page.
-   - Skip ids already acked. Fetch the rest, and treat a 404 as already gone.
+   - Take the lock, list, and drain every page.
+   - Skip ids already acked. Fetch the rest, and treat a 404 as already gone. A fetch answers the ciphertext alone, of the size its list entry gave; the sender, on the server's word, and the times are the entry's.
    - Decrypt, then check what was decrypted in the order of `PROTOCOL.md` §5: its layout; the envelope's line as one JSON object, UTF-8, its keys matched exactly and none twice (so no two readers take different values from its fields; the body is the sender's own JSON, passed on as it is); the identity document it carries, and that `from` is its hash; the signature over the line exactly as decrypted, under a certificate of that identity. The server is asked nothing about a sender.
    - Then the rest of the envelope: `v` the number 1, the inner `to`, and the 33-day `sent_at` window; that the server's `from` is the verified sender; the seen-set and `(from, msg_id)`; and that the server's id is the ciphertext's SHA-256.
    - Deliver, then ack, both after the delivery is on disk (fsync). Print or pass on one line of JSON built from the checked fields, never the sender's bytes (the CLI's `mail` line, the client README's § What it prints), with U+0085, U+2028 and U+2029 escaped (Python's `splitlines` and Node's `readline` end lines there). A crash between storing and recording as seen delivers again, never loses: consumers de-duplicate on `from` + `msg_id`. Refused mail is quarantined and acked, and never blocks its claimed sender.

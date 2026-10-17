@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -242,7 +241,7 @@ func TestAccounts(t *testing.T) {
 		e.want(e.do(http.MethodDelete, r.path("/account"), nil, pass), 204, "")
 		// Over the sender's own cap, a send is refused before its body is
 		// read: here, before the server finds it is no age file.
-		e.want(e.do(http.MethodPost, r.path("/messages"), protocol.SendRequest{Ciphertext: make([]byte, 16384)}, pass), 413, protocol.CodeTooLarge)
+		e.want(e.do(http.MethodPost, r.path("/messages"), sealedTo(1, 1, make([]byte, 16384)), pass), 413, protocol.CodeTooLarge)
 	})
 }
 
@@ -359,17 +358,15 @@ func until(t *testing.T, ok func(i int) bool) {
 // read that far.
 func TestLargeReadsTakeTurns(t *testing.T) {
 	l := relaxed()
-	l.MaxSize, l.AccountMaxSize = 16<<10, 64<<10 // bodies read at once up to ~25 KB, at most ~91 KB
+	l.MaxSize, l.AccountMaxSize = 16<<10, 64<<10 // bodies read at once up to 16 KiB, at most 64 KiB
 	e := newEnv(t, l)
 	_, key := accountEnv(t, e, true, 1)
 	lifted, free, to := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic)
 	adopt(t, lifted, key)
 	post := func(pass string, size int, wait time.Duration) (int, error) {
-		one := uint64(1)
-		j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: make([]byte, size)})
 		ctx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String()+"/messages", bytes.NewReader(j))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String()+"/messages?"+sealedTo(1, 1, nil).Encode(), bytes.NewReader(make([]byte, size)))
 		if pass != "" {
 			req.Header.Set("Authorization", pass)
 		}
@@ -410,7 +407,7 @@ func TestLargeReadsTakeTurns(t *testing.T) {
 // is read at once, not after the stalled one's peer gives up.
 func TestAStalledBodyGivesTheLargeReadBack(t *testing.T) {
 	l := relaxed()
-	l.MaxSize, l.AccountMaxSize = 16<<10, 64<<10 // bodies read at once up to ~25 KB, at most ~91 KB
+	l.MaxSize, l.AccountMaxSize = 16<<10, 64<<10 // bodies read at once up to 16 KiB, at most 64 KiB
 	l.BodyTimeout, l.BodyMinRate = 300*time.Millisecond, 1<<20
 	e := newEnv(t, l)
 	_, key := accountEnv(t, e, true, 1)
@@ -422,14 +419,13 @@ func TestAStalledBodyGivesTheLargeReadBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	_, _ = io.WriteString(conn, "POST /v1/"+to.Address().String()+"/messages HTTP/1.1\r\nHost: "+addr+"\r\nAuthorization: "+e.pass(lifted)+
-		"\r\nContent-Type: application/json\r\nContent-Length: 60000\r\n\r\n"+strings.Repeat("a", 30000)) // past the free size, then nothing
+	query := sealedTo(1, 1, nil).Encode()
+	_, _ = io.WriteString(conn, "POST /v1/"+to.Address().String()+"/messages?"+query+" HTTP/1.1\r\nHost: "+addr+"\r\nAuthorization: "+e.pass(lifted)+
+		"\r\nContent-Type: application/octet-stream\r\nContent-Length: 60000\r\n\r\n"+strings.Repeat("a", 30000)) // past the free size, then nothing
 	time.Sleep(50 * time.Millisecond) // the stalled send holds the large read
-	one := uint64(1)
-	j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: make([]byte, 30000)})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String()+"/messages", bytes.NewReader(j))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String()+"/messages?"+query, bytes.NewReader(make([]byte, 30000)))
 	req.Header.Set("Authorization", e.pass(lifted))
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
@@ -454,11 +450,9 @@ func TestAWaitForTheLargeReadIsBounded(t *testing.T) {
 	adopt(t, lifted, key)
 	e.server.largeRead <- struct{}{} // another large send is being read
 	defer func() { <-e.server.largeRead }()
-	one := uint64(1)
-	j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: make([]byte, 30000)})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String()+"/messages", bytes.NewReader(j))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String()+"/messages?"+sealedTo(1, 1, nil).Encode(), bytes.NewReader(make([]byte, 30000)))
 	req.Header.Set("Authorization", e.pass(lifted))
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)

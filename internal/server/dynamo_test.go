@@ -159,7 +159,7 @@ func TestCrashAfterTheBody(t *testing.T) {
 func TestRetryAfterAckIsNotRedelivered(t *testing.T) {
 	e, s := dynamoEnv(t)
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
+	sent := capture(e, "/v1/"+b.Address().String())
 	send(t, a, b, "once")
 	e.setMiddle(nil)
 	receive(t, b)
@@ -168,22 +168,20 @@ func TestRetryAfterAckIsNotRedelivered(t *testing.T) {
 	if r := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a)); r.status != http.StatusOK {
 		t.Fatalf("retry after the ack: %d %s", r.status, r.body)
 	}
-	if n, _, _ := s.Count(context.Background(), b.Address()); n != 0 {
+	if n, _ := s.Count(context.Background(), b.Address()); n != 0 {
 		t.Fatal("the retry brought back an acked message")
 	}
 	// In the table, too: memory's tomb for the ack would hide a message the
 	// retry listed again, until the stream brought it. No record holds a
 	// signature.
-	var req protocol.SendRequest
-	_ = json.Unmarshal(*sent, &req)
-	it := s.stored(t, b.Address(), sha256.Sum256(req.Ciphertext))
+	it := s.stored(t, b.Address(), sha256.Sum256(sent.ciphertext))
 	if _, ok := it["live"]; ok || it == nil {
 		t.Fatalf("after the ack and the retry: %v", it)
 	}
 	if _, ok := it["sig"]; ok {
 		t.Fatal("a message's record holds a signature")
 	}
-	id := sha256.Sum256(req.Ciphertext)
+	id := sha256.Sum256(sent.ciphertext)
 	if s.bodyExists(t, b.Address(), id) {
 		t.Fatal("the ack left the body")
 	}
@@ -205,7 +203,7 @@ func TestCrashBetweenAnAcksDeletes(t *testing.T) {
 	if err == nil || res == nil || len(res.Delivered) != 1 {
 		t.Fatalf("first drain: %v", err)
 	}
-	if n, _, _ := s.Count(ctx, b.Address()); n != 1 {
+	if n, _ := s.Count(ctx, b.Address()); n != 1 {
 		t.Fatal("the message left the list with the body")
 	}
 	// The client acks again on its next drain, and it leaves the list.
@@ -213,7 +211,7 @@ func TestCrashBetweenAnAcksDeletes(t *testing.T) {
 	if len(res.Delivered) != 0 || len(res.Duplicates) != 0 || len(res.Refused) != 0 {
 		t.Fatalf("second drain: %+v", res)
 	}
-	if n, _, _ := s.Count(ctx, b.Address()); n != 0 {
+	if n, _ := s.Count(ctx, b.Address()); n != 0 {
 		t.Fatal("not acked on the second drain")
 	}
 }
@@ -235,7 +233,7 @@ func TestHeaderWithoutBodyIsGone(t *testing.T) {
 	if s.listed(t, b.Address(), id) {
 		t.Fatal("the bodiless message is still listed")
 	}
-	if n, _, _ := s.Count(ctx, b.Address()); n != 0 {
+	if n, _ := s.Count(ctx, b.Address()); n != 0 {
 		t.Fatal("still counted")
 	}
 }
@@ -285,7 +283,7 @@ func TestTwoProcesses(t *testing.T) {
 		return 0
 	}
 	count := func(s Store) int {
-		n, _, _ := s.Count(ctx, b.Address())
+		n, _ := s.Count(ctx, b.Address())
 		return n
 	}
 
@@ -347,14 +345,13 @@ func TestRestartLoadsLazily(t *testing.T) {
 	if r := e.do(http.MethodDelete, "/v1/"+d.Address().String(), nil, e.pass(d)); r.status != http.StatusNoContent {
 		t.Fatalf("close: %d %s", r.status, r.body)
 	}
-	_, version, _ := e.store.Count(ctx, b.Address())
 	renewed, err := e.store.Box(ctx, c.Address())
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	fresh := startDynamo(t, e.clock.Now)
-	mk, err := e.keys.markKey() // a restart reads the same keys file: the same tags, the same versions
+	mk, err := e.keys.markKey() // a restart reads the same keys file: the same tags
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,11 +363,11 @@ func TestRestartLoadsLazily(t *testing.T) {
 	if n, _, _ := fresh.PairCount(ctx, b.Address(), a.Address()); n != 2 {
 		t.Fatalf("pair count %d", n)
 	}
-	if n, _, _ := fresh.Count(ctx, f.Address()); n != 1 {
+	if n, _ := fresh.Count(ctx, f.Address()); n != 1 {
 		t.Fatalf("count %d", n)
 	}
-	if n, v, _ := fresh.Count(ctx, b.Address()); n != 2 || v != version {
-		t.Fatalf("count %d, version %x; want 2, %x", n, v, version)
+	if n, _ := fresh.Count(ctx, b.Address()); n != 2 {
+		t.Fatalf("count %d, want 2", n)
 	}
 	if n := fresh.loads.Load(); n != 2 {
 		t.Fatalf("%d loads for two boxes", n)
@@ -380,20 +377,20 @@ func TestRestartLoadsLazily(t *testing.T) {
 	if _, ok := fresh.Held(c.Address()); ok {
 		t.Fatal("a box nothing has used is in memory")
 	}
-	if n, _, err := fresh.Count(ctx, c.Address()); n != 0 || err != nil {
+	if n, err := fresh.Count(ctx, c.Address()); n != 0 || err != nil {
 		t.Fatalf("rekeyed box: %d %v", n, err)
 	}
 	if st, ok := fresh.Held(c.Address()); !ok || st.State != Active || st.Cert != renewed.Cert {
 		t.Fatalf("rekeyed box: %v %v", st, ok)
 	}
-	if n, _, _ := fresh.Count(ctx, d.Address()); n != 0 {
+	if n, _ := fresh.Count(ctx, d.Address()); n != 0 {
 		t.Fatal("the close left mail in the table")
 	}
 	if st, ok := fresh.Held(d.Address()); !ok || st.State != Closed {
 		t.Fatalf("closed box: %v %v", st, ok)
 	}
 	var nobody protocol.Address
-	if n, _, err := fresh.Count(ctx, nobody); n != 0 || err != nil {
+	if n, err := fresh.Count(ctx, nobody); n != 0 || err != nil {
 		t.Fatalf("no box: %d %v", n, err)
 	}
 	if _, ok := fresh.Held(nobody); ok {
@@ -431,8 +428,8 @@ func TestPollsReadOncePerProcess(t *testing.T) {
 // A throttled store answers 503 with Retry-After, never a wrong answer.
 type throttled struct{ Store }
 
-func (throttled) Count(context.Context, protocol.Address) (int, uint64, error) {
-	return 0, 0, &smithy.GenericAPIError{Code: "ProvisionedThroughputExceededException", Message: "slow down"}
+func (throttled) Count(context.Context, protocol.Address) (int, error) {
+	return 0, &smithy.GenericAPIError{Code: "ProvisionedThroughputExceededException", Message: "slow down"}
 }
 
 func TestThrottleIs503(t *testing.T) {
@@ -621,7 +618,7 @@ func TestExpiredHeadersAreNotListed(t *testing.T) {
 func TestResendAfterExpiryIsRefused(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
+	sent := capture(e, "/v1/"+b.Address().String())
 	first := send(t, a, b, "once, then again")
 	e.setMiddle(nil)
 	e.clock.Add(protocol.TTL - time.Second)
@@ -701,7 +698,7 @@ func TestRetryAfterCloseIsNotRedelivered(t *testing.T) {
 	e := newEnv(t, relaxed())
 	ctx := context.Background()
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
+	sent := capture(e, "/v1/"+b.Address().String())
 	send(t, a, b, "deleted unread")
 	e.setMiddle(nil)
 	if r := e.do(http.MethodDelete, "/v1/"+b.Address().String(), nil, e.pass(b)); r.status != http.StatusNoContent {
@@ -713,8 +710,6 @@ func TestRetryAfterCloseIsNotRedelivered(t *testing.T) {
 	// A retry of the same bytes is answered as the first send was, from the
 	// dedupe record, though it names the retired serial (PROTOCOL.md §4.5
 	// step 6): it stores nothing, and what the close deleted stays deleted.
-	var req protocol.SendRequest
-	_ = json.Unmarshal(*sent, &req)
 	if r := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a)); r.status != http.StatusOK {
 		t.Fatalf("retry: %d %s", r.status, r.body)
 	}
@@ -722,7 +717,7 @@ func TestRetryAfterCloseIsNotRedelivered(t *testing.T) {
 		t.Fatal("mail deleted by the close came back")
 	}
 	if s, ok := e.store.(*DynamoStore); ok {
-		if id := sha256.Sum256(req.Ciphertext); s.listed(t, b.Address(), id) || s.bodyExists(t, b.Address(), id) {
+		if id := sha256.Sum256(sent.ciphertext); s.listed(t, b.Address(), id) || s.bodyExists(t, b.Address(), id) {
 			t.Fatal("mail the close deleted is still listed, or its body kept")
 		}
 	}

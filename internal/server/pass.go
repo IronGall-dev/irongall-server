@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -84,13 +85,40 @@ func (s *Server) standingOf(r *http.Request, a protocol.Address) (st Standing, o
 	return st, err == nil, err
 }
 
-// serverName is the name the caller called this server by, the request's
-// Host in lowercase, if it is one of the server's own. A pass names the
-// server it was made for, and the name is not sent with it: checked against
-// a name that is not ours, a pass made for another server would pass here.
+// serverName is the name the caller called this server by, if it is one of
+// the server's own: the request's Host, lowercase, written as an origin is
+// (PROTOCOL.md §6.1b), with its port as a number and none at all when it is
+// 443 or 80. TLS ends in front of this server, so it cannot tell which scheme
+// a client called it by, and takes either's default as left unwritten: a
+// client that calls https on port 80, or http on 443, names a port this
+// drops, and its pass is refused. A pass names the server it was made for,
+// and the name is not sent with it: checked against a name that is not ours,
+// a pass made for another server would pass here.
 func (s *Server) serverName(r *http.Request) (string, bool) {
 	name := strings.ToLower(r.Host)
+	if i := strings.LastIndexByte(name, ':'); i > strings.LastIndexByte(name, ']') {
+		switch n, err := strconv.ParseUint(name[i+1:], 10, 16); {
+		case i == len(name)-1, err == nil && (n == 443 || n == 80):
+			name = name[:i]
+		case err == nil:
+			name = name[:i+1] + strconv.FormatUint(n, 10)
+		}
+	}
 	return name, len(s.names) == 0 || slices.Contains(s.names, name)
+}
+
+// authorization returns the call's Authorization value, "" when it has none.
+// one is false for a call with two lines or more: which of them is the
+// pass is not for the server to choose, so such a call carries no pass and
+// is refused as one that is not a pass is.
+func authorization(r *http.Request) (auth string, one bool) {
+	switch v := r.Header.Values("Authorization"); len(v) {
+	case 0:
+		return "", true
+	case 1:
+		return v[0], true
+	}
+	return "", false
 }
 
 func unauthorized(hint, detail string) *problem {
@@ -133,12 +161,12 @@ func (s *Server) checkPassBounded(r *http.Request, a protocol.Address, key strin
 }
 
 func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert [32]byte, p *protocol.Pass, count bool) (err error) {
-	auth := r.Header.Get("Authorization")
-	if len(auth) > protocol.MaxPassAuthorization {
+	auth, one := authorization(r)
+	if !one || len(auth) > protocol.MaxPassAuthorization {
 		if !count {
 			return unauthorized(hintPass, "no pass, or not a pass")
 		}
-		return s.notAPass(r) // longer than any pass can be: refused before it is hashed or parsed
+		return s.notAPass(r) // two lines, or longer than any pass can be: refused before it is hashed or parsed
 	}
 	now := s.now()
 	sum := sha256.Sum256([]byte(auth))
@@ -258,9 +286,10 @@ func checkCertificate(key string, cert ssh.PublicKey, a protocol.Address, now ti
 // owner authenticates a call a box makes about itself: it returns the
 // address in the path, once the call has shown that box's pass. A box this
 // process holds is checked from memory; any other costs a read of its
-// record, which lookup limits for an address that names no box.
-func (s *Server) owner(r *http.Request) (protocol.Address, error) {
-	a, err := pathAddr(r)
+// record, which lookup limits for an address that names no box. params are
+// the query parameters the call takes (pathAddr).
+func (s *Server) owner(r *http.Request, params ...string) (protocol.Address, error) {
+	a, err := pathAddr(r, params...)
 	if err != nil {
 		return a, err
 	}
@@ -281,8 +310,9 @@ func (s *Server) owner(r *http.Request) (protocol.Address, error) {
 // sender authenticates a send: the sender is the box the call's pass names
 // (PROTOCOL.md §4.5, step 1).
 func (s *Server) sender(r *http.Request) (protocol.Address, error) {
-	p, err := protocol.ParsePass(r.Header.Get("Authorization"))
-	if err != nil {
+	auth, one := authorization(r)
+	p, err := protocol.ParsePass(auth)
+	if !one || err != nil {
 		return protocol.Address{}, s.notAPass(r)
 	}
 	a := p.Address

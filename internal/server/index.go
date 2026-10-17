@@ -37,13 +37,12 @@ type indexShard struct {
 //
 // A message is known by its tag, which nobody outside the server can choose
 // or compute: the id is the SHA-256 of a ciphertext its sender chose, so 8
-// bytes of it are the sender's to steer. A version that is the XOR of plain
-// prefixes can be forced to that of an empty box, and an id that only shares
-// a held message's prefix would pass for it (IronGall-dev/irongall-server#10).
+// bytes of it are the sender's to steer: an id that only shares a held
+// message's prefix would pass for it (IronGall-dev/irongall-server#10).
 // The plain prefix stays for one thing: ordering two messages of one
 // millisecond as the list orders them.
 type mark struct {
-	tag  uint64 // markTag of the message id: what the mark is known by, and what the version is made of
+	tag  uint64 // markTag of the message id: what the mark is known by
 	id   uint64 // first 8 bytes of the message id, for the list's order within a millisecond only
 	from uint64 // first 8 bytes of the sender's address, for the per-pair cap
 	exp  uint64 // expiry in unix ms: received_at + TTL
@@ -212,21 +211,17 @@ func (x *index) remove(box protocol.Address, tag, exp, now uint64, echo bool) {
 	})
 }
 
-// count returns the number of live messages in a box and its version: the
-// XOR of their tags, identical on every process.
-func (x *index) count(box protocol.Address, now uint64) (n int, version uint64) {
+// count returns the number of live messages in a box.
+func (x *index) count(box protocol.Address, now uint64) int {
 	sh := x.shard(box)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	m := sh.held(box)
 	if m == nil {
-		return 0, 0
+		return 0
 	}
 	m.prune(now)
-	for _, k := range m.marks {
-		version ^= k.tag
-	}
-	return len(m.marks), version
+	return len(m.marks)
 }
 
 // pair returns how many live messages from one sender a box holds, and the

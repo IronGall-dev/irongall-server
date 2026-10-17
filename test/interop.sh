@@ -182,7 +182,7 @@ printf 'waiting in the box that is revoked\n' | gocli "$V2" send "$V1L" > /dev/n
 out=$(recipe "$V1" "ig_revoke ${V1A:0:63}" 2>&1); [ $? -ne 0 ] && [ "$(look "$V1A")" = 200 ] \
   && ok "the recipe does not revoke without the address in full, and nothing is published" || bad "revoke with a short address: $out"
 out=$(recipe "$V1" "ig_revoke $V1A" 2>&1) && [ "$out" = "$(revoked_line $V1A)" ] && [ "$(look "$V1A")" = 410 ] \
-  && curl -s "$IG_BASE/v1/$V1A" | jq -e '.code == "revoked" and (.record | keys == ["identity","revocation","type"] and .type == "revocation_record")' > /dev/null \
+  && curl -s "$IG_BASE/v1/$V1A" | jq -e '.code == "revoked" and (.record | keys == ["identity","revocation_signature","type"] and .type == "revocation_record")' > /dev/null \
   && ok "the recipe revokes its box: 410 from then on, and the server shows the record in it to anyone" || bad "recipe revoke: $out"
 out=$(gocli "$V2" recv 2>&1); [ $? -eq 0 ] && grep -q '"code":"revoked"' <<< "$out" && ! grep -q '"body"' <<< "$out" && [ -s "$V2/peers/$V1A/revoke.sig" ] \
   && ok "the Go client refuses mail from the box the recipe revoked, and keeps the revocation it checked" || bad "Go recv from a revoked box: $out"
@@ -201,7 +201,7 @@ out=$(recipe "$V4" "ig_recv" 2>&1); [ $? -eq 0 ] && grep -q '"code":"revoked"' <
 out=$(recipe "$V4" "ig_send $V3L '$work/body7'" 2>&1); [ $? -ne 0 ] && grep -q "REVOKED" <<< "$out" && ok "the recipe sends nothing to it: REVOKED" || bad "recipe send to a revoked box: $out"
 # A record made in advance revokes with no box and no key, by either client or by curl; what is not one is refused.
 gocli "$V5" revocation make > "$work/v5.json" 2> /dev/null && [ "$(look "$V5A")" = 200 ] && ok "a record is made, and nothing is published" || bad "Go revocation"
-jq -c --arg s "$(printf 'revoke it' | base64)" '.revocation = $s' "$work/v5.json" > "$work/v5-junk.json"
+jq -c --arg s "$(printf 'revoke it' | base64)" '.revocation_signature = $s' "$work/v5.json" > "$work/v5-junk.json"
 [ "$(curl -s -X PUT -H 'Content-Type: application/json' --data-binary "@$work/v5-junk.json" "$IG_BASE/v1/$V5A/revocations" | jq -r .code)" = bad_revocation ] \
   && [ "$(curl -s -X PUT -H 'Content-Type: application/json' --data-binary "@$work/v5.json" "$IG_BASE/v1/$V4A/revocations" | jq -r .code)" = identity_mismatch ] \
   && [ "$(look "$V5A")" = 200 ] \
@@ -300,7 +300,7 @@ out=$(gocli "$X6" revocation publish "$X6A" 2>&1); [ $? -eq 1 ] && grep -q "was 
 # Back on the same directory, it still holds what it took, and the same command again is the cure.
 "$work/irongall-revocation-server" --dir "$work/revocations" --listen "127.0.0.1:$rport" --writes-per-hour -1 2>> "$work/revocation-server.log" & rev=$!
 for _ in $(seq 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$REV/")" = 200 ] && break; sleep 0.1; done
-[ "$(at "$REV" "$X1A")" = 200 ] && [ "$(at "$REV" "$X6A")" = 200 ] && out=$(gocli "$X6" revocation publish "$X6A" 2>&1) && [ "$out" = "$(revoked_line $X6A)" ] && curl -s "$REV/v1/$X6A/revocations" | jq -e '.revocation and .revoked_certificates' > /dev/null \
+[ "$(at "$REV" "$X1A")" = 200 ] && [ "$(at "$REV" "$X6A")" = 200 ] && out=$(gocli "$X6" revocation publish "$X6A" 2>&1) && [ "$out" = "$(revoked_line $X6A)" ] && curl -s "$REV/v1/$X6A/revocations" | jq -e '.revocation_signature and .revoked_certificates' > /dev/null \
   && out2=$(recipe "$X4" "ig_revoke $X4A" 2>&1) && [ "$out2" = "$(revoked_line $X4A)" ] && [ "$(at "$REV" "$X4A")" = 200 ] \
   && ! grep -q -e "$X5A" -e "GET" "$work/revocation-server.log" \
   && ok "restarted on its directory the revocation server still holds every record, the same command again publishes what it missed, and its log names no lookup" || bad "after the restart: $out / ${out2:-} / $(tail -n 3 "$work/revocation-server.log")"

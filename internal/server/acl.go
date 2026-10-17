@@ -71,7 +71,7 @@ func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 	// After the record holds the ACL, so the sends it refuses are refused
 	// from here on. Memory says first whether the box holds any mail.
 	if acl.Deny.Len() > 0 {
-		if n, _, err := s.store.Count(r.Context(), a); err != nil {
+		if n, err := s.store.Count(r.Context(), a); err != nil {
 			return err
 		} else if n > 0 {
 			if err := s.store.DeleteFrom(r.Context(), a, acl.Deny.Has); err != nil {

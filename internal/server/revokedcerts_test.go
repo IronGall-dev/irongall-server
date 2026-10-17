@@ -48,7 +48,7 @@ func (e *env) sendTo(to *raw, serial, under uint64, from *raw, fromUnder uint64)
 	}
 	_, _ = io.WriteString(w, `{"v":1}`)
 	_ = w.Close()
-	return e.do("POST", to.path("/messages"), protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &under, Ciphertext: ct.Bytes()}, from.pass(fromUnder))
+	return e.do("POST", to.path("/messages"), sealedTo(serial, under, ct.Bytes()), from.pass(fromUnder))
 }
 
 func TestRevokedCertificates(t *testing.T) {
@@ -121,7 +121,7 @@ func TestRevokedCertificates(t *testing.T) {
 		t.Fatalf("what the server shows for a box with its certificates revoked does not verify: %+v, %v", l, err)
 	}
 	var members map[string]json.RawMessage
-	if err := json.Unmarshal(shown.body, &members); err != nil || len(members) != 5 || members["revocation"] != nil || members["type"] != nil ||
+	if err := json.Unmarshal(shown.body, &members); err != nil || len(members) != 5 || members["revocation_signature"] != nil || members["type"] != nil ||
 		members["revoked_certificates"] == nil || members["revoked_certificates_signature"] == nil {
 		t.Errorf("the box is read with %d members, want its identity, prekey and signature, then the statement and its signature: %s", len(members), shown.body)
 	}
@@ -152,7 +152,7 @@ func TestRevokedCertificates(t *testing.T) {
 	e.want(put(2, 2), 401, protocol.CodeCertificateRevoked)
 	r.prekeyUnder(r.work[2], 3, now.Add(time.Hour), nil)
 	e.want(put(3, 2), 401, protocol.CodeCertificateRevoked)
-	if n, _, _ := e.store.Count(ctx, r.id.Address()); n != 1 {
+	if n, _ := e.store.Count(ctx, r.id.Address()); n != 1 {
 		t.Errorf("the box holds %d messages after its certificate was revoked, want the 1 it had", n)
 	}
 	shown = e.do("GET", r.path(""), nil, "")

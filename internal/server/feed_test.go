@@ -154,7 +154,7 @@ func feedFixture(t *testing.T) (*fakeStream, *feed, *DynamoStore, protocol.Addre
 }
 
 func (s *DynamoStore) countOf(box protocol.Address) int {
-	n, _, _ := s.Count(context.Background(), box)
+	n, _ := s.Count(context.Background(), box)
 	return n
 }
 

@@ -272,11 +272,10 @@ type Store interface {
 	// UseMarkKey sets the key a store tags each live message with in memory
 	// (markTag), before it is first used: New calls it with the server's.
 	UseMarkKey(key [32]byte)
-	// Count returns the number of live messages in a box and its version:
-	// the XOR of their tags (markTag), identical on every process.
-	// Count and PairCount answer from memory: a store with memory loads the
-	// box on its first use, then answers from memory.
-	Count(ctx context.Context, box protocol.Address) (n int, version uint64, err error)
+	// Count returns the number of live messages in a box. Count and
+	// PairCount answer from memory: a store with memory loads the box on its
+	// first use, then answers from memory.
+	Count(ctx context.Context, box protocol.Address) (n int, err error)
 	// PairCount returns how many live messages from one sender a box holds,
 	// and when the oldest of them expires.
 	PairCount(ctx context.Context, box, from protocol.Address) (n int, oldest time.Time, err error)

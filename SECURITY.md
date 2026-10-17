@@ -26,9 +26,10 @@ gh api repos/IronGall-dev/irongall-server/security-advisories/reports \
 | **It never holds a private key and never sees plaintext;** it stores ciphertext and a box's public documents | `AGENTS.md` § Invariants; what it stores and for how long is the spec's §7, and how, `PROTOCOL-SERVER.md` §7 |
 | **It holds no signature on a message and issues no credential:** a box proves itself with a pass it signs, which says who is calling and nothing of what the call does | `internal/server/pass.go`; `server_test.go`, `keytype_test.go`, `clock_test.go` |
 | **A pass is checked in three steps, in a fixed order:** the certificate against the box's current one, the working key's signature, then the identity's signature on the certificate | `checkPass`; `PROTOCOL-SERVER.md` §6.1b |
+| **A pass is taken only for a name of the server's own,** the request's `Host` written as an origin is, and a call with two `Authorization` lines carries none | `serverName` and `authorization` in `internal/server/pass.go`; `TestAPassIsForOneServer`, `TestTheServerReadsItsHostAsAnOrigin`, `TestTwoAuthorizationLinesAreNoPass` |
 | **No call is free, and a stranger never spends a box's budget:** every limit, who pays it, when it is taken, the order of checks on each route, and its known weaknesses | `LIMITS.md`; `budgets_test.go`, `limits_test.go`, `marks_test.go` |
 | **Keyed hashing is HMAC or HKDF only,** never `hash(secret ‖ …)` | `internal/server/index.go`, `keys.go` |
-| **Every error is RFC 9457 Problem Details, and every value in its `detail` is a member of its own,** so no client needs to show a server's words | `problem_test.go`; the spec's §13 |
+| **Every error is RFC 9457 Problem Details, its `type` its code's own, and every value in its `detail` is a member of its own,** so no client needs to show a server's words | `problem_test.go`; `api/apitest`, which every test server is wrapped in, fails a `type` that is not its `code`'s; the spec's §13 |
 | **Revocation is kept as the identity signed it,** and answered for an address it covers before anything else | `revocation_test.go`, `revokedcerts_test.go` |
 | **Every error is tested over raw HTTP against the spec's status map,** and both clients run end to end against the real server | `internal/server/*_test.go` (the list is `PROTOCOL-SERVER.md` §11), `e2e_test.go`; `test/interop.sh` for the shell client |
 

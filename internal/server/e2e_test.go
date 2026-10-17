@@ -192,12 +192,10 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal("the envelope is HTML-escaped")
 	}
 
-	// Acked: the box is empty, and an empty box's ETag is kept for a 304.
+	// Acked: the box is empty, and its poll is a page as any other is, 200
+	// with poll_after: never a 304, which would carry no poll_after.
 	if res := receive(t, b); len(res.Delivered) != 0 {
 		t.Fatal("delivered twice")
-	}
-	if _, err := os.Stat(filepath.Join(b.Dir(), "etag")); err != nil {
-		t.Fatal("no etag kept for the empty box")
 	}
 	var polls []int
 	e.setMiddle(func(w http.ResponseWriter, r *http.Request, next http.Handler) {
@@ -208,8 +206,8 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 	receive(t, b)
-	if len(polls) != 1 || polls[0] != http.StatusNotModified {
-		t.Fatalf("an empty poll with the ETag got %v, want [304]", polls)
+	if len(polls) != 1 || polls[0] != http.StatusOK {
+		t.Fatalf("an empty poll got %v, want [200]", polls)
 	}
 	e.setMiddle(nil)
 
@@ -218,25 +216,30 @@ func TestEndToEnd(t *testing.T) {
 	if res := receive(t, a); len(res.Delivered) != 1 || bodyOf(t, res.Delivered[0]) != "reply" {
 		t.Fatal("no reply")
 	}
-	// A message arriving after the ETag was kept is not hidden by it.
+	// A message arriving after an empty poll is in the next.
 	send(t, a, b, "second")
 	if res := receive(t, b); len(res.Delivered) != 1 || bodyOf(t, res.Delivered[0]) != "second" {
-		t.Fatal("the kept ETag hid new mail")
+		t.Fatal("the poll after an empty one missed new mail")
 	}
 }
 
-// capture records the JSON body of the next request matching method and
-// path suffix.
-func capture(e *env, method, suffix string) *[]byte {
-	var got []byte
+// capture records the next send to box path to, "/v1/<address>", as the
+// client made it: its serials and its ciphertext.
+func capture(e *env, to string) *sealed {
+	got := &sealed{}
 	e.setMiddle(func(w http.ResponseWriter, r *http.Request, next http.Handler) {
-		if r.Method == method && strings.HasSuffix(r.URL.Path, suffix) && got == nil {
-			got, _ = io.ReadAll(r.Body)
-			r.Body = io.NopCloser(bytes.NewReader(got))
+		if r.Method == http.MethodPost && r.URL.Path == to+"/messages" && got.ciphertext == nil {
+			q, err := protocol.ParseSendQuery(r.URL.RawQuery)
+			if err != nil {
+				e.t.Errorf("the client's send: %v", err)
+			}
+			got.SendQuery = q
+			got.ciphertext, _ = io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(got.ciphertext))
 		}
 		next.ServeHTTP(w, r)
 	})
-	return &got
+	return got
 }
 
 // A send's 201 names the message it made, at the path its recipient fetches
@@ -254,10 +257,9 @@ func TestASendNamesTheMessageItMade(t *testing.T) {
 	if at != "/v1/"+b.Address().String()+"/messages/"+r.ID {
 		t.Fatalf("Location %q, receipt %s", at, r.ID)
 	}
-	var m protocol.Message
 	got := e.do(http.MethodGet, at, nil, e.pass(b))
-	if err := json.Unmarshal(got.body, &m); err != nil || got.status != http.StatusOK || m.ID != r.ID || !bytes.Equal(m.Ciphertext, req.Ciphertext) {
-		t.Fatalf("fetching the Location: %d %s", got.status, got.body)
+	if got.status != http.StatusOK || got.header.Get("Content-Type") != protocol.CiphertextContentType || !bytes.Equal(got.body, req.ciphertext) {
+		t.Fatalf("fetching the Location: %d %v", got.status, got.header)
 	}
 	if retry := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", req, e.pass(a)); retry.status != http.StatusOK || retry.header.Get("Location") != "" {
 		t.Fatalf("retry: %d, Location %q", retry.status, retry.header.Get("Location"))
@@ -267,7 +269,7 @@ func TestASendNamesTheMessageItMade(t *testing.T) {
 func TestRetryGetsOriginalReceipt(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
+	sent := capture(e, "/v1/"+b.Address().String())
 	r := send(t, a, b, "once")
 	e.setMiddle(nil)
 
@@ -428,8 +430,9 @@ func TestLimits(t *testing.T) {
 		send(t, c, b, "2")
 		_, err := c.Send(ctx, b.Address(), "3")
 		var ae *client.APIError
-		if !errors.As(err, &ae) || ae.Problem.Code != protocol.CodeMailboxFull || ae.Status != 429 || ae.RetryAfter == 0 {
-			t.Fatalf("send to a full box: %v", err)
+		if !errors.As(err, &ae) || ae.Problem.Code != protocol.CodeMailboxFull || ae.Status != 429 || ae.RetryAfter == 0 ||
+			ae.Problem.Count == nil || *ae.Problem.Count != 2 {
+			t.Fatalf("send to a full box: %v %+v", err, ae)
 		}
 	})
 	t.Run("sends per day", func(t *testing.T) {
@@ -491,7 +494,7 @@ func TestTheGoClientsACL(t *testing.T) {
 	if _, err := b.Block(ctx, a.Address()); err != nil {
 		t.Fatal(err)
 	}
-	if n, _, err := e.store.Count(ctx, b.Address()); err != nil || n != 0 {
+	if n, err := e.store.Count(ctx, b.Address()); err != nil || n != 0 {
 		t.Fatalf("the box still holds %d messages, %v", n, err)
 	}
 	_, err := a.Send(ctx, b.Address(), "refused")

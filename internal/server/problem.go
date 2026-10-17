@@ -49,8 +49,9 @@ func limitValue(n int) value {
 	return value{n, func(p *protocol.Problem) { p.Limit = u64(uint64(max(n, 0))) }}
 }
 
-func messagesValue(n int) value {
-	return value{n, func(p *protocol.Problem) { p.Messages = u64(uint64(max(n, 0))) }}
+// countValue is how many messages a full box holds, as its list counts them.
+func countValue(n int) value {
+	return value{n, func(p *protocol.Problem) { p.Count = u64(uint64(max(n, 0))) }}
 }
 
 func versionValue(v uint64) value {

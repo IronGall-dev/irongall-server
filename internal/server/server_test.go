@@ -13,9 +13,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -43,6 +43,21 @@ func (r reply) code() protocol.Code {
 	return p.Code
 }
 
+// sealed is a send as the server reads one (PROTOCOL.md §4.5): the
+// ciphertext, which is the body, and the serials of the prekey it is sealed
+// to, which are the query.
+type sealed struct {
+	protocol.SendQuery
+	ciphertext []byte
+}
+
+// sealedTo is a send of ciphertext to prekey serial under certificate under.
+func sealedTo(serial, under uint64, ciphertext []byte) sealed {
+	return sealed{protocol.SendQuery{PrekeySerial: serial, CertificateSerial: under}, ciphertext}
+}
+
+// do calls the server. A body of []byte is sent as it is, a sealed as a
+// send sends it, and anything else as JSON.
 func (e *env) do(method, path string, body any, pass string) reply {
 	e.t.Helper()
 	return e.doAs("", method, path, body, pass)
@@ -52,15 +67,21 @@ func (e *env) do(method, path string, body any, pass string) reply {
 func (e *env) doAs(host, method, path string, body any, pass string) reply {
 	e.t.Helper()
 	var rd io.Reader
-	if body != nil {
-		if raw, ok := body.([]byte); ok {
-			rd = bytes.NewReader(raw)
-		} else {
-			j, _ := json.Marshal(body)
-			rd = bytes.NewReader(j)
-		}
+	ctype := ""
+	switch b := body.(type) {
+	case nil:
+	case []byte:
+		rd = bytes.NewReader(b)
+	case sealed:
+		rd, ctype, path = bytes.NewReader(b.ciphertext), protocol.CiphertextContentType, path+"?"+b.Encode()
+	default:
+		j, _ := json.Marshal(body)
+		rd = bytes.NewReader(j)
 	}
 	req, _ := http.NewRequest(method, e.srv.URL+path, rd)
+	if ctype != "" {
+		req.Header.Set("Content-Type", ctype)
+	}
 	if host != "" {
 		req.Host = host
 	}
@@ -514,6 +535,110 @@ func TestOwnerCalls(t *testing.T) {
 	}
 }
 
+// An address in a path is 64 lowercase hex characters, so a box has one URL:
+// the same address in uppercase is no address, on every route that names
+// one, whoever calls (PROTOCOL.md §2).
+func TestAnAddressInAPathIsLowercase(t *testing.T) {
+	e := newEnv(t, relaxed())
+	r := e.raw().register(protocol.MaxPrekeyLifetime)
+	pass := r.pass(1)
+	upper := "/v1/" + strings.ToUpper(r.id.Address().String())
+	lower := r.id.Address().String()
+	i := strings.IndexAny(lower, "abcdef") // one letter in uppercase
+	mixed := "/v1/" + lower[:i] + strings.ToUpper(lower[i:i+1]) + lower[i+1:]
+	for _, c := range []struct{ method, path, pass string }{
+		{"GET", upper, ""},
+		{"GET", mixed, ""},
+		{"GET", upper + "/messages", pass},
+		{"GET", upper + "/messages/" + strings.Repeat("a", 64), pass},
+		{"DELETE", upper + "/messages/" + strings.Repeat("a", 64), pass},
+		{"GET", upper + "/acl", pass},
+		{"DELETE", upper + "/account", pass},
+	} {
+		e.want(e.do(c.method, c.path, nil, c.pass), 400, protocol.CodeBadAddress)
+	}
+	e.want(e.do("PUT", upper+"/prekey", r.upload(1), pass), 400, protocol.CodeBadAddress)
+	e.want(e.do("GET", r.path(""), nil, ""), 200, "")
+	e.want(e.do("GET", r.path("/messages"), nil, pass), 200, "")
+}
+
+// A query parameter a call does not take, and one given twice, is refused
+// as a member a body should not hold is: 400 bad_request, naming it in
+// member (PROTOCOL.md §13). A cursor not of a cursor's form is named too.
+// The send's own parameters are TestSendPipeline's.
+func TestAQueryHoldsOnlyTheCallsParameters(t *testing.T) {
+	e := newEnv(t, relaxed())
+	r := e.raw().register(protocol.MaxPrekeyLifetime)
+	pass := r.pass(1)
+	id := strings.Repeat("a", 64)
+	for _, c := range []struct {
+		method, path string
+		body         any
+		pass, member string
+	}{
+		{"GET", r.path("/messages?limit=5"), nil, pass, "limit"},
+		{"GET", r.path("/messages?cursor=x&limit=5"), nil, pass, "limit"},
+		{"GET", r.path("/messages?cursor=zzz&cursor=zzz"), nil, pass, "cursor"},
+		{"GET", r.path("/messages?cursor=zzz"), nil, pass, "cursor"},
+		{"GET", r.path("/messages?cursor="), nil, pass, "cursor"},
+		{"GET", r.path("/messages?cursor=" + url.QueryEscape(strings.Repeat("A", 52)+"/a")), nil, pass, "cursor"},
+		{"GET", r.path("/messages?Cursor=x"), nil, pass, "Cursor"},
+		{"GET", r.path("?x=1"), nil, "", "x"},
+		{"GET", r.path("?prekey_serial=1"), nil, pass, "prekey_serial"},
+		{"PUT", r.path("/prekey?x"), r.upload(1), pass, "x"},
+		{"GET", r.path("/acl?x=1"), nil, pass, "x"},
+		{"GET", r.path("/messages/" + id + "?x=1"), nil, pass, "x"},
+		{"DELETE", r.path("/messages/" + id + "?x=1"), nil, pass, "x"},
+	} {
+		got := e.do(c.method, c.path, c.body, c.pass)
+		var p protocol.Problem
+		_ = json.Unmarshal(got.body, &p)
+		if got.status != 400 || p.Code != protocol.CodeBadRequest || p.Member != c.member || !strings.Contains(p.Detail, c.member) {
+			t.Errorf("%s %s: %d %s, member %q; want 400 %s naming %s", c.method, c.path, got.status, p.Code, p.Member, protocol.CodeBadRequest, c.member)
+		}
+	}
+	// A query that does not parse names nothing.
+	e.want(e.do("GET", r.path("/messages?%zz"), nil, pass), 400, protocol.CodeBadRequest)
+	e.want(e.do("GET", r.path("/messages"), nil, pass), 200, "")
+}
+
+// A call with two Authorization lines carries no pass, whatever each holds:
+// which of them is the pass is not the server's to choose. It is refused as
+// a call that carries no pass is, and a lookup with two is not one with none.
+func TestTwoAuthorizationLinesAreNoPass(t *testing.T) {
+	e := newEnv(t, relaxed())
+	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
+	pass := e.pass(b)
+	twice := func(method, path string, body []byte, lines ...string) reply {
+		t.Helper()
+		req, _ := http.NewRequest(method, e.srv.URL+path, bytes.NewReader(body))
+		for _, l := range lines {
+			req.Header.Add("Authorization", l)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		got, _ := io.ReadAll(resp.Body)
+		return reply{status: resp.StatusCode, header: resp.Header, body: got}
+	}
+	messages := "/v1/" + b.Address().String() + "/messages"
+	e.want(e.do("GET", messages, nil, pass), 200, "") // taken, and remembered
+	for _, lines := range [][]string{{pass, pass}, {pass, "x"}, {"x", pass}, {pass, ""}} {
+		got := twice("GET", messages, nil, lines...)
+		e.want(got, 401, protocol.CodeUnauthorized)
+		if got.header.Get("WWW-Authenticate") != protocol.PassScheme {
+			t.Errorf("WWW-Authenticate %q", got.header.Get("WWW-Authenticate"))
+		}
+	}
+	seal := e.sealTo(b)
+	e.want(twice("POST", messages+"?"+seal.Encode(), seal.ciphertext, e.pass(a), e.pass(a)), 401, protocol.CodeUnauthorized)
+	e.want(twice("GET", "/v1/"+b.Address().String(), nil, e.pass(a), e.pass(a)), 401, protocol.CodeUnauthorized)
+	e.want(e.do("POST", messages, seal, e.pass(a)), 201, "")
+	e.want(e.do("GET", messages, nil, pass), 200, "")
+}
+
 // A pass is made for one server, by the name the box calls it. A server
 // takes one only on a request that calls it by a name of its own: the name
 // is not sent with the pass, so checked against whatever name a request
@@ -544,6 +669,41 @@ func TestAPassIsForOneServer(t *testing.T) {
 	// same box's pass for another server stays refused.
 	e.want(e.doAs("mail.example", "GET", r.path("/messages"), nil, ours), 200, "")
 	e.want(e.doAs("another.example", "GET", r.path("/messages"), nil, theirs), 401, protocol.CodeUnauthorized)
+}
+
+// The server writes the Host a request names as an origin is written, as a
+// client writes the server's name in its pass (PROTOCOL.md §6.1b): its port as
+// a number, and none at all for 443 or 80, whichever scheme the client
+// called it by, which TLS ending in front of the server hides. So a box whose
+// URL is https://mail.example:443 signs its pass for mail.example, and its
+// call names mail.example:443. Each pass here is a new one, a second later:
+// one the server has taken is taken again without its name being read.
+func TestTheServerReadsItsHostAsAnOrigin(t *testing.T) {
+	keys, _ := NewDevKeys()
+	clk := &clock{t: time.Now().UTC().Truncate(time.Second)}
+	e := &env{t: t, clock: clk, keys: keys, store: NewMemStore(clk.Now)}
+	e.srv = httptest.NewServer(apitest.Handler(t, New(Config{Store: e.store, Keys: keys, Limits: relaxed(), Now: clk.Now, Names: []string{"mail.example", "mail.example:8443"}}).Handler()))
+	t.Cleanup(e.srv.Close)
+	r := e.raw()
+	r.prekey(1, clk.Now().Add(time.Hour), nil)
+	pass := func(name string) string {
+		clk.Add(time.Second)
+		return e.passFor(r.work[1], r.id.Address(), name)
+	}
+	// A pass that names the default port is not for the name the server
+	// writes, which leaves it out.
+	e.want(e.doAs("mail.example:443", "PUT", r.path(""), r.registration(1), pass("mail.example:443")), 401, protocol.CodeUnauthorized)
+	e.want(e.doAs("mail.example:443", "PUT", r.path(""), r.registration(1), pass("mail.example")), 201, "")
+	for host, name := range map[string]string{
+		"mail.example:80":    "mail.example",
+		"MAIL.example:0443":  "mail.example",
+		"mail.example:08443": "mail.example:8443",
+	} {
+		e.want(e.doAs(host, "GET", r.path("/messages"), nil, pass(name)), 200, "")
+	}
+	// A port that is no default stays, and must be the pass's.
+	e.want(e.doAs("mail.example:8443", "GET", r.path("/messages"), nil, pass("mail.example")), 401, protocol.CodeUnauthorized)
+	e.want(e.doAs("mail.example:80", "GET", r.path("/messages"), nil, pass("mail.example:80")), 401, protocol.CodeUnauthorized)
 }
 
 func TestPrekeyRenewal(t *testing.T) {
@@ -636,7 +796,7 @@ func TestSendPipeline(t *testing.T) {
 
 	// seal encrypts to the given recipients. What is inside is the
 	// recipient's to judge: the server sees an age file and a pass.
-	seal := func(rs ...age.Recipient) protocol.SendRequest {
+	seal := func(rs ...age.Recipient) sealed {
 		var ct bytes.Buffer
 		w, err := age.Encrypt(&ct, rs...)
 		if err != nil {
@@ -645,66 +805,67 @@ func TestSendPipeline(t *testing.T) {
 		_, _ = io.WriteString(w, `{"v":1}`)
 		_ = w.Close()
 		serial, under := e.numbers(b.Address())
-		return protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &under, Ciphertext: ct.Bytes()}
+		return sealedTo(serial, under, ct.Bytes())
 	}
 	to := "/v1/" + b.Address().String()
 	ok := seal(pqRecipient)
 	classic, _ := age.GenerateX25519Identity()
 	pass := e.pass(a)
 
-	// The pass comes first: with none, nothing of the body is judged.
+	// The pass comes first: with none, nothing of the request is judged,
+	// its query and its address included.
 	e.want(e.do("POST", to+"/messages", ok, ""), 401, protocol.CodeUnauthorized)
-	e.want(e.do("POST", to+"/messages", []byte("not json"), ""), 401, protocol.CodeUnauthorized)
+	e.want(e.do("POST", to+"/messages?prekey_serial=0", ok.ciphertext, ""), 401, protocol.CodeUnauthorized)
 	e.want(e.do("POST", "/v1/nope/messages", ok, ""), 401, protocol.CodeUnauthorized)
 
-	e.want(e.do("POST", to+"/messages", []byte("not json"), pass), 400, protocol.CodeBadRequest)
-	// The sender is the box the pass names: the body names none, and holds
-	// no signature.
-	j, _ := json.Marshal(ok)
-	for _, member := range []string{`"from":"` + a.Address().String() + `",`, `"signature":"",`} {
-		e.want(e.do("POST", to+"/messages", append([]byte("{"+member), j[1:]...), pass), 400, protocol.CodeBadRequest)
-	}
-	// Read as every reader reads JSON (PROTOCOL.md §0b), its serials no more
-	// than 2^53 - 1 and written as integers.
-	serial := regexp.MustCompile(`"prekey_serial":[0-9]+`)
-	for name, body := range map[string][]byte{
-		"a name in another case":   bytes.Replace(j, []byte(`"ciphertext"`), []byte(`"Ciphertext"`), 1),
-		"a name twice":             bytes.Replace(j, []byte(`{`), []byte(`{"prekey_serial":1,`), 1),
-		"a bracket after it":       append(append([]byte{}, j...), ']'),
-		"a serial above 2^53 - 1":  serial.ReplaceAll(j, []byte(`"prekey_serial":9007199254740992`)),
-		"a serial with a fraction": serial.ReplaceAllFunc(j, func(b []byte) []byte { return append(append([]byte{}, b...), ".0"...) }),
-		"a serial as a string":     serial.ReplaceAllFunc(j, func(b []byte) []byte { return []byte(`"prekey_serial":"` + string(b[16:]) + `"`) }),
+	// Then the address, then the query: the two serials, each once and
+	// written as a statement writes one, and nothing else. What is wrong is
+	// named in member. The sender is the box the pass names, so the query
+	// names none.
+	e.want(e.do("POST", "/v1/nope/messages?x=1", ok.ciphertext, pass), 400, protocol.CodeBadAddress)
+	e.want(e.do("POST", "/v1/"+strings.ToUpper(b.Address().String())+"/messages", ok, pass), 400, protocol.CodeBadAddress)
+	serials := ok.Encode()
+	for query, member := range map[string]string{
+		"":                                                    protocol.PrekeySerialParam,
+		"certificate_serial=1":                                protocol.PrekeySerialParam,
+		"prekey_serial=1":                                     protocol.CertificateSerialParam,
+		"prekey_serial=0&certificate_serial=1":                protocol.PrekeySerialParam,
+		"prekey_serial=1&certificate_serial=0":                protocol.CertificateSerialParam,
+		"prekey_serial=01&certificate_serial=1":               protocol.PrekeySerialParam,
+		"prekey_serial=%2B1&certificate_serial=1":             protocol.PrekeySerialParam,
+		"prekey_serial=1.0&certificate_serial=1":              protocol.PrekeySerialParam,
+		"prekey_serial=9007199254740992&certificate_serial=1": protocol.PrekeySerialParam,
+		"prekey_serial=&certificate_serial=1":                 protocol.PrekeySerialParam,
+		serials + "&prekey_serial=1":                          protocol.PrekeySerialParam,
+		serials + "&from=" + a.Address().String():             "from",
+		serials + "&PREKEY_SERIAL=1":                          "PREKEY_SERIAL",
 	} {
-		if got := e.do("POST", to+"/messages", body, pass); got.status != 400 || got.code() != protocol.CodeBadRequest {
-			t.Errorf("%s: %d %s, want 400 %s", name, got.status, got.code(), protocol.CodeBadRequest)
+		got := e.do("POST", to+"/messages?"+query, ok.ciphertext, pass)
+		var p protocol.Problem
+		_ = json.Unmarshal(got.body, &p)
+		if got.status != 400 || p.Code != protocol.CodeBadRequest || p.Member != member || !strings.Contains(p.Detail, member) {
+			t.Errorf("?%s: %d %s, member %q; want 400 %s naming %s", query, got.status, p.Code, p.Member, protocol.CodeBadRequest, member)
 		}
 	}
-	e.want(e.do("POST", to+"/messages", unusedBitsSet(t, j), pass), 400, protocol.CodeBadEncoding)
-	e.want(e.do("POST", "/v1/nope/messages", ok, pass), 400, protocol.CodeBadAddress)
-	zero := ok
-	var z uint64
-	zero.PrekeySerial = &z
-	e.want(e.do("POST", to+"/messages", zero, pass), 400, protocol.CodeBadRequest)
-	noSerial := ok
-	noSerial.PrekeySerial = nil
-	e.want(e.do("POST", to+"/messages", noSerial, pass), 400, protocol.CodeBadRequest)
-	// A prekey is named by both serials: its own, and its certificate's.
-	zeroCert, noCert := ok, ok
-	zeroCert.CertificateSerial, noCert.CertificateSerial = &z, nil
-	e.want(e.do("POST", to+"/messages", zeroCert, pass), 400, protocol.CodeBadRequest)
-	e.want(e.do("POST", to+"/messages", noCert, pass), 400, protocol.CodeBadRequest)
-	notAge := ok
-	notAge.Ciphertext = []byte("not an age file")
-	e.want(e.do("POST", to+"/messages", notAge, pass), 400, protocol.CodeNotAge)
+	e.want(e.do("POST", to+"/messages?prekey_serial=9007199254740991&certificate_serial=9007199254740991", ok.ciphertext, pass), 409, protocol.CodeStalePrekey)
+
+	// The body is the ciphertext's bytes, whatever its Content-Type says. A
+	// body that is no age file, the JSON a send once was among them, is
+	// refused as no age file.
+	j, _ := json.Marshal(map[string]any{"prekey_serial": ok.PrekeySerial, "certificate_serial": ok.CertificateSerial, "ciphertext": ok.ciphertext})
+	for name, body := range map[string][]byte{"no body": nil, "a JSON object": j, "text": []byte("not an age file")} {
+		if got := e.do("POST", to+"/messages?"+serials, body, pass); got.status != 400 || got.code() != protocol.CodeNotAge {
+			t.Errorf("%s: %d %s, want 400 %s", name, got.status, got.code(), protocol.CodeNotAge)
+		}
+	}
 	e.want(e.do("POST", to+"/messages", seal(classic.Recipient()), pass), 400, protocol.CodeWrongRecipientType)
 	two, _ := age.GenerateHybridIdentity()
 	e.want(e.do("POST", to+"/messages", seal(pqRecipient, two.Recipient()), pass), 400, protocol.CodeWrongRecipientType)
 	stale := ok
-	s9 := uint64(9)
-	stale.PrekeySerial = &s9
+	stale.PrekeySerial = 9
 	e.want(e.do("POST", to+"/messages", stale, pass), 409, protocol.CodeStalePrekey)
 	staleCert := ok
-	staleCert.CertificateSerial = &s9
+	staleCert.CertificateSerial = 9
 	e.want(e.do("POST", to+"/messages", staleCert, pass), 409, protocol.CodeStalePrekey)
 
 	big := relaxed()
@@ -714,6 +875,32 @@ func TestSendPipeline(t *testing.T) {
 	if _, err := sa.Send(ctx, sb.Address(), strings.Repeat("x", 200)); client.Code(err) != protocol.CodeTooLarge {
 		t.Fatalf("send over the cap: %v", err)
 	}
+	// The body is read to the sender's cap, the ciphertext's bytes, and no
+	// further: past it is too_large with the cap in limit, whether a
+	// Content-Length says so before the body is read or the body runs past
+	// it as it arrives. The address and the query are judged first.
+	sto, spass := "/v1/"+sb.Address().String()+"/messages", small.pass(sa)
+	tooLarge := func(r reply) {
+		t.Helper()
+		var p protocol.Problem
+		if err := json.Unmarshal(r.body, &p); err != nil || r.status != 413 || p.Code != protocol.CodeTooLarge || p.Limit == nil || *p.Limit != 100 {
+			t.Fatalf("over the cap: %d %s", r.status, r.body)
+		}
+	}
+	small.want(small.do("POST", sto+"?x=1", make([]byte, 101), spass), 400, protocol.CodeBadRequest)
+	small.want(small.do("POST", "/v1/nope/messages?"+serials, make([]byte, 101), spass), 400, protocol.CodeBadAddress)
+	tooLarge(small.do("POST", sto+"?"+serials, make([]byte, 101), spass))
+	small.want(small.do("POST", sto+"?"+serials, make([]byte, 100), spass), 400, protocol.CodeNotAge)
+	// A body of no known length goes chunked, with no Content-Length.
+	chunked, _ := http.NewRequest(http.MethodPost, small.srv.URL+sto+"?"+serials, io.MultiReader(bytes.NewReader(make([]byte, 101))))
+	chunked.Header.Set("Authorization", spass)
+	resp, err := http.DefaultClient.Do(chunked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	tooLarge(reply{status: resp.StatusCode, header: resp.Header, body: body})
 
 	// A pass that names no box here, and a recipient that is none.
 	unregistered := e.raw()
@@ -746,16 +933,20 @@ func TestSendPipeline(t *testing.T) {
 	// receipt.
 	d := e.box(protocol.Classic)
 	e.want(e.do("POST", to+"/messages", ok, e.pass(d)), 409, protocol.CodeConflict)
-	// What the recipient is handed names the box whose pass the send
-	// carried, and holds no signature.
+	// What the recipient is handed: in the list, the box whose pass the
+	// send carried and the ciphertext's size; on the fetch, the ciphertext
+	// exactly as posted, and nothing else.
 	var rcpt protocol.Receipt
 	_ = json.Unmarshal(first.body, &rcpt)
+	list := listOf(t, e.do("GET", "/v1/"+b.Address().String()+"/messages", nil, e.pass(b)))
+	if len(list.Messages) != 1 || list.Messages[0].ID != rcpt.ID || list.Messages[0].From != a.Address().String() || list.Messages[0].Size != int64(len(ok.ciphertext)) {
+		t.Fatalf("the list: %+v", list)
+	}
 	fetched := e.do("GET", "/v1/"+b.Address().String()+"/messages/"+rcpt.ID, nil, e.pass(b))
 	e.want(fetched, 200, "")
-	var got map[string]json.RawMessage
-	_ = json.Unmarshal(fetched.body, &got)
-	if len(got) != 5 || string(got["from"]) != `"`+a.Address().String()+`"` || got["ciphertext"] == nil || got["signature"] != nil {
-		t.Fatalf("a fetched message: %s", fetched.body)
+	if !bytes.Equal(fetched.body, ok.ciphertext) || fetched.header.Get("Content-Type") != protocol.CiphertextContentType ||
+		fetched.header.Get("Content-Length") != strconv.Itoa(len(ok.ciphertext)) {
+		t.Fatalf("a fetched message: %v, %d bytes", fetched.header, len(fetched.body))
 	}
 
 	// Revoked boxes, set by hand, each with the revocation its identity
@@ -800,8 +991,7 @@ func TestGreaseIsIgnored(t *testing.T) {
 	_, _ = io.WriteString(w, "x")
 	_ = w.Close()
 	serial, under := e.numbers(b.Address())
-	req := protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &under, Ciphertext: ct.Bytes()}
-	e.want(e.do("POST", "/v1/"+b.Address().String()+"/messages", req, e.pass(a)), 201, "")
+	e.want(e.do("POST", "/v1/"+b.Address().String()+"/messages", sealedTo(serial, under, ct.Bytes()), e.pass(a)), 201, "")
 }
 
 func TestPerIPLimits(t *testing.T) {
@@ -881,12 +1071,12 @@ func TestSendNamesTheCurrentPrekey(t *testing.T) {
 		t.Fatalf("rekey to post-quantum: %v", err)
 	}
 	// sealOld seals to the retired classic key, naming serial.
-	sealOld := func(body string, serial uint64) protocol.SendRequest {
+	sealOld := func(body string, serial uint64) sealed {
 		var ct bytes.Buffer
 		w, _ := age.Encrypt(&ct, oldRecipient)
 		_, _ = io.WriteString(w, body)
 		_ = w.Close()
-		return protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &serial, Ciphertext: ct.Bytes()}
+		return sealedTo(serial, serial, ct.Bytes())
 	}
 	to := "/v1/" + b.Address().String()
 	current, _ := e.numbers(b.Address())

@@ -32,7 +32,7 @@ func TestARetryAfterARenewalGetsItsReceipt(t *testing.T) {
 	l.SendsPerDay = 1
 	e := newEnv(t, l)
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
+	sent := capture(e, "/v1/"+b.Address().String())
 	first := send(t, a, b, "sent before the renewal")
 	e.setMiddle(nil)
 	if _, err := b.Rekey(ctx, ""); err != nil {
@@ -43,15 +43,13 @@ func TestARetryAfterARenewalGetsItsReceipt(t *testing.T) {
 	if r.status != http.StatusOK || json.Unmarshal(r.body, &again) != nil || again != *first {
 		t.Fatalf("a retry after the renewal: %d %s, want 200 and %+v", r.status, r.body, *first)
 	}
-	if n, _, err := e.store.Count(ctx, b.Address()); err != nil || n != 1 {
+	if n, err := e.store.Count(ctx, b.Address()); err != nil || n != 1 {
 		t.Fatalf("the box holds %d messages (%v), want the one", n, err)
 	}
-	var req protocol.SendRequest
-	if err := json.Unmarshal(*sent, &req); err != nil {
-		t.Fatal(err)
-	}
-	req.Ciphertext[len(req.Ciphertext)-1] ^= 1 // another ciphertext, to the same retired prekey
-	e.want(e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", req, e.pass(a)), http.StatusConflict, protocol.CodeStalePrekey)
+	other := *sent
+	other.ciphertext = append([]byte{}, sent.ciphertext...)
+	other.ciphertext[len(other.ciphertext)-1] ^= 1 // another ciphertext, to the same retired prekey
+	e.want(e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", other, e.pass(a)), http.StatusConflict, protocol.CodeStalePrekey)
 }
 
 // A sender's calls bound what its sends cost before they are checked, the
@@ -61,7 +59,7 @@ func TestASendersCallsBoundTheDedupeRead(t *testing.T) {
 	l := relaxed()
 	e := newEnv(t, l)
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
+	sent := capture(e, "/v1/"+b.Address().String())
 	send(t, a, b, "once")
 	e.setMiddle(nil)
 	l.CallBurst, l.CallRefill = 3, time.Minute
@@ -91,7 +89,7 @@ func TestTheReceiveBudget(t *testing.T) {
 	e := newEnv(t, l)
 	b := e.box(protocol.Classic)
 	s1, s2, s3 := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
+	sent := capture(e, "/v1/"+b.Address().String())
 	send(t, s1, b, "one")
 	e.setMiddle(nil)
 	send(t, s2, b, "two")
@@ -105,7 +103,7 @@ func TestTheReceiveBudget(t *testing.T) {
 	if rs, err := s3.Flush(ctx); err != nil || len(rs) != 1 {
 		t.Fatalf("the waiting message after a refill: %v, %v", rs, err)
 	}
-	if n, _, err := e.store.Count(ctx, b.Address()); err != nil || n != 3 {
+	if n, err := e.store.Count(ctx, b.Address()); err != nil || n != 3 {
 		t.Fatalf("the box holds %d messages (%v), want 3", n, err)
 	}
 
@@ -401,9 +399,7 @@ func concurrently(t *testing.T, e *env, l Limits, to *raw, froms []*raw, n int) 
 			w, _ := age.Encrypt(&ct, to.keys[1].Recipient())
 			_, _ = io.WriteString(w, `{"v":1}`)
 			_ = w.Close()
-			one := uint64(1)
-			j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: ct.Bytes()})
-			posts = append(posts, post{j, pass})
+			posts = append(posts, post{ct.Bytes(), pass})
 		}
 	}
 	var wg sync.WaitGroup
@@ -413,7 +409,7 @@ func concurrently(t *testing.T, e *env, l Limits, to *raw, froms []*raw, n int) 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req, _ := http.NewRequest(http.MethodPost, srv.URL+to.path("/messages"), bytes.NewReader(p.body))
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+to.path("/messages?")+sealedTo(1, 1, nil).Encode(), bytes.NewReader(p.body))
 			req.Header.Set("Authorization", p.pass)
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {

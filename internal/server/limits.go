@@ -12,7 +12,7 @@ import (
 // Limits are the server's numbers. Decided ones are marked; the rest are
 // tunables, and a zero turns that limit off.
 type Limits struct {
-	MaxSize        int           // the cap on the decoded ciphertext; nothing may depend on its value
+	MaxSize        int           // the cap on a ciphertext, in bytes, and what a send reads of its body; nothing may depend on its value
 	PairCap        int           // unacked per (sender → box) [tunable]
 	BoxCap         int           // total per box, a storage ceiling [tunable]
 	SendsPerDay    int           // per sender, per UTC day (decided: 20)

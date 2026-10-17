@@ -50,10 +50,23 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	// 2. Size and shape, to the sender's own cap. Past the free cap's size,
-	// a read waits for the one allowance for large reads, which only a
-	// sender whose cap is larger ever takes.
-	free, limit := readLimit(s.limits.MaxSize), readLimit(lim.MaxSize)
+	// 2. The request's target, before the body is read: the recipient's
+	// address, and in the query the two serials and nothing else, each once
+	// and written as a statement writes one.
+	to, err := pathAddr(r, protocol.PrekeySerialParam, protocol.CertificateSerialParam)
+	if err != nil {
+		return err
+	}
+	q, err := protocol.ParseSendQuery(r.URL.RawQuery)
+	if err != nil {
+		return queryProblem(err, "name the serials of the prekey the ciphertext is encrypted to, and of the certificate its statement is signed under: irongall send does")
+	}
+
+	// 3. The body is the ciphertext's bytes, whatever its Content-Type says,
+	// read to the sender's own cap. Past the free cap's size, a read waits
+	// for the one allowance for large reads, which only a sender whose cap is
+	// larger ever takes.
+	free, limit := int64(s.limits.MaxSize), int64(lim.MaxSize)
 	tooLarge := fail(protocol.CodeTooLarge, "send less", "the ciphertext is over %d bytes", limitValue(lim.MaxSize))
 	if r.ContentLength > limit {
 		return tooLarge
@@ -98,31 +111,10 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		}
 		data = append(data, rest...)
 	}
-	var req protocol.SendRequest
-	if err := decodeJSON(data, &req); err != nil {
-		return err
-	}
-	if err := required("ciphertext", req.Ciphertext); err != nil {
-		return err
-	}
-	if len(req.Ciphertext) > lim.MaxSize {
-		return tooLarge
-	}
-
-	// 3. The recipient's address, and the serials.
-	to, err := pathAddr(r)
-	if err != nil {
-		return err
-	}
-	if req.PrekeySerial == nil || *req.PrekeySerial < 1 || *req.PrekeySerial > protocol.MaxSerial {
-		return fail(protocol.CodeBadRequest, "name the serial of the prekey the ciphertext is encrypted to: irongall send does", "%s is missing or not a serial", memberValue("prekey_serial"))
-	}
-	if req.CertificateSerial == nil || *req.CertificateSerial < 1 || *req.CertificateSerial > protocol.MaxSerial {
-		return fail(protocol.CodeBadRequest, "name the serial of the certificate that prekey's statement is signed under: irongall send does", "%s is missing or not a serial", memberValue("certificate_serial"))
-	}
+	ciphertext := data
 
 	// 4. It is an age file.
-	stanzas, err := stanzasOf(req.Ciphertext)
+	stanzas, err := stanzasOf(ciphertext)
 	if err != nil {
 		return fail(protocol.CodeNotAge, "encrypt with age to the box's prekey", "the ciphertext is not an age file")
 	}
@@ -143,7 +135,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	// retry gets the original receipt, whatever has changed since it was
 	// stored, a renewal of the box's prekey included. What those checks
 	// keep from the box is new mail, and a retry is none.
-	msgID := sha256.Sum256(req.Ciphertext)
+	msgID := sha256.Sum256(ciphertext)
 	if orig, err := s.store.Dedupe(ctx, to, msgID); err == nil {
 		return s.duplicate(w, orig, from)
 	} else if !errors.Is(err, ErrNotFound) {
@@ -171,7 +163,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 			"this box's client does not verify identities of your box's key type, %s", keyTypeValue(t))
 	}
 	// A prekey is named by both serials: its own, and its certificate's.
-	if *req.PrekeySerial != rcpt.Prekey.Serial || *req.CertificateSerial != rcpt.CertSerial {
+	if q.PrekeySerial != rcpt.Prekey.Serial || q.CertificateSerial != rcpt.CertSerial {
 		return fail(protocol.CodeStalePrekey, "a newer prekey exists: read GET /v1/<address> again and re-encrypt the same envelope (irongall does this)", "the box's current prekey is serial %d, under certificate %d", prekeySerialValue(rcpt.Prekey.Serial), certificateSerialValue(rcpt.CertSerial))
 	}
 	if p := checkStanzas(stanzas, rcpt); p != nil {
@@ -231,11 +223,11 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	h := &Header{
 		ID:         msgID,
 		From:       from,
-		Size:       len(req.Ciphertext),
+		Size:       len(ciphertext),
 		ReceivedAt: now.UTC().Truncate(time.Millisecond),
 		ExpiresAt:  now.UTC().Truncate(time.Millisecond).Add(protocol.TTL),
 	}
-	orig, err := s.store.PutMessage(ctx, to, h, req.Ciphertext)
+	orig, err := s.store.PutMessage(ctx, to, h, ciphertext)
 	if err != nil {
 		return err
 	}
@@ -270,7 +262,7 @@ func (s *Server) reserveCaps(ctx context.Context, to, from protocol.Address) (re
 		return func() {}, nil, nil
 	}
 	// Load the box first, so what is read under the lock is memory.
-	if _, _, err := s.store.Count(ctx, to); err != nil {
+	if _, err := s.store.Count(ctx, to); err != nil {
 		return nil, nil, err
 	}
 	f := &s.inFlight[to[0]]
@@ -289,12 +281,12 @@ func (s *Server) reserveCaps(ctx context.Context, to, from protocol.Address) (re
 		}
 	}
 	if s.limits.BoxCap > 0 {
-		n, _, err := s.store.Count(ctx, to)
+		n, err := s.store.Count(ctx, to)
 		if err != nil {
 			return nil, nil, err
 		}
 		if n += f.box[to]; n >= s.limits.BoxCap {
-			p := fail(protocol.CodeMailboxFull, "the box is full: retry later", "the box holds %d messages", messagesValue(n))
+			p := fail(protocol.CodeMailboxFull, "the box is full: retry later", "the box holds %d messages", countValue(n))
 			p.retryAfter = time.Duration(s.limits.PollAfter) * time.Second
 			return nil, p, nil
 		}
@@ -315,10 +307,6 @@ func (s *Server) reserveCaps(ctx context.Context, to, from protocol.Address) (re
 		}
 	}, nil, nil
 }
-
-// readLimit is the request body that carries a ciphertext of size bytes:
-// base64 plus JSON overhead.
-func readLimit(size int) int64 { return int64((size*4+2)/3) + 4<<10 }
 
 func receipt(h *Header) protocol.Receipt {
 	return protocol.Receipt{ID: hexID(h.ID), ReceivedAt: formatTime(h.ReceivedAt), ExpiresAt: formatTime(h.ExpiresAt)}

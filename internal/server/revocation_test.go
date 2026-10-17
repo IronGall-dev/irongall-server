@@ -115,11 +115,11 @@ func TestRevocation(t *testing.T) {
 		"B's document":                              {protocol.Revocations{Identity: docB, Revocation: rec.Revocation}, protocol.CodeIdentityMismatch},
 		"B's whole record":                          {ofB, protocol.CodeIdentityMismatch},
 		"no signature":                              {[]byte(`{"identity":"` + string(mustJSONBytes(t, docA)) + `"}`), protocol.CodeBadRequest},
-		"no document":                               {[]byte(`{"revocation":"eA=="}`), protocol.CodeBadRequest},
-		"a member the body does not have":           {[]byte(`{"identity":"eA==","revocation":"eA==","reason":"lost"}`), protocol.CodeBadRequest},
+		"no document":                               {[]byte(`{"revocation_signature":"eA=="}`), protocol.CodeBadRequest},
+		"a member the body does not have":           {[]byte(`{"identity":"eA==","revocation_signature":"eA==","reason":"lost"}`), protocol.CodeBadRequest},
 		"not JSON":                                  {[]byte(`revoke`), protocol.CodeBadRequest},
-		"a name in another case":                    {bytes.Replace(recJSON, []byte(`"revocation"`), []byte(`"Revocation"`), 1), protocol.CodeBadRequest},
-		"a name twice":                              {bytes.Replace(recJSON, []byte(`{`), []byte(`{"revocation":"eA==",`), 1), protocol.CodeBadRequest},
+		"a name in another case":                    {bytes.Replace(recJSON, []byte(`"revocation_signature"`), []byte(`"Revocation_Signature"`), 1), protocol.CodeBadRequest},
+		"a name twice":                              {bytes.Replace(recJSON, []byte(`{`), []byte(`{"revocation_signature":"eA==",`), 1), protocol.CodeBadRequest},
 		"a second value after it":                   {append(append([]byte{}, recJSON...), "{}"...), protocol.CodeBadRequest},
 		"base64 with its unused bits set":           {unusedBitsSet(t, recJSON), protocol.CodeBadEncoding},
 		"a record of another type":                  {bytes.Replace(recJSON, []byte(`"type":"revocation_record"`), []byte(`"type":"revocation"`), 1), protocol.CodeBadRequest},
@@ -144,7 +144,7 @@ func TestRevocation(t *testing.T) {
 	if got := held(t, unrevoked); got != nil {
 		t.Fatalf("what was refused is shown: %s", unrevoked.body)
 	}
-	if n, _, _ := e.store.Count(ctx, a.Address()); n != 1 {
+	if n, _ := e.store.Count(ctx, a.Address()); n != 1 {
 		t.Fatalf("A holds %d messages before it is revoked, want 1", n)
 	}
 	send(t, c, a, "A still takes mail")
@@ -159,7 +159,7 @@ func TestRevocation(t *testing.T) {
 	if err != nil || stored.State != Revoked || string(stored.Revocation) != string(rec.Revocation) {
 		t.Fatalf("the record after a revocation: %+v, %v", stored, err)
 	}
-	if n, _, _ := e.store.Count(ctx, a.Address()); n != 0 {
+	if n, _ := e.store.Count(ctx, a.Address()); n != 0 {
 		t.Errorf("a revoked box still holds %d messages", n)
 	}
 
@@ -457,11 +457,11 @@ func TestARevocationRetriedAfterAFailedDeleteDeletes(t *testing.T) {
 	if stored, err := e.store.Box(ctx, a.Address()); err != nil || stored.State != Revoked {
 		t.Fatalf("after a revocation whose delete failed the box is %+v, %v", stored, err)
 	}
-	if n, _, err := e.store.Count(ctx, a.Address()); err != nil || n != 1 {
+	if n, err := e.store.Count(ctx, a.Address()); err != nil || n != 1 {
 		t.Fatalf("after a revocation whose delete failed the box holds %d messages (%v), want the 1 it had", n, err)
 	}
 	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
-	if n, _, err := e.store.Count(ctx, a.Address()); err != nil || n != 0 {
+	if n, err := e.store.Count(ctx, a.Address()); err != nil || n != 0 {
 		t.Errorf("after the retry the revoked box holds %d messages (%v), want none", n, err)
 	}
 	// With the box empty, one more reads nothing.
