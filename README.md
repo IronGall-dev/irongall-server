@@ -10,7 +10,7 @@ The server of [irongall.dev](https://irongall.dev): end-to-end encrypted, sender
 
 | Path | Holds |
 |---|---|
-| `cmd/irongalld/` | The command: `irongalld serve`, and `irongalld account` for the operator |
+| `cmd/irongalld/` | The command: `irongalld serve`, and `irongalld account` and `irongalld limits` for the operator |
 | `internal/server/` | The API (every route under `/v1/`, and `/to/<address>`, the page a box's link opens), what each process holds in memory, the DynamoDB stream followers, the two stores (DynamoDB with S3 Express One Zone, and in memory) and the limits |
 | [`PROTOCOL-SERVER.md`](PROTOCOL-SERVER.md) | How this server does each step of the specification, under the specification's section numbers |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Processes, memory, request paths, failure modes and the stages of scale |

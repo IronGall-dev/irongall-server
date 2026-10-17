@@ -277,6 +277,17 @@ func (bs *buckets) next(key string, now time.Time) (next time.Time, over time.Du
 	return next, next.Sub(now) - time.Duration(bs.n)*bs.every
 }
 
+// clear fills key's bucket at now, as if the key had never been seen, and
+// reports whether it held anything: a token taken and not yet back.
+// Reservations in flight settle as they would have.
+func (bs *buckets) clear(key string, now time.Time) bool {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	full, ok := bs.full[key]
+	delete(bs.full, key)
+	return ok && full.After(now)
+}
+
 // prune drops every key whose bucket is full again, once each time an empty
 // bucket would have filled: the map holds only keys used within the last two
 // such periods, not every key ever seen.

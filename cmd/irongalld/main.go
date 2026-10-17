@@ -5,6 +5,7 @@
 //	irongalld account create -accounts-table T [-id NAME] [-unmetered]
 //	irongalld account key -accounts-table T -keys FILE -account ID -uses N -ttl D
 //	irongalld account drop -boxes-table T -accounts-table T -account ID -box ADDR
+//	irongalld limits clear -socket PATH -ip ADDR
 //
 // The first keeps state in three DynamoDB tables, boxes, messages and
 // accounts, and an S3 Express One Zone directory bucket (PROTOCOL-SERVER.md §7),
@@ -49,9 +50,12 @@ func main() {
 		err = serve(os.Args[2:])
 	case len(os.Args) >= 3 && os.Args[1] == "account":
 		err = account(os.Args[2], os.Args[3:])
+	case len(os.Args) >= 3 && os.Args[1] == "limits":
+		err = limits(os.Args[2], os.Args[3:])
 	default:
 		fmt.Fprintln(os.Stderr, "usage: irongalld serve (-boxes-table T -msgs-table T -accounts-table T -bucket B -keys FILE -names NAMES | --dev) [-listen addr] [options] [limits]")
 		fmt.Fprintln(os.Stderr, "       irongalld account (create | key | drop) [flags]")
+		fmt.Fprintln(os.Stderr, "       irongalld limits clear -socket PATH -ip ADDR")
 		os.Exit(2)
 	}
 	if err != nil {
@@ -101,6 +105,7 @@ func serve(args []string) error {
 	fs.IntVar(&l.ACLEntries, "acl-entries", l.ACLEntries, "the most entries a box's ACL holds, its two lists together (0: off)")
 	fs.DurationVar(&l.BodyTimeout, "body-timeout", l.BodyTimeout, "how long a request body, or a response, may take before one more second for each -body-min-rate bytes moved; also the longest wait for the one large read (0: off)")
 	fs.IntVar(&l.BodyMinRate, "body-min-rate", l.BodyMinRate, "bytes a second a body must keep up, as Apache's RequestReadTimeout MinRate (0: off)")
+	adminSocket := fs.String("admin-socket", "", "a Unix socket for the operator's commands (irongalld limits): made 0600 by this process, never on the API's listener (empty: none)")
 	idle := fs.Duration("idle-timeout", 75*time.Second, "how long an idle keep-alive connection stays open (nginx's default; above the 60 s nginx keeps idle upstream connections)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -194,9 +199,20 @@ func serve(args []string) error {
 		logger.Printf("irongalld on %s: tables %s, %s and %s, bucket %s", *listen, *boxes, *msgs, *accts, *bucket)
 	}
 
+	api := server.New(cfg)
+	if *adminSocket != "" {
+		l, err := listenAdmin(*adminSocket)
+		if err != nil {
+			return err
+		}
+		admin := &http.Server{Handler: api.AdminHandler(), ReadHeaderTimeout: 10 * time.Second}
+		go func() { _ = admin.Serve(l) }()
+		defer admin.Close() //nolint:errcheck // the process is ending
+		logger.Printf("operator commands on %s", *adminSocket)
+	}
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           server.New(cfg).Handler(),
+		Handler:           api.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       *idle,
 	}

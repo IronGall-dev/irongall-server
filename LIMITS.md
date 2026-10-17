@@ -65,6 +65,10 @@ Every limit `irongalld` enforces, what it protects, who pays for it, when it is 
 6. **The one large read can still be held for as long as a body takes at the minimum rate:** for a body of the largest cap, hours. Only a box whose account lifts its cap can take it, and a send waiting for it gives up after `-body-timeout`.
 7. **Nothing bounds how many sends wait for the large read,** and each holds the free size it has read while it waits.
 
+## An operator clearing an address
+
+`irongalld limits clear -socket PATH -ip ADDR` forgets what the four limits keyed by an address hold of one caller, as if it had never been seen: its calls with no pass, its misses, its registrations and its sends before their pass. An IPv6 address is cleared by its /64, as it is counted. It goes through the running server's `-admin-socket`, because the counts are in that process's memory and a process of its own could not reach them; so it clears one process's (weakness 1). The socket is a Unix socket the server makes 0600, never on the API's listener, and the server logs that a clear happened and which limits held anything, never the address. It answers `{"address": <the key cleared>, "cleared": [<those limits>]}`. A box's own budgets are not touched.
+
 ## Tested
 
-`internal/server/budgets_test.go` holds each budget and each order above, `limits_test.go` the polls, pages, repeats and misses, `marks_test.go` the tags that memory knows messages by, `accounts_test.go` the large read, `server_test.go` the renewals, and `acl_test.go` the ACL's bound, its order of checks and that a send it refuses spends no count. They run on the in-memory store, and on DynamoDB with the test tables set (`AGENTS.md`).
+`internal/server/budgets_test.go` holds each budget and each order above, `admin_test.go` and `cmd/irongalld/limits_test.go` an operator's clear, `limits_test.go` the polls, pages, repeats and misses, `marks_test.go` the tags that memory knows messages by, `accounts_test.go` the large read, `server_test.go` the renewals, and `acl_test.go` the ACL's bound, its order of checks and that a send it refuses spends no count. They run on the in-memory store, and on DynamoDB with the test tables set (`AGENTS.md`).
