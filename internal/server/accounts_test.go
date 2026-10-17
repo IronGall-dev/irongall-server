@@ -242,7 +242,7 @@ func TestAccounts(t *testing.T) {
 		e.want(e.do(http.MethodDelete, r.path("/account"), nil, pass), 204, "")
 		// Over the sender's own cap, a send is refused before its body is
 		// read: here, before the server finds it is no age file.
-		e.want(e.do(http.MethodPost, r.path(""), protocol.SendRequest{Ciphertext: make([]byte, 16384)}, pass), 413, protocol.CodeTooLarge)
+		e.want(e.do(http.MethodPost, r.path("/messages"), protocol.SendRequest{Ciphertext: make([]byte, 16384)}, pass), 413, protocol.CodeTooLarge)
 	})
 }
 
@@ -369,7 +369,7 @@ func TestLargeReadsTakeTurns(t *testing.T) {
 		j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: make([]byte, size)})
 		ctx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String(), bytes.NewReader(j))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String()+"/messages", bytes.NewReader(j))
 		if pass != "" {
 			req.Header.Set("Authorization", pass)
 		}
@@ -422,14 +422,14 @@ func TestAStalledBodyGivesTheLargeReadBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	_, _ = io.WriteString(conn, "POST /v1/"+to.Address().String()+" HTTP/1.1\r\nHost: "+addr+"\r\nAuthorization: "+e.pass(lifted)+
+	_, _ = io.WriteString(conn, "POST /v1/"+to.Address().String()+"/messages HTTP/1.1\r\nHost: "+addr+"\r\nAuthorization: "+e.pass(lifted)+
 		"\r\nContent-Type: application/json\r\nContent-Length: 60000\r\n\r\n"+strings.Repeat("a", 30000)) // past the free size, then nothing
 	time.Sleep(50 * time.Millisecond) // the stalled send holds the large read
 	one := uint64(1)
 	j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: make([]byte, 30000)})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String(), bytes.NewReader(j))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String()+"/messages", bytes.NewReader(j))
 	req.Header.Set("Authorization", e.pass(lifted))
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
@@ -458,7 +458,7 @@ func TestAWaitForTheLargeReadIsBounded(t *testing.T) {
 	j, _ := json.Marshal(protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: make([]byte, 30000)})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String(), bytes.NewReader(j))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/v1/"+to.Address().String()+"/messages", bytes.NewReader(j))
 	req.Header.Set("Authorization", e.pass(lifted))
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)

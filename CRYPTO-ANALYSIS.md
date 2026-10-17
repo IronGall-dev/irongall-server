@@ -175,7 +175,7 @@ A send signs the envelope with the recipient bound into the signature, then encr
 2. A writes the envelope: one line of compact JSON with REQUIRED fields `{v, from: A, to: B, sent_at, msg_id, identity, body}`. `msg_id` is a random UUID kept across retries, so a re-encrypted retry is delivered once. `identity` is A's own identity document, so B can check a sender it has never met without asking the server.
 3. A signs that line with its working key, SSHSIG namespace `irongall-msg-v1:<B>`, so the signature is valid only for B.
 4. A encrypts with age to B's prekey: the line, then the signature block exactly as `ssh-keygen` wrote it, then padding. It is the layout of a signed git tag. One `mlkem768x25519` stanza (about 1.6 KB) for post-quantum, or one X25519 stanza for a `--no-pq` box. The payload is ChaCha20-Poly1305 under a key derived from a random file key.
-5. A posts `{prekey_serial, certificate_serial, ciphertext}`, carrying its pass: the sender is the mailbox the pass names. The two serials name the prekey A used, and both are required. If B has a newer prekey, A gets `409 stale_prekey` and encrypts the same signed envelope again.
+5. A sends `POST /v1/<B>/messages` with `{prekey_serial, certificate_serial, ciphertext}`, carrying its pass: the sender is the mailbox the pass names. The two serials name the prekey A used, and both are required. If B has a newer prekey, A gets `409 stale_prekey` and encrypts the same signed envelope again.
 
 **The server's checks, cheapest first; nothing is written until all pass**
 

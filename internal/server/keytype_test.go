@@ -324,7 +324,7 @@ func TestTheSenderKeyTypesABoxDeclared(t *testing.T) {
 		}
 		_, _ = io.WriteString(w, `{"v":1}`)
 		_ = w.Close()
-		return e.do("POST", to.path(""), protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &serial, Ciphertext: ct.Bytes()}, from.pass(1))
+		return e.do("POST", to.path("/messages"), protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &serial, Ciphertext: ct.Bytes()}, from.pass(1))
 	}
 
 	nothing := declaring(nil)

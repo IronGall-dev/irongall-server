@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IronGall-dev/irongall-client/api/apitest"
 	"github.com/IronGall-dev/irongall-client/client"
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
@@ -241,7 +242,7 @@ func TestARevocationOutlivesTheProcess(t *testing.T) {
 	e.want(e.do("PUT", revocationPath(a.Address()), rec, ""), 201, "")
 
 	later := startDynamo(t, e.clock.Now) // its memory holds nothing of A
-	srv := httptest.NewServer(New(Config{Store: later, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: later.Ready}).Handler())
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: later, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: later.Ready}).Handler()))
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	e2.want(e2.do("GET", "/v1/"+a.Address().String()+"/identity", nil, ""), 410, protocol.CodeRevoked)
@@ -299,7 +300,7 @@ func countingEnv(t *testing.T) (*env, *countingDeletes) {
 	cs := &countingDeletes{Store: inner}
 	e := &env{t: t, clock: clk, keys: keys, store: cs}
 	e.server = New(Config{Store: cs, Keys: keys, Limits: relaxed(), Now: clk.Now, Ready: ready})
-	e.srv = httptest.NewServer(e.server.Handler())
+	e.srv = httptest.NewServer(apitest.Handler(t, e.server.Handler()))
 	t.Cleanup(e.srv.Close)
 	return e, cs
 }

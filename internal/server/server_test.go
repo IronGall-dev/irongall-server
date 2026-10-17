@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/IronGall-dev/irongall-client/api/apitest"
 	"github.com/IronGall-dev/irongall-client/client"
 	"github.com/IronGall-dev/irongall-client/protocol"
 	"golang.org/x/crypto/ssh"
@@ -520,7 +521,7 @@ func TestAPassIsForOneServer(t *testing.T) {
 	keys, _ := NewDevKeys()
 	clk := &clock{t: time.Now().UTC().Truncate(time.Second)}
 	e := &env{t: t, clock: clk, keys: keys, store: NewMemStore(clk.Now)}
-	e.srv = httptest.NewServer(New(Config{Store: e.store, Keys: keys, Limits: relaxed(), Now: clk.Now, Names: []string{"mail.example", "mail.example:8443"}}).Handler())
+	e.srv = httptest.NewServer(apitest.Handler(t, New(Config{Store: e.store, Keys: keys, Limits: relaxed(), Now: clk.Now, Names: []string{"mail.example", "mail.example:8443"}}).Handler()))
 	t.Cleanup(e.srv.Close)
 	r := e.raw()
 	r.prekey(1, clk.Now().Add(time.Hour), nil)
@@ -651,16 +652,16 @@ func TestSendPipeline(t *testing.T) {
 	pass := e.pass(a)
 
 	// The pass comes first: with none, nothing of the body is judged.
-	e.want(e.do("POST", to, ok, ""), 401, protocol.CodeUnauthorized)
-	e.want(e.do("POST", to, []byte("not json"), ""), 401, protocol.CodeUnauthorized)
-	e.want(e.do("POST", "/v1/nope", ok, ""), 401, protocol.CodeUnauthorized)
+	e.want(e.do("POST", to+"/messages", ok, ""), 401, protocol.CodeUnauthorized)
+	e.want(e.do("POST", to+"/messages", []byte("not json"), ""), 401, protocol.CodeUnauthorized)
+	e.want(e.do("POST", "/v1/nope/messages", ok, ""), 401, protocol.CodeUnauthorized)
 
-	e.want(e.do("POST", to, []byte("not json"), pass), 400, protocol.CodeBadRequest)
+	e.want(e.do("POST", to+"/messages", []byte("not json"), pass), 400, protocol.CodeBadRequest)
 	// The sender is the box the pass names: the body names none, and holds
 	// no signature.
 	j, _ := json.Marshal(ok)
 	for _, member := range []string{`"from":"` + a.Address().String() + `",`, `"signature":"",`} {
-		e.want(e.do("POST", to, append([]byte("{"+member), j[1:]...), pass), 400, protocol.CodeBadRequest)
+		e.want(e.do("POST", to+"/messages", append([]byte("{"+member), j[1:]...), pass), 400, protocol.CodeBadRequest)
 	}
 	// Read as every reader reads JSON (PROTOCOL.md §0b), its serials no more
 	// than 2^53 - 1 and written as integers.
@@ -673,37 +674,37 @@ func TestSendPipeline(t *testing.T) {
 		"a serial with a fraction": serial.ReplaceAllFunc(j, func(b []byte) []byte { return append(append([]byte{}, b...), ".0"...) }),
 		"a serial as a string":     serial.ReplaceAllFunc(j, func(b []byte) []byte { return []byte(`"prekey_serial":"` + string(b[16:]) + `"`) }),
 	} {
-		if got := e.do("POST", to, body, pass); got.status != 400 || got.code() != protocol.CodeBadRequest {
+		if got := e.do("POST", to+"/messages", body, pass); got.status != 400 || got.code() != protocol.CodeBadRequest {
 			t.Errorf("%s: %d %s, want 400 %s", name, got.status, got.code(), protocol.CodeBadRequest)
 		}
 	}
-	e.want(e.do("POST", to, unusedBitsSet(t, j), pass), 400, protocol.CodeBadEncoding)
-	e.want(e.do("POST", "/v1/nope", ok, pass), 400, protocol.CodeBadAddress)
+	e.want(e.do("POST", to+"/messages", unusedBitsSet(t, j), pass), 400, protocol.CodeBadEncoding)
+	e.want(e.do("POST", "/v1/nope/messages", ok, pass), 400, protocol.CodeBadAddress)
 	zero := ok
 	var z uint64
 	zero.PrekeySerial = &z
-	e.want(e.do("POST", to, zero, pass), 400, protocol.CodeBadRequest)
+	e.want(e.do("POST", to+"/messages", zero, pass), 400, protocol.CodeBadRequest)
 	noSerial := ok
 	noSerial.PrekeySerial = nil
-	e.want(e.do("POST", to, noSerial, pass), 400, protocol.CodeBadRequest)
+	e.want(e.do("POST", to+"/messages", noSerial, pass), 400, protocol.CodeBadRequest)
 	// A prekey is named by both serials: its own, and its certificate's.
 	zeroCert, noCert := ok, ok
 	zeroCert.CertificateSerial, noCert.CertificateSerial = &z, nil
-	e.want(e.do("POST", to, zeroCert, pass), 400, protocol.CodeBadRequest)
-	e.want(e.do("POST", to, noCert, pass), 400, protocol.CodeBadRequest)
+	e.want(e.do("POST", to+"/messages", zeroCert, pass), 400, protocol.CodeBadRequest)
+	e.want(e.do("POST", to+"/messages", noCert, pass), 400, protocol.CodeBadRequest)
 	notAge := ok
 	notAge.Ciphertext = []byte("not an age file")
-	e.want(e.do("POST", to, notAge, pass), 400, protocol.CodeNotAge)
-	e.want(e.do("POST", to, seal(classic.Recipient()), pass), 400, protocol.CodeWrongRecipientType)
+	e.want(e.do("POST", to+"/messages", notAge, pass), 400, protocol.CodeNotAge)
+	e.want(e.do("POST", to+"/messages", seal(classic.Recipient()), pass), 400, protocol.CodeWrongRecipientType)
 	two, _ := age.GenerateHybridIdentity()
-	e.want(e.do("POST", to, seal(pqRecipient, two.Recipient()), pass), 400, protocol.CodeWrongRecipientType)
+	e.want(e.do("POST", to+"/messages", seal(pqRecipient, two.Recipient()), pass), 400, protocol.CodeWrongRecipientType)
 	stale := ok
 	s9 := uint64(9)
 	stale.PrekeySerial = &s9
-	e.want(e.do("POST", to, stale, pass), 409, protocol.CodeStalePrekey)
+	e.want(e.do("POST", to+"/messages", stale, pass), 409, protocol.CodeStalePrekey)
 	staleCert := ok
 	staleCert.CertificateSerial = &s9
-	e.want(e.do("POST", to, staleCert, pass), 409, protocol.CodeStalePrekey)
+	e.want(e.do("POST", to+"/messages", staleCert, pass), 409, protocol.CodeStalePrekey)
 
 	big := relaxed()
 	big.MaxSize = 100
@@ -716,26 +717,26 @@ func TestSendPipeline(t *testing.T) {
 	// A pass that names no box here, and a recipient that is none.
 	unregistered := e.raw()
 	unregistered.prekey(1, e.clock.Now().Add(time.Hour), nil)
-	e.want(e.do("POST", to, ok, unregistered.pass(1)), 403, protocol.CodeUnknownSender)
-	e.want(e.do("POST", "/v1/"+unregistered.id.Address().String(), ok, pass), 404, protocol.CodeNoSuchMailbox)
+	e.want(e.do("POST", to+"/messages", ok, unregistered.pass(1)), 403, protocol.CodeUnknownSender)
+	e.want(e.do("POST", "/v1/"+unregistered.id.Address().String()+"/messages", ok, pass), 404, protocol.CodeNoSuchMailbox)
 	// A pass that is not the box's it names: under a certificate the server
 	// never saw, and with its signature changed.
 	other := e.raw()
 	other.signer, other.id = signer(t, a), a.Identity()
-	e.want(e.do("POST", to, ok, e.passFor(other.certify(7), a.Address(), e.name())), 401, protocol.CodeCertificateNotCurrent)
+	e.want(e.do("POST", to+"/messages", ok, e.passFor(other.certify(7), a.Address(), e.name())), 401, protocol.CodeCertificateNotCurrent)
 	e.clock.Add(-protocol.PassLifetime)
 	ranOut := e.pass(a)
 	e.clock.Add(protocol.PassLifetime)
-	e.want(e.do("POST", to, ok, ranOut), 401, protocol.CodePassExpired)
+	e.want(e.do("POST", to+"/messages", ok, ranOut), 401, protocol.CodePassExpired)
 
 	// A registered sender that is closed.
 	c := e.raw().register(time.Hour)
 	e.want(e.do("DELETE", c.path(""), nil, c.pass(1)), 204, "")
-	e.want(e.do("POST", to, ok, c.pass(1)), 403, protocol.CodeUnknownSender)
+	e.want(e.do("POST", to+"/messages", ok, c.pass(1)), 403, protocol.CodeUnknownSender)
 
-	first := e.do("POST", to, ok, pass)
+	first := e.do("POST", to+"/messages", ok, pass)
 	e.want(first, 201, "")
-	retry := e.do("POST", to, ok, pass)
+	retry := e.do("POST", to+"/messages", ok, pass)
 	e.want(retry, 200, "")
 	if !bytes.Equal(first.body, retry.body) {
 		t.Fatalf("a retry's receipt %s is not the original %s", retry.body, first.body)
@@ -743,7 +744,7 @@ func TestSendPipeline(t *testing.T) {
 	// The same ciphertext under another box's pass: a conflict, never a
 	// receipt.
 	d := e.box(protocol.Classic)
-	e.want(e.do("POST", to, ok, e.pass(d)), 409, protocol.CodeConflict)
+	e.want(e.do("POST", to+"/messages", ok, e.pass(d)), 409, protocol.CodeConflict)
 	// What the recipient is handed names the box whose pass the send
 	// carried, and holds no signature.
 	var rcpt protocol.Receipt
@@ -763,8 +764,8 @@ func TestSendPipeline(t *testing.T) {
 		rec.State = Revoked
 		_ = e.store.UpdateBox(ctx, rec)
 	}
-	e.want(e.do("POST", to, seal(pqRecipient), pass), 403, protocol.CodeSenderRevoked)
-	e.want(e.do("POST", to, seal(pqRecipient), e.pass(d)), 410, protocol.CodeRevoked)
+	e.want(e.do("POST", to+"/messages", seal(pqRecipient), pass), 403, protocol.CodeSenderRevoked)
+	e.want(e.do("POST", to+"/messages", seal(pqRecipient), e.pass(d)), 410, protocol.CodeRevoked)
 	e.want(e.do("GET", "/v1/"+a.Address().String()+"/identity", nil, ""), 410, protocol.CodeRevoked)
 	e.want(e.do("GET", "/v1/"+a.Address().String()+"/messages", nil, pass), 410, protocol.CodeRevoked)
 
@@ -773,7 +774,7 @@ func TestSendPipeline(t *testing.T) {
 	rec.State = Active
 	_ = e.store.UpdateBox(ctx, rec)
 	e.clock.Add(protocol.MaxPrekeyLifetime)
-	e.want(e.do("POST", to, seal(pqRecipient), e.pass(d)), 409, protocol.CodePrekeyExpired)
+	e.want(e.do("POST", to+"/messages", seal(pqRecipient), e.pass(d)), 409, protocol.CodePrekeyExpired)
 }
 
 // greaseRecipient adds a grease stanza, as rage and pyrage do.
@@ -798,7 +799,7 @@ func TestGreaseIsIgnored(t *testing.T) {
 	_ = w.Close()
 	serial, under := e.numbers(b.Address())
 	req := protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &under, Ciphertext: ct.Bytes()}
-	e.want(e.do("POST", "/v1/"+b.Address().String(), req, e.pass(a)), 201, "")
+	e.want(e.do("POST", "/v1/"+b.Address().String()+"/messages", req, e.pass(a)), 201, "")
 }
 
 func TestPerIPLimits(t *testing.T) {
@@ -836,10 +837,10 @@ func TestClientIPFromTrustedProxy(t *testing.T) {
 		{"untrusted peer: the header is ignored", nil, http.StatusTooManyRequests},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			srv := httptest.NewServer(New(Config{Store: store, Keys: keys, Limits: l, TrustedProxies: c.trusted}).Handler())
+			srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: store, Keys: keys, Limits: l, TrustedProxies: c.trusted}).Handler()))
 			defer srv.Close()
 			call := func(ip string) int {
-				req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/"+protocol.Address{1}.String(), nil)
+				req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/"+protocol.Address{1}.String()+"/messages", nil)
 				req.Header.Set("CF-Connecting-IP", ip)
 				resp, err := http.DefaultClient.Do(req)
 				if err != nil {
@@ -887,8 +888,8 @@ func TestSendNamesTheCurrentPrekey(t *testing.T) {
 	}
 	to := "/v1/" + b.Address().String()
 	current, _ := e.numbers(b.Address())
-	e.want(e.do("POST", to, sealOld("named the retired serial", old.Prekey.Serial), e.pass(a)), 409, protocol.CodeStalePrekey)
-	e.want(e.do("POST", to, sealOld("sealed to the retired key", current), e.pass(a)), 400, protocol.CodeWrongRecipientType)
+	e.want(e.do("POST", to+"/messages", sealOld("named the retired serial", old.Prekey.Serial), e.pass(a)), 409, protocol.CodeStalePrekey)
+	e.want(e.do("POST", to+"/messages", sealOld("sealed to the retired key", current), e.pass(a)), 400, protocol.CodeWrongRecipientType)
 	send(t, a, b, "after the switch") // to the post-quantum key
 	if res := receive(t, b); len(res.Delivered) != 1 {
 		t.Fatalf("delivered %d, want 1", len(res.Delivered))

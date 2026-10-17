@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IronGall-dev/irongall-client/api/apitest"
 	"github.com/IronGall-dev/irongall-client/client"
 )
 
@@ -17,7 +18,7 @@ import (
 // front of it.
 func TestNoPagesButTheLinkPage(t *testing.T) {
 	keys, _ := NewDevKeys()
-	srv := httptest.NewServer(New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Ready: func() bool { return false }}).Handler())
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Ready: func() bool { return false }}).Handler()))
 	defer srv.Close()
 	for _, p := range []string{"/", "/llms.txt", "/docs/", "/docs", "/index.html", "/to.html", "/nope"} {
 		resp, err := http.Get(srv.URL + p)
@@ -44,7 +45,7 @@ func TestNoPagesButTheLinkPage(t *testing.T) {
 // out of Referer headers and search engines. Anything else is 404.
 func TestLinkPage(t *testing.T) {
 	keys, _ := NewDevKeys()
-	srv := httptest.NewServer(New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Ready: func() bool { return false }}).Handler())
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Ready: func() bool { return false }}).Handler()))
 	defer srv.Close()
 	get := func(method, path string) (*http.Response, string) {
 		t.Helper()
@@ -90,7 +91,7 @@ func TestLinkPage(t *testing.T) {
 // a line of the README, at the address the client code carries.
 func TestLinkPageCommandIsInTheClientREADME(t *testing.T) {
 	keys, _ := NewDevKeys()
-	srv := httptest.NewServer(New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed()}).Handler())
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed()}).Handler()))
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/to/" + client.EchoAddress)
 	if err != nil {

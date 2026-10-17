@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IronGall-dev/irongall-client/api/apitest"
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
@@ -70,7 +71,7 @@ func TestContinuationAllowance(t *testing.T) {
 func counted(t *testing.T, e *env, l Limits) (*env, *countingStore) {
 	t.Helper()
 	cs := &countingStore{Store: e.store}
-	srv := httptest.NewServer(New(Config{Store: cs, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler())
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: cs, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler()))
 	t.Cleanup(srv.Close)
 	return &env{t: t, clock: e.clock, srv: srv}, cs
 }

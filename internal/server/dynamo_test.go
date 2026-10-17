@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IronGall-dev/irongall-client/api/apitest"
 	"github.com/IronGall-dev/irongall-client/client"
 	"github.com/IronGall-dev/irongall-client/protocol"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -158,13 +159,13 @@ func TestCrashAfterTheBody(t *testing.T) {
 func TestRetryAfterAckIsNotRedelivered(t *testing.T) {
 	e, s := dynamoEnv(t)
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String())
+	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
 	send(t, a, b, "once")
 	e.setMiddle(nil)
 	receive(t, b)
 	// A retry of the same bytes after the ack: the original receipt, from the
 	// item the ack left as the dedupe record.
-	if r := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a)); r.status != http.StatusOK {
+	if r := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a)); r.status != http.StatusOK {
 		t.Fatalf("retry after the ack: %d %s", r.status, r.body)
 	}
 	if n, _, _ := s.Count(context.Background(), b.Address()); n != 0 {
@@ -265,7 +266,7 @@ func TestTwoProcesses(t *testing.T) {
 	e, _ := dynamoEnv(t)
 	ctx := context.Background()
 	other := startDynamo(t, e.clock.Now)
-	srv2 := httptest.NewServer(New(Config{Store: other, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: other.Ready}).Handler())
+	srv2 := httptest.NewServer(apitest.Handler(t, New(Config{Store: other, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: other.Ready}).Handler()))
 	t.Cleanup(srv2.Close)
 	e2 := &env{t: t, clock: e.clock, store: other, srv: srv2}
 
@@ -437,7 +438,7 @@ func (throttled) Count(context.Context, protocol.Address) (int, uint64, error) {
 func TestThrottleIs503(t *testing.T) {
 	e := newEnv(t, relaxed())
 	b := e.box(protocol.Classic)
-	srv := httptest.NewServer(New(Config{Store: throttled{e.store}, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now}).Handler())
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: throttled{e.store}, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now}).Handler()))
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e2.pass(b))
@@ -452,7 +453,7 @@ func TestThrottleIs503(t *testing.T) {
 // Until the store has loaded its memory, every call is a 503.
 func TestNotReadyIs503(t *testing.T) {
 	keys, _ := NewDevKeys()
-	srv := httptest.NewServer(New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Ready: func() bool { return false }}).Handler())
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Ready: func() bool { return false }}).Handler()))
 	defer srv.Close()
 	e := &env{t: t, srv: srv}
 	var a protocol.Address
@@ -531,7 +532,7 @@ func TestPollStaysInMemory(t *testing.T) {
 	ctx := context.Background()
 	b, c := e.box(protocol.Classic), e.box(protocol.Classic)
 	cs := &countingStore{Store: e.store}
-	srv := httptest.NewServer(New(Config{Store: cs, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now}).Handler())
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: cs, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now}).Handler()))
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	poll := func(x *client.Box, pass string) reply {
@@ -620,18 +621,18 @@ func TestExpiredHeadersAreNotListed(t *testing.T) {
 func TestResendAfterExpiryIsRefused(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String())
+	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
 	first := send(t, a, b, "once, then again")
 	e.setMiddle(nil)
 	e.clock.Add(protocol.TTL - time.Second)
-	again := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a))
+	again := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a))
 	var r protocol.Receipt
 	_ = json.Unmarshal(again.body, &r)
 	if again.status != http.StatusOK || r.ReceivedAt != first.ReceivedAt {
 		t.Fatalf("inside the TTL: %d %s", again.status, again.body)
 	}
 	e.clock.Add(time.Second)
-	if late := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a)); late.code() != protocol.CodePrekeyExpired {
+	if late := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a)); late.code() != protocol.CodePrekeyExpired {
 		t.Fatalf("past the TTL: %d %s", late.status, late.body)
 	}
 }
@@ -700,7 +701,7 @@ func TestRetryAfterCloseIsNotRedelivered(t *testing.T) {
 	e := newEnv(t, relaxed())
 	ctx := context.Background()
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String())
+	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
 	send(t, a, b, "deleted unread")
 	e.setMiddle(nil)
 	if r := e.do(http.MethodDelete, "/v1/"+b.Address().String(), nil, e.pass(b)); r.status != http.StatusNoContent {
@@ -714,7 +715,7 @@ func TestRetryAfterCloseIsNotRedelivered(t *testing.T) {
 	// step 6): it stores nothing, and what the close deleted stays deleted.
 	var req protocol.SendRequest
 	_ = json.Unmarshal(*sent, &req)
-	if r := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a)); r.status != http.StatusOK {
+	if r := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a)); r.status != http.StatusOK {
 		t.Fatalf("retry: %d %s", r.status, r.body)
 	}
 	if res := receive(t, b); len(res.Delivered) != 0 {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/IronGall-dev/irongall-client/api/apitest"
 	"github.com/IronGall-dev/irongall-client/client"
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
@@ -157,13 +158,13 @@ func TestACLRefusesSends(t *testing.T) {
 	}
 
 	acl(1, []string{a.Address().String()}, nil)
-	notAllowed := e.do("POST", to, e.sealTo(b), e.pass(c))
+	notAllowed := e.do("POST", to+"/messages", e.sealTo(b), e.pass(c))
 	e.want(notAllowed, 403, protocol.CodeSenderNotAllowed)
-	e.want(e.do("POST", to, e.sealTo(b), e.pass(c)), 403, protocol.CodeSenderNotAllowed)
-	e.want(e.do("POST", to, e.sealTo(b), e.pass(a)), 201, "")
+	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(c)), 403, protocol.CodeSenderNotAllowed)
+	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(a)), 201, "")
 
 	acl(2, []string{"*"}, []string{a.Address().String()})
-	denied := e.do("POST", to, e.sealTo(b), e.pass(a))
+	denied := e.do("POST", to+"/messages", e.sealTo(b), e.pass(a))
 	e.want(denied, 403, protocol.CodeSenderNotAllowed)
 	var p, q protocol.Problem
 	_ = json.Unmarshal(notAllowed.body, &p)
@@ -173,8 +174,8 @@ func TestACLRefusesSends(t *testing.T) {
 	}
 	// c was refused twice under SendsPerDay 1: neither refusal spent its
 	// send, which "*" now lets through, and the count then holds.
-	e.want(e.do("POST", to, e.sealTo(b), e.pass(c)), 201, "")
-	e.want(e.do("POST", to, e.sealTo(b), e.pass(c)), 429, protocol.CodeSendsSpent)
+	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(c)), 201, "")
+	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(c)), 429, protocol.CodeSendsSpent)
 }
 
 // A deny list deletes the box's unacked mail from what it matches, and only
@@ -186,10 +187,10 @@ func TestACLDenyPurges(t *testing.T) {
 	a, b, c := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic)
 	to := "/v1/" + b.Address().String()
 	first := e.sealTo(b)
-	stored := e.do("POST", to, first, e.pass(a))
+	stored := e.do("POST", to+"/messages", first, e.pass(a))
 	e.want(stored, 201, "")
-	e.want(e.do("POST", to, e.sealTo(b), e.pass(a)), 201, "")
-	e.want(e.do("POST", to, e.sealTo(b), e.pass(c)), 201, "")
+	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(a)), 201, "")
+	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(c)), 201, "")
 	count := func(from *client.Box) int {
 		t.Helper()
 		n, _, err := e.store.PairCount(ctx, b.Address(), from.Address())
@@ -209,19 +210,19 @@ func TestACLDenyPurges(t *testing.T) {
 	if n, _, err := e.store.Count(ctx, b.Address()); err != nil || n != 1 {
 		t.Fatalf("the box holds %d, %v", n, err)
 	}
-	retry := e.do("POST", to, first, e.pass(a))
+	retry := e.do("POST", to+"/messages", first, e.pass(a))
 	e.want(retry, 200, "")
 	if !bytes.Equal(retry.body, stored.body) {
 		t.Fatalf("a retry's receipt changed: %s, was %s", retry.body, stored.body)
 	}
-	e.want(e.do("POST", to, e.sealTo(b), e.pass(a)), 403, protocol.CodeSenderNotAllowed)
+	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(a)), 403, protocol.CodeSenderNotAllowed)
 
 	// Deny "*": everything goes, and nothing more comes.
 	e.want(e.do("PUT", to+"/acl", aclOf(2, []string{"*"}, []string{"*"}), e.pass(b)), 200, "")
 	if n, _, err := e.store.Count(ctx, b.Address()); err != nil || n != 0 {
 		t.Fatalf("after denying everyone the box holds %d, %v", n, err)
 	}
-	e.want(e.do("POST", to, e.sealTo(b), e.pass(c)), 403, protocol.CodeSenderNotAllowed)
+	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(c)), 403, protocol.CodeSenderNotAllowed)
 }
 
 // On DynamoDB, an ACL put through one process reaches another through the
@@ -229,14 +230,14 @@ func TestACLDenyPurges(t *testing.T) {
 func TestACLReachesAnotherProcess(t *testing.T) {
 	e, _ := dynamoEnv(t)
 	other := startDynamo(t, e.clock.Now)
-	srv2 := httptest.NewServer(New(Config{Store: other, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: other.Ready}).Handler())
+	srv2 := httptest.NewServer(apitest.Handler(t, New(Config{Store: other, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: other.Ready}).Handler()))
 	t.Cleanup(srv2.Close)
 	e2 := &env{t: t, clock: e.clock, store: other, srv: srv2}
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	to := "/v1/" + b.Address().String()
 
 	// The other process holds b's record, with no ACL in it.
-	e2.want(e2.do("POST", to, e2.sealTo(b), e2.pass(a)), 201, "")
+	e2.want(e2.do("POST", to+"/messages", e2.sealTo(b), e2.pass(a)), 201, "")
 	e.want(e.do("PUT", to+"/acl", aclOf(1, []string{"*"}, []string{a.Address().String()}), e.pass(b)), 200, "")
 	start := time.Now()
 	for {
@@ -249,7 +250,7 @@ func TestACLReachesAnotherProcess(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Logf("an ACL put on one process reached the other in %s", time.Since(start))
-	e2.want(e2.do("POST", to, e2.sealTo(b), e2.pass(a)), 403, protocol.CodeSenderNotAllowed)
+	e2.want(e2.do("POST", to+"/messages", e2.sealTo(b), e2.pass(a)), 403, protocol.CodeSenderNotAllowed)
 	if d := aclReply(t, e2.do("GET", to+"/acl", nil, e2.pass(b))); *d.Version != 1 || len(d.Deny) != 1 {
 		t.Fatalf("the other process answers %+v", d)
 	}

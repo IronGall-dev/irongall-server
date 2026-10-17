@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/IronGall-dev/irongall-client/api/apitest"
 	"github.com/IronGall-dev/irongall-client/client"
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
@@ -31,13 +32,13 @@ func TestARetryAfterARenewalGetsItsReceipt(t *testing.T) {
 	l.SendsPerDay = 1
 	e := newEnv(t, l)
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String())
+	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
 	first := send(t, a, b, "sent before the renewal")
 	e.setMiddle(nil)
 	if _, err := b.Rekey(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	r := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a))
+	r := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a))
 	var again protocol.Receipt
 	if r.status != http.StatusOK || json.Unmarshal(r.body, &again) != nil || again != *first {
 		t.Fatalf("a retry after the renewal: %d %s, want 200 and %+v", r.status, r.body, *first)
@@ -50,7 +51,7 @@ func TestARetryAfterARenewalGetsItsReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Ciphertext[len(req.Ciphertext)-1] ^= 1 // another ciphertext, to the same retired prekey
-	e.want(e.do(http.MethodPost, "/v1/"+b.Address().String(), req, e.pass(a)), http.StatusConflict, protocol.CodeStalePrekey)
+	e.want(e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", req, e.pass(a)), http.StatusConflict, protocol.CodeStalePrekey)
 }
 
 // A sender's calls bound what its sends cost before they are checked, the
@@ -60,17 +61,17 @@ func TestASendersCallsBoundTheDedupeRead(t *testing.T) {
 	l := relaxed()
 	e := newEnv(t, l)
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String())
+	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
 	send(t, a, b, "once")
 	e.setMiddle(nil)
 	l.CallBurst, l.CallRefill = 3, time.Minute
 	e2, cs := counted(t, e, l)
 	pass := e2.pass(a)
 	for range 3 {
-		e2.want(e2.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, pass), http.StatusOK, "")
+		e2.want(e2.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, pass), http.StatusOK, "")
 	}
 	before := cs.reads.Load()
-	r := e2.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, pass)
+	r := e2.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, pass)
 	e2.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
 	if r.header.Get("Retry-After") == "" {
 		t.Error("no Retry-After")
@@ -90,7 +91,7 @@ func TestTheReceiveBudget(t *testing.T) {
 	e := newEnv(t, l)
 	b := e.box(protocol.Classic)
 	s1, s2, s3 := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String())
+	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
 	send(t, s1, b, "one")
 	e.setMiddle(nil)
 	send(t, s2, b, "two")
@@ -99,7 +100,7 @@ func TestTheReceiveBudget(t *testing.T) {
 	if client.Code(err) != protocol.CodeMailboxBusy || !errorsAs(err, &ae) || ae.RetryAfter <= 0 || ae.Status != http.StatusTooManyRequests {
 		t.Fatalf("a third new message in the burst: %v", err)
 	}
-	e.want(e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(s1)), http.StatusOK, "") // a retry: nothing new
+	e.want(e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(s1)), http.StatusOK, "") // a retry: nothing new
 	e.clock.Add(time.Minute)
 	if rs, err := s3.Flush(ctx); err != nil || len(rs) != 1 {
 		t.Fatalf("the waiting message after a refill: %v, %v", rs, err)
@@ -384,7 +385,7 @@ func (s slowPut) PutMessage(ctx context.Context, box protocol.Address, h *Header
 // stored.
 func concurrently(t *testing.T, e *env, l Limits, to *raw, froms []*raw, n int) int {
 	t.Helper()
-	srv := httptest.NewServer(New(Config{Store: slowPut{e.store, 50 * time.Millisecond}, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler())
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: slowPut{e.store, 50 * time.Millisecond}, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler()))
 	t.Cleanup(srv.Close)
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	type post struct {
@@ -411,7 +412,7 @@ func concurrently(t *testing.T, e *env, l Limits, to *raw, froms []*raw, n int) 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req, _ := http.NewRequest(http.MethodPost, srv.URL+to.path(""), bytes.NewReader(p.body))
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+to.path("/messages"), bytes.NewReader(p.body))
 			req.Header.Set("Authorization", p.pass)
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
@@ -482,7 +483,7 @@ func TestLookupsOfOneAddressShareARead(t *testing.T) {
 	l.MissesPerMinute = 1
 	e := newEnv(t, l)
 	var n atomic.Int64
-	srv := httptest.NewServer(New(Config{Store: slowBox{e.store, &n}, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler())
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: slowBox{e.store, &n}, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler()))
 	t.Cleanup(srv.Close)
 	var nobody protocol.Address
 	nobody[0] = 9

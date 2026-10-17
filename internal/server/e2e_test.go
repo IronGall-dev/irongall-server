@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IronGall-dev/irongall-client/api/apitest"
 	"github.com/IronGall-dev/irongall-client/client"
 	"github.com/IronGall-dev/irongall-client/protocol"
 	"golang.org/x/crypto/ssh"
@@ -68,7 +69,7 @@ func newEnv(t *testing.T, l Limits) *env {
 	var ready func() bool
 	e.store, ready = newTestStore(t, e.clock.Now)
 	e.server = New(Config{Store: e.store, Keys: keys, Limits: l, Now: e.clock.Now, Ready: ready})
-	h := e.server.Handler()
+	h := apitest.Handler(t, e.server.Handler())
 	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e.mu.Lock()
 		m := e.middle
@@ -238,14 +239,39 @@ func capture(e *env, method, suffix string) *[]byte {
 	return &got
 }
 
+// A send's 201 names the message it made, at the path its recipient fetches
+// it from (RFC 9110 §15.3.2); a retry's 200 makes nothing, and names nothing.
+func TestASendNamesTheMessageItMade(t *testing.T) {
+	e := newEnv(t, relaxed())
+	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
+	req := e.sealTo(b)
+	made := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", req, e.pass(a))
+	var r protocol.Receipt
+	if err := json.Unmarshal(made.body, &r); err != nil || made.status != http.StatusCreated {
+		t.Fatalf("send: %d %s", made.status, made.body)
+	}
+	at := made.header.Get("Location")
+	if at != "/v1/"+b.Address().String()+"/messages/"+r.ID {
+		t.Fatalf("Location %q, receipt %s", at, r.ID)
+	}
+	var m protocol.Message
+	got := e.do(http.MethodGet, at, nil, e.pass(b))
+	if err := json.Unmarshal(got.body, &m); err != nil || got.status != http.StatusOK || m.ID != r.ID || !bytes.Equal(m.Ciphertext, req.Ciphertext) {
+		t.Fatalf("fetching the Location: %d %s", got.status, got.body)
+	}
+	if retry := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", req, e.pass(a)); retry.status != http.StatusOK || retry.header.Get("Location") != "" {
+		t.Fatalf("retry: %d, Location %q", retry.status, retry.header.Get("Location"))
+	}
+}
+
 func TestRetryGetsOriginalReceipt(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String())
+	sent := capture(e, http.MethodPost, "/v1/"+b.Address().String()+"/messages")
 	r := send(t, a, b, "once")
 	e.setMiddle(nil)
 
-	retry := e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a))
+	retry := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a))
 	var again protocol.Receipt
 	if err := json.Unmarshal(retry.body, &again); err != nil || retry.status != http.StatusOK || again != *r {
 		t.Fatalf("retry: %d %s, want 200 and %+v", retry.status, retry.body, *r)
@@ -254,7 +280,7 @@ func TestRetryGetsOriginalReceipt(t *testing.T) {
 		t.Fatalf("delivered %d, want 1", len(res.Delivered))
 	}
 	// Still a retry after the ack: the dedupe record outlives it.
-	e.want(e.do(http.MethodPost, "/v1/"+b.Address().String(), *sent, e.pass(a)), http.StatusOK, "")
+	e.want(e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a)), http.StatusOK, "")
 	if res := receive(t, b); len(res.Delivered) != 0 {
 		t.Fatal("a retry after the ack was delivered again")
 	}

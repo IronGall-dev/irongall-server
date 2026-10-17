@@ -86,7 +86,7 @@ func TestASenderCannotForgeAnEmptyBox(t *testing.T) {
 	e.want(empty, http.StatusOK, "")
 	one := uint64(1)
 	for _, i := range subset {
-		e.want(e.do(http.MethodPost, to.path(""), protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: bodies[i]}, from.pass(1)), http.StatusCreated, "")
+		e.want(e.do(http.MethodPost, to.path("/messages"), protocol.SendRequest{PrekeySerial: &one, CertificateSerial: &one, Ciphertext: bodies[i]}, from.pass(1)), http.StatusCreated, "")
 	}
 	full := e.do(http.MethodGet, to.path("/messages"), nil, to.pass(1))
 	e.want(full, http.StatusOK, "")

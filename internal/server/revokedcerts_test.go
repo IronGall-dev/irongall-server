@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/IronGall-dev/irongall-client/api/apitest"
 	"github.com/IronGall-dev/irongall-client/client"
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
@@ -47,7 +48,7 @@ func (e *env) sendTo(to *raw, serial, under uint64, from *raw, fromUnder uint64)
 	}
 	_, _ = io.WriteString(w, `{"v":1}`)
 	_ = w.Close()
-	return e.do("POST", to.path(""), protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &under, Ciphertext: ct.Bytes()}, from.pass(fromUnder))
+	return e.do("POST", to.path("/messages"), protocol.SendRequest{PrekeySerial: &serial, CertificateSerial: &under, Ciphertext: ct.Bytes()}, from.pass(fromUnder))
 }
 
 func TestRevokedCertificates(t *testing.T) {
@@ -301,7 +302,7 @@ func TestARevocationOfCertificatesOutlivesTheProcess(t *testing.T) {
 	e.want(e.do("PUT", r.path("/revocations"), rec, ""), 200, "")
 
 	later := startDynamo(t, e.clock.Now) // its memory holds nothing of the box
-	srv := httptest.NewServer(New(Config{Store: later, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: later.Ready}).Handler())
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: later, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: later.Ready}).Handler()))
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	r2 := *r

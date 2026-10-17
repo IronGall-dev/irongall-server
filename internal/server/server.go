@@ -141,25 +141,44 @@ func New(c Config) *Server {
 	return s
 }
 
+// route is one of the API's routes: its pattern and its handler.
+type route struct {
+	pattern string
+	h       func(http.ResponseWriter, *http.Request) error
+}
+
+// routes are the API's, each the client repo's api/openapi.yaml gives
+// (TestTheRoutesAreTheDescriptions).
+func (s *Server) routes() []route {
+	return []route{
+		{"PUT /v1/{addr}", s.register},
+		{"DELETE /v1/{addr}", s.closeBox},
+		{"GET /v1/{addr}/identity", s.identity},
+		{"PUT /v1/{addr}/prekey", s.prekey},
+		{"PUT /v1/{addr}/revocations", s.revoke},
+		{"GET /v1/{addr}/revocations", s.revocations},
+		{"PUT /v1/{addr}/acl", s.putACL},
+		{"GET /v1/{addr}/acl", s.getACL},
+		{"PUT /v1/{addr}/account", s.adopt},
+		{"DELETE /v1/{addr}/account", s.leave},
+		{"POST /v1/{addr}/messages", s.send},
+		{"GET /v1/{addr}/messages", s.list},
+		{"GET /v1/{addr}/messages/{id}", s.fetch},
+		{"DELETE /v1/{addr}/messages/{id}", s.ack},
+	}
+}
+
+// linkRoute is the page a box's link opens, the one route outside /v1/.
+const linkRoute = "GET " + protocol.LinkPath + "{addr}"
+
 // Handler returns the API's routes and the page a box's link opens.
 func (s *Server) Handler() http.Handler {
 	api := http.NewServeMux()
-	api.HandleFunc("PUT /v1/{addr}", s.handle(s.register))
-	api.HandleFunc("POST /v1/{addr}", s.handle(s.send))
-	api.HandleFunc("DELETE /v1/{addr}", s.handle(s.closeBox))
-	api.HandleFunc("GET /v1/{addr}/identity", s.handle(s.identity))
-	api.HandleFunc("PUT /v1/{addr}/prekey", s.handle(s.prekey))
-	api.HandleFunc("PUT /v1/{addr}/revocations", s.handle(s.revoke))
-	api.HandleFunc("GET /v1/{addr}/revocations", s.handle(s.revocations))
-	api.HandleFunc("PUT /v1/{addr}/acl", s.handle(s.putACL))
-	api.HandleFunc("GET /v1/{addr}/acl", s.handle(s.getACL))
-	api.HandleFunc("PUT /v1/{addr}/account", s.handle(s.adopt))
-	api.HandleFunc("DELETE /v1/{addr}/account", s.handle(s.leave))
-	api.HandleFunc("GET /v1/{addr}/messages", s.handle(s.list))
-	api.HandleFunc("GET /v1/{addr}/messages/{id}", s.handle(s.fetch))
-	api.HandleFunc("DELETE /v1/{addr}/messages/{id}", s.handle(s.ack))
+	for _, r := range s.routes() {
+		api.HandleFunc(r.pattern, s.handle(r.h))
+	}
 	mux := http.NewServeMux()
-	mux.Handle("GET "+protocol.LinkPath+"{addr}", s.publicPage(linkPage()))
+	mux.Handle(linkRoute, s.publicPage(linkPage()))
 	mux.Handle("/v1/", notStored(s.whenReady(api)))
 	return s.accessLog(s.dated(mux))
 }

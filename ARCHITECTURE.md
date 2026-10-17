@@ -128,7 +128,7 @@ That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go map
 | Poll / list `GET …/messages` | The pass, from memory. Layer 1 for the count and ETag; the page from one DynamoDB Query (from layer 2 once it is built) | Empty: the precomputed empty body. `If-None-Match` equal to the version: `304`. Every list response carries `count`, an `ETag`, pages of 50 and `poll_after` (the delivery contract, decided; `PROTOCOL.md` §5.1) |
 | Fetch `GET …/messages/<id>` | Memory first: an id the box does not hold is `404` with no storage call, and a fetch of a message this process has served before takes from the box's allowance (`PROTOCOL.md` §5.7). Then DynamoDB GetItem of the message item by `box, id`, S3 Express GET | Memory can say a message is absent, never that it is there: the read decides. A live item whose body is gone leaves the list and is answered as gone |
 | Ack `DELETE …/messages/<id>` | Memory first, as for a fetch (an id not held is `404`); then S3 DELETE, then a conditional UpdateItem that removes `live` (`PROTOCOL-SERVER.md` §7) | Both steps are safe to repeat. Applied to local memory at once; the stream tells the others |
-| Send `POST /v1/<addr>` | The sender's pass, before the body is read; its record for its account (the LRU, or one GetItem); GetItem (the dedupe check), S3 PUT, then one conditional PutItem: the header and the dedupe record are one item (`PROTOCOL-SERVER.md` §7) | Cheapest check first (`PROTOCOL.md` §4.5); the caps read layer 1. No signature on the message is checked: it is inside the ciphertext |
+| Send `POST /v1/<addr>/messages` | The sender's pass, before the body is read; its record for its account (the LRU, or one GetItem); GetItem (the dedupe check), S3 PUT, then one conditional PutItem: the header and the dedupe record are one item (`PROTOCOL-SERVER.md` §7) | Cheapest check first (`PROTOCOL.md` §4.5); the caps read layer 1. No signature on the message is checked: it is inside the ciphertext |
 | Register `PUT /v1/<addr>` | Four signature checks (the certificate and the statement under it, then the pass under it and the certificate again), then DynamoDB PutItem | The box is in use from this one write |
 | New prekey `PUT …/prekey` | The record (the LRU, or one GetItem), the same four checks, DynamoDB UpdateItem | The authority is the statement's own certificate and a pass under it: no pass under the box's current certificate is needed |
 | `/identity` | The LRU; DynamoDB on a miss | Never cached in front of the server: every API answer says `no-store` (`PROTOCOL-SERVER.md` §6.3, §12) |
@@ -143,13 +143,13 @@ sequenceDiagram
   participant D as DynamoDB
   participant P2 as irongalld (others)
   participant B as recipient
-  A->>P1: POST /v1/B with prekey_serial, certificate_serial and ciphertext, carrying A's pass
+  A->>P1: POST /v1/B/messages with prekey_serial, certificate_serial and ciphertext, carrying A's pass
   P1->>P1: check the pass (from memory once seen), parse, stanza check
   P1->>D: GetItem B, id (dedupe)
   P1->>S3: PUT B/id
   P1->>D: PutItem B, id (if no live one)
   P1->>P1: apply to its own memory
-  P1->>A: 201 id, received_at, expires_at
+  P1->>A: 201 id, received_at, expires_at, and Location
   D-->>P2: stream record (about 1 to 2 s)
   B->>P2: GET /v1/B/messages with If-None-Match
   P2->>B: 200 with count and ETag, or 304
@@ -172,7 +172,7 @@ sequenceDiagram
 
 ### Extreme scale: shard by the address's first hex character
 
-**It fits the design.** Every mailbox call names its box in the path (`/v1/<addr>/…`, and a send is `POST /v1/<recipient>`), and addresses are SHA-256 output, so a first hex character splits the load into 16 even shards. The edge routes by path prefix. `cloudflared`'s ingress rules can match a path, as can Cloudflare's load-balancing rules or an AWS ALB (an NLB can't).
+**It fits the design.** Every mailbox call names its box in the path (`/v1/<addr>/…`, and a send is `POST /v1/<recipient>/messages`), and addresses are SHA-256 output, so a first hex character splits the load into 16 even shards. The edge routes by path prefix. `cloudflared`'s ingress rules can match a path, as can Cloudflare's load-balancing rules or an AWS ALB (an NLB can't).
 
 What changes:
 - **Memory stops being replicated.** Each shard group holds only its sixteenth of layer 1, layer 2, the box standings and the poll buckets. That removes the one capacity limit above, where every process held all of layer 1.
@@ -295,7 +295,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
    - A refusal is a code and the client's own words, kept beside the quarantined message, never text the sender or the server chose; and a drain is bounded in messages, bytes and pages, deleting no retired prekey when it stopped at a bound (`PROTOCOL.md` §5).
 4. **Renew.** A new prekey, a new working key and its certificate, with the identity alone, under the box's lock, refusing a served serial below the box's own `serial` (a rollback). A renewal's number is the box's clock, or one above the highest it knows of when the clock gives nothing higher, so a box restored from its identity needs no record of the numbers used before (`PROTOCOL.md` §2b). A serial is signed once: a statement the server did not take is sent again as it was signed, never signed again, and a later number gets a new key only when that statement has expired (`PROTOCOL.md` §6.4). The Go client renews in `irongall recv` once the prekey is more than a day old (a failed renewal does not stop the drain and is retried hourly); `irongall prekey renew` renews at once, waiting up to a minute for a drain's lock so a scheduled run does not die on one collision. `irongall.sh` never renews on its own: `prekey renew` by hand, at least monthly. Delete retired keys: the Go client keeps the current prekey and the newest retired one, and deletes the older ones after a drain that empties the box and began more than an hour after the newest retired one was made (the hour covers a send in progress as a renewal lands); any retired prekey goes at its `not_after` + 33 days, the Go client's backstop and `irongall.sh`'s only rule. `irongall prekey renew` keeps the box's key type unless told otherwise, where the recipe's `ig_rekey` defaults to post-quantum; the Go client names the server in `IRONGALL_BASE`, the recipe in `IG_BASE`.
 5. **Pass.** Sign a pass good for ten minutes with the working key, keep it in the box and send it on every call. On any `401` (`pass_expired`, `certificate_not_current`, `certificate_revoked`, `unauthorized`), sign another and retry, once (`PROTOCOL.md` §6.1b).
-6. **Pace.** Follow `429` `Retry-After`. (The RateLimit header fields are specified and the server does not send them.)
+6. **Pace.** Follow `429` `Retry-After`.
 7. **Say what needs a look.** Refused mail and a failed renewal are lines on stdout beside the mail, as JSON lines with their type first, as every command prints; `recv` exits 3 after a renewal that failed and 0 after refused mail, which any sender can cause; `irongall status` reads the box's own files and lists what needs attention (the client README has the exit statuses). This step is the Go client's: the script has no `status`, and its `recv` never renews.
 
 **Conformance kit:**

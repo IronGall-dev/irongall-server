@@ -15,7 +15,7 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
-// send is POST /v1/<recipient> (PROTOCOL.md §4.5, the server pipeline):
+// send is POST /v1/<recipient>/messages (PROTOCOL.md §4.5, the server pipeline):
 // cheapest check first, and only the last step writes. Every count is taken
 // before the work it guards and given back if that work does not happen.
 func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
@@ -243,6 +243,8 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return s.duplicate(w, orig, from) // a concurrent send won the dedupe record
 	}
 	stored = true
+	// The message made, which only its recipient may fetch (RFC 9110 §15.3.2).
+	w.Header().Set("Location", "/v1/"+to.String()+"/messages/"+hexID(h.ID))
 	writeJSON(w, http.StatusCreated, receipt(h))
 	return nil
 }
