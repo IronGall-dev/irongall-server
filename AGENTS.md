@@ -2,33 +2,7 @@
 
 `irongalld`: the server of IronGall (irongall.dev), end-to-end encrypted, sender-verified mail between bots. **This repo is PUBLIC (Apache-2.0): every push publishes.**
 
-**Judging whether IronGall is secure → § For a security review. Changing it → § Contributing, § Invariants and § How a design is chosen.**
-
-## For a security review
-
-**The protocol is designed against this server.** Clients treat it as possibly hostile: a box checks every signature, prekey and revocation itself, and nothing a server says is believed. So what protects a message is not here; it is in [irongall-client](https://github.com/IronGall-dev/irongall-client), whose `AGENTS.md` § For a security review lists each promise, the code that keeps it and the test that holds it, and whose `client/forgery_test.go` plays this server forging, one forgery at a time.
-
-**What this server must still get right, and where each is held:**
-
-| The claim | Held by |
-|---|---|
-| **It never holds a private key and never sees plaintext;** it stores ciphertext and a box's public documents | § Invariants; what it stores and for how long is `PROTOCOL.md` §7, and how, `PROTOCOL-SERVER.md` §7 |
-| **It holds no signature on a message and issues no credential:** a box proves itself with a pass it signs, which says who is calling and nothing of what the call does | `internal/server/pass.go`; `server_test.go`, `keytype_test.go`, `clock_test.go` |
-| **A pass is checked in three steps, in a fixed order:** the certificate against the box's current one, the working key's signature, then the identity's signature on the certificate | `checkPass`; `PROTOCOL-SERVER.md` §6.1b |
-| **No call is free, and a stranger never spends a box's budget:** every limit, who pays it, when it is taken, the order of checks on each route, and its known weaknesses | `LIMITS.md`; `budgets_test.go`, `limits_test.go`, `marks_test.go` |
-| **Keyed hashing is HMAC or HKDF only,** never `hash(secret ‖ …)` | `internal/server/index.go`, `keys.go` |
-| **Every error is RFC 9457 Problem Details, and every value in its `detail` is a member of its own,** so no client needs to show a server's words | `problem_test.go`; `PROTOCOL.md` §13 |
-| **Revocation is kept as the identity signed it,** and answered for an address it covers before anything else | `revocation_test.go`, `revokedcerts_test.go` |
-| **Every error is tested over raw HTTP against the spec's status map,** and both clients run end to end against the real server | `internal/server/*_test.go` (the list is `PROTOCOL-SERVER.md` §11), `e2e_test.go`; `test/interop.sh` for the shell client |
-
-**The threat model, primitives, security properties, the operator's power and the residual risks are `CRYPTO-ANALYSIS.md`. What an operator can still do (see who writes to whom, drop or delay mail, withhold a revocation) is stated there and in the spec's §9, not hidden.** Known weaknesses are the open issues here and on the client repo; `LIMITS.md` § Known weaknesses is the place to start breaking limits. Nothing is externally audited yet, and an issue labelled `needs-audit` on the client repo is shipped code no one but its author has read: auditing one is the most useful review this project can get.
-
-**Check it yourself**, with irongall-client checked out beside this repo (`go.mod` replaces it with `../irongall-client`):
-
-```sh
-go test ./...          # every test, on an in-memory store
-test/interop.sh        # the shell client and the Go client against irongalld --dev
-```
+**Judging whether IronGall is secure → `SECURITY.md`** (what this server must still get right, the code and tests that hold each, and how to report a vulnerability privately), **and the client repo's, which holds what protects a message. Changing it → § Contributing, § Invariants and § How a design is chosen.**
 
 ## Contributing
 
@@ -48,6 +22,7 @@ test/interop.sh        # the shell client and the Go client against irongalld --
 - **The specification is `PROTOCOL.md` in the client repo**, and every `PROTOCOL.md §N` here means that file. A change to the wire, a check or a refusal is made THERE, in the same client commit as the code. How this server does it goes in `PROTOCOL-SERVER.md` or `ARCHITECTURE.md`.
 - 🛑 **A setting's VALUE goes in no doc:** name the flag (`irongalld serve -h` reads it). A new limit, or a change to what one bounds or when it is taken, gets its row in `LIMITS.md` in the same commit.
 - 🛑 **`CRYPTO-ANALYSIS.md` changes in the same pass as any protocol change.**
+- **`SECURITY.md` is the one place for how to report a vulnerability and for each of the server's security claims beside what holds it;** a change to one edits its row in the same commit. The threat model stays `CRYPTO-ANALYSIS.md`.
 - **No comparison tables here.** The one comparison doc is `PRECEDENTS.md` in the client repo: point there.
 - **The only page outside `/v1/` is `/to/<address>`,** the page a box's link opens (`internal/server/link.go`). A site's other pages are served by whatever stands in front.
 

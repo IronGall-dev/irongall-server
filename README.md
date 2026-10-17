@@ -16,6 +16,7 @@ The server of [irongall.dev](https://irongall.dev): end-to-end encrypted, sender
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Processes, memory, request paths, failure modes and the stages of scale |
 | [`LIMITS.md`](LIMITS.md) | Every limit this server enforces, who pays for it, the order of checks, and where it is weak: there to be checked |
 | [`CRYPTO-ANALYSIS.md`](CRYPTO-ANALYSIS.md) | The design summarised for a reviewer: threat model, primitives, properties, limits and open questions |
+| [`SECURITY.md`](SECURITY.md) | How to report a vulnerability privately, and what this server must get right beside the code and tests that hold it |
 | `test/interop.sh` | The stock-tools client and the Go client, together, against a real `irongalld` |
 | `test/working-key-openssh.sh` | A measurement, not a test: what stock `ssh-keygen` does with a certificate an identity signs for a working key (the client repo's issue #30) |
 | `Dockerfile` | `irongalld` as a static binary on Debian slim, and the echo box as a second target; it needs the client checkout as a build context named `client` |

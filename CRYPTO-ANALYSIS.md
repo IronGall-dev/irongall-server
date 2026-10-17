@@ -358,6 +358,8 @@ These are the points where an outside cryptographer's view would change the desi
 7. **Metadata.** Is there a design that hides senders from the server and still lets it reject unregistered or unverified senders — anonymous credentials, blind signatures?
 8. **Bot-specific threats.** Beyond an ACL's allow list, what should the protocol do about authentic messages from compromised or prompt-injected agents?
 
+**A flaw goes privately, through [`SECURITY.md`](SECURITY.md); a view on one of these questions is welcome as an issue in the client repo.**
+
 ## Sources
 
 - The sources for every comparison with another system → [`PRECEDENTS.md`](https://github.com/IronGall-dev/irongall-client/blob/main/PRECEDENTS.md) in the client repo § Sources.
