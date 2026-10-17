@@ -1,8 +1,38 @@
-# irongall-server — the server of irongall.dev
+# AGENTS.md — irongall-server
 
-`irongalld`: the API of irongall.dev, end-to-end encrypted, sender-verified mail between bots. **This repo is PUBLIC (Apache-2.0): every push publishes.**
+`irongalld`: the server of IronGall (irongall.dev), end-to-end encrypted, sender-verified mail between bots. **This repo is PUBLIC (Apache-2.0): every push publishes.**
 
-## Sign off every commit
+**Judging whether IronGall is secure → § For a security review. Changing it → § Contributing, § Invariants and § How a design is chosen.**
+
+## For a security review
+
+**The protocol is designed against this server.** Clients treat it as possibly hostile: a box checks every signature, prekey and revocation itself, and nothing a server says is believed. So what protects a message is not here; it is in [irongall-client](https://github.com/IronGall-dev/irongall-client), whose `AGENTS.md` § For a security review lists each promise, the code that keeps it and the test that holds it, and whose `client/forgery_test.go` plays this server forging, one forgery at a time.
+
+**What this server must still get right, and where each is held:**
+
+| The claim | Held by |
+|---|---|
+| **It never holds a private key and never sees plaintext;** it stores ciphertext and a box's public documents | § Invariants; what it stores and for how long is `PROTOCOL.md` §7, and how, `PROTOCOL-SERVER.md` §7 |
+| **It holds no signature on a message and issues no credential:** a box proves itself with a pass it signs, which says who is calling and nothing of what the call does | `internal/server/pass.go`; `server_test.go`, `keytype_test.go`, `clock_test.go` |
+| **A pass is checked in three steps, in a fixed order:** the certificate against the box's current one, the working key's signature, then the identity's signature on the certificate | `checkPass`; `PROTOCOL-SERVER.md` §6.1b |
+| **No call is free, and a stranger never spends a box's budget:** every limit, who pays it, when it is taken, the order of checks on each route, and its known weaknesses | `LIMITS.md`; `budgets_test.go`, `limits_test.go`, `marks_test.go` |
+| **Keyed hashing is HMAC or HKDF only,** never `hash(secret ‖ …)` | `internal/server/index.go`, `keys.go` |
+| **Every error is RFC 9457 Problem Details, and every value in its `detail` is a member of its own,** so no client needs to show a server's words | `problem_test.go`; `PROTOCOL.md` §13 |
+| **Revocation is kept as the identity signed it,** and answered for an address it covers before anything else | `revocation_test.go`, `revokedcerts_test.go` |
+| **Every error is tested over raw HTTP against the spec's status map,** and both clients run end to end against the real server | `internal/server/*_test.go` (the list is `PROTOCOL-SERVER.md` §11), `e2e_test.go`; `test/interop.sh` for the shell client |
+
+**The threat model, primitives, security properties, the operator's power and the residual risks are `CRYPTO-ANALYSIS.md`. What an operator can still do (see who writes to whom, drop or delay mail, withhold a revocation) is stated there and in the spec's §9, not hidden.** Known weaknesses are the open issues here and on the client repo; `LIMITS.md` § Known weaknesses is the place to start breaking limits. Nothing is externally audited yet, and an issue labelled `needs-audit` on the client repo is shipped code no one but its author has read: auditing one is the most useful review this project can get.
+
+**Check it yourself**, with irongall-client checked out beside this repo (`go.mod` replaces it with `../irongall-client`):
+
+```sh
+go test ./...          # every test, on an in-memory store
+test/interop.sh        # the shell client and the Go client against irongalld --dev
+```
+
+## Contributing
+
+### Sign off every commit
 
 **Every commit carries your human's sign-off, made with `git commit -s`** (the Developer Certificate of Origin: `CONTRIBUTING.md`).
 - **It is their certification, not yours.** Tell them the repo requires it. With their say-so you may run `git commit -s` for them: it writes the line from their git identity.
@@ -10,33 +40,31 @@
 - **Name yourself** in an `Assisted-by:` or `Co-Authored-By:` trailer.
 - A pull request whose commits lack the line fails the DCO check and is not merged. `CONTRIBUTING.md` has the commands that add it to commits already made.
 
-## What goes here, and what never does
+### What goes here, and what never does
 
 - **Here:** the server's code, its tests and its design docs (`README.md` has the table).
 - 🛑 **Never here:** a secret; a hostname, address, account id or resource name of any deployment; what a deployment costs or how its limits are set; anyone's private words. A deployment's notes belong to its operator.
-- 🛑 **No client code here, and the client imports nothing from here.** The client is [irongall-client](https://github.com/IronGall-dev/irongall-client); this repo imports its `protocol/` and `sshsig/`.
+- 🛑 **No client code here, and the client imports nothing from here.** This repo imports the client's `protocol/` and `sshsig/`.
 - **The specification is `PROTOCOL.md` in the client repo**, and every `PROTOCOL.md §N` here means that file. A change to the wire, a check or a refusal is made THERE, in the same client commit as the code. How this server does it goes in `PROTOCOL-SERVER.md` or `ARCHITECTURE.md`.
-- 🛑 **A setting's VALUE goes in no doc:** name the flag (`irongalld serve -h` reads it).
+- 🛑 **A setting's VALUE goes in no doc:** name the flag (`irongalld serve -h` reads it). A new limit, or a change to what one bounds or when it is taken, gets its row in `LIMITS.md` in the same commit.
 - 🛑 **`CRYPTO-ANALYSIS.md` changes in the same pass as any protocol change.**
 - **No comparison tables here.** The one comparison doc is `PRECEDENTS.md` in the client repo: point there.
 - **The only page outside `/v1/` is `/to/<address>`,** the page a box's link opens (`internal/server/link.go`). A site's other pages are served by whatever stands in front.
 
-## Before every push
+### Before every push
 
-- `gofmt -l .` (empty), `go vet ./...`, `go test ./...`, and `golangci-lint` with the client repo's flags (its `AGENTS.md`), clean outside `_test.go`.
-- `go.mod` replaces the client with `../irongall-client`: the build and the tests need that checkout beside this one.
+- `gofmt -l .` (empty), `go vet ./...`, `go test ./...`, and `golangci-lint` with the client repo's flags (its `AGENTS.md`), clean outside `_test.go`. There is no CI.
 - After a change to a handler or a store: `test/interop.sh`, and the tests on AWS. They run on the in-memory store unless `IRONGALL_TEST_BOXES_TABLE`, `IRONGALL_TEST_MSGS_TABLE`, `IRONGALL_TEST_ACCOUNTS_TABLE` and `IRONGALL_TEST_BUCKET` are all set, which runs every test on DynamoDB and S3 Express plus the AWS-only ones (the crash between each pair of writes, two processes, restart). 🛑 Name tables and a bucket kept for tests, never a running server's.
 - A test of client behaviour belongs in the client repo, where the forging-server tests are. This repo tests what the real server enforces.
-- There is no CI.
 
-## After a push: `needs-audit`
+### After a push: `needs-audit`
 
 When a change ships that its author is not confident in without a second reader (nobody else read it, or what was written after its review has not been read), a new issue with the label `needs-audit` is filed for it in the client repo, whichever repo changed. The issue the change fixes closes as usual.
 - 🛑 **The issue is the auditor's whole brief:** the commits, the claims to try to break, where to look first, what is already known and open, how to run it, and what closes it. An outside agent with no other context must be able to work from it.
 - **Nothing waits on one:** it is not a gate.
 - **Whoever audits closes it,** saying what was read, run and tried, with each finding as an issue of its own. The client repo's #45 is the pattern.
 
-## The maintainers' own commits
+### The maintainers' own commits
 
 On a pull request the DCO app checks every commit, and `main` requires its check. 🛑 A direct push by an org admin bypasses that rule and nothing checks it: the sign-off there is on whoever pushes. The maintainer's commits are written with Custos, his AI assistant: they carry his sign-off, by his standing word to it, and name Custos in `Co-Authored-By:`. 🛑 That is his arrangement with his own assistant. A contributor's commits are theirs, with their own sign-off (above).
 
@@ -45,23 +73,25 @@ On a pull request the DCO app checks every commit, and `main` requires its check
 - 🛑 **The server never holds a box's private key and never sees plaintext.** A server feature that needs either is wrong. (The echo box, `PROTOCOL.md` §10, is a separate CLIENT process with its own keys.)
 - 🛑 **No anonymous sends:** every message is authenticated as a REGISTERED address.
 - **The address is the SHA-256 of the identity alone. The identity certifies a WORKING KEY, and signs nothing else but a revocation; mail is encrypted to an age PREKEY the working key signs.** Every renewal is a new key: the server refuses one that comes back.
-- 🛑 **The server holds no signature on a message, and issues no credential.** A message's signature is inside the ciphertext, and a box proves itself with a pass it signs, which says who is calling and nothing of what a call does (`PROTOCOL.md` §4.4, §6.1b). A server feature that needs a sender's signature over a message, or a secret the server hands a box, is wrong.
+- 🛑 **The server holds no signature on a message, and issues no credential.** A message's signature is inside the ciphertext, and a box proves itself with a pass it signs (`PROTOCOL.md` §4.4, §6.1b). A server feature that needs a sender's signature over a message, or a secret the server hands a box, is wrong.
 - **Well-defined, RECOMMENDED crypto only:** native age to encrypt, a SEPARATE Ed25519 key to sign. No home-rolled constructions, and no key used for both. An identity may be of another key type the protocol defines (`PROTOCOL.md` §2: today P-256, optional); the working key that signs what a box says is Ed25519.
 - 🛑 **A new pass is checked in three steps, in this order** (`checkPass`; `PROTOCOL-SERVER.md` §6.1b): the certificate it carries against the hash of the box's current one, the working key's signature, then the identity's signature on the certificate with every rule of a certificate. The first two refuse a pass that is not the box's for one signature check at most. The third is a second check of what a registration checked, and it stays: do not drop it to save its cost, and do not move it ahead of the other two.
 - 🛑 **Keyed hashing is HMAC or HKDF only, never `hash(secret ‖ …)`.**
-- **Go. Every API path under `/v1/`.**
-- 🛑 **INDUSTRY-standard API shapes, never something clever.** JSON in and out; every byte field is standard base64 of the exact file bytes, in its one encoding, and every JSON text is read by one set of rules, I-JSON among them, by every reader (`PROTOCOL.md` §4.5, §0b).
+- 🛑 **INDUSTRY-standard API shapes, never something clever.** Go; every API path under `/v1/`; JSON in and out; every byte field is standard base64 of the exact file bytes, in its one encoding, and every JSON text is read by one set of rules, I-JSON among them, by every reader (`PROTOCOL.md` §4.5, §0b).
 - 🛑 **An empty poll never leaves the process:** no DynamoDB, S3 or Redis round trip. Polls × mailboxes is THE load. The rule is for the steady state; the ONE read that loads a box into a process's memory on its first use is fine.
 - **Bodies are served through this server's endpoint, never by a redirect to S3.**
 - **Bot-first.** Every error carries a machine code plus a `hint` naming the client command that fixes it, never a raw command line the server could alter.
 - 🛑 **Every value in an error's `detail` is also a member of its own** (AEP-193; `PROTOCOL.md` §13): `fail` takes a detail's values only as `value`s, each of which sets its member, and `failErr` only a protocol error's fixed words. A client needs nothing from `detail`, `hint` or `title`, and shows none of them. A new code is added in the client repo's `protocol/errors.go`, with its status, its title and the client's sentence for it, before this server sends it.
-- 🔑 **Pre-stable: nothing is final until v1 is declared stable.** Until then, always the CORRECT design, with no weight on backwards compatibility or on leaving the wire alone.
-- 🛑 **A rule, format or behaviour of our own is no constraint before the freeze either,** this server's, the spec's or a client's: when one forces a workaround on either side, that is a design question, put to the maintainer with the best design for every side and its cost, and every side changes together (the client repo's #126 audits for it).
-- 🔑 **The design priorities, in this order:** 1. the correct encryption · 2. a server that is feasible and fast, not as cheap as possible · 3. simple things simple to the user. Never offer a weaker design to save the server CPU, storage or a round trip: state the measured cost beside the correct design.
-- 🛑 **The protocol is designed against a server that may be hostile and a network that TLS to that server protects.** Never against whatever proxy or CDN stands in front: it may be named as what it is, never given as a reason for a design.
-- 🛑 **Design for a current client;** an old tool version is never a constraint.
-- 🛑 **No invented requirements.** Every limit, margin and constraint traces to a stated need or a measurement.
 - 🛑 **The store is designed for provisioned DynamoDB capacity, never on-demand:** any burst read must fit it, which is why memory loads per box on first use and never by a full Scan (`ARCHITECTURE.md` § Startup).
 - 🛑 **Clocks: every check is exact at this server's own clock, and a client leaves an hour of room in what it makes** (`PROTOCOL.md` §0; the comparisons are `PRECEDENTS.md` § Clocks, in the client repo). Add no allowance to a check. What the server takes is the room: a pass up to an hour ahead, a prekey up to an hour past the 33 days a client asks for. Every answer is dated by that clock (`Server.dated`): that is how a refusal for a time states what it reads. 🛑 **A test of anything timed gives the box a clock of its own** (`internal/server/clock_test.go`): every test once shared one clock with the server, and none could see that a box two seconds fast could not register.
+
+## How a design is chosen
+
+- 🔑 **The design priorities, in this order:** 1. the correct encryption · 2. a server that is feasible and fast, not as cheap as possible · 3. simple things simple to the user. Never offer a weaker design to save the server CPU, storage or a round trip: state the measured cost beside the correct design.
+- 🛑 **The protocol is designed against a server that may be hostile and a network that TLS to that server protects.** Never against whatever proxy or CDN stands in front: it may be named as what it is, never given as a reason for a design.
 - 🛑 **A design follows industry practice, read at its source,** never this project's own earlier choice, and a statement of the design that differs from that practice is challenged, whoever made it. A deviation is discussed and justified as part of the design, with its reason in `PRECEDENTS.md` in the client repo. **Where Let's Encrypt meets the same concern as a free public API anyone may call (its limits, renewal, revocation, abuse), its practice is the precedent.**
+- 🔑 **Pre-stable: nothing is final until v1 is declared stable.** Until then, always the CORRECT design, with no weight on backwards compatibility or on leaving the wire alone.
+- 🛑 **A rule, format or behaviour of our own is no constraint before the freeze either,** this server's, the spec's or a client's: when one forces a workaround on either side, that is a design question, put to the maintainer with the best design for every side and its cost, and every side changes together (the client repo's #126 audits for it).
+- 🛑 **Design for a current client;** an old tool version is never a constraint.
+- 🛑 **No invented requirements.** Every limit, margin and constraint traces to a stated need or a measurement.
 - **`[proposed]` in `PROTOCOL.md` is not decided.** Build only what is decided.
