@@ -27,28 +27,20 @@ func TestTheRoutesAreTheDescriptions(t *testing.T) {
 	}
 }
 
-// The read of a box is GET /v1/<address>, and the two reads it replaced are
-// no routes of this server: GET …/identity gets the router's plain 404, and
-// GET …/revocations, whose PUT stays, its plain 405. A revocation server
-// keeps that GET; a mailbox server is not one.
-func TestTheReadsTheBoxReplacedAreGone(t *testing.T) {
+// The read of a box is GET /v1/<address>, and the read of its identity it
+// replaced is no route of this server: GET …/identity gets the router's plain
+// 404. GET …/revocations is a route, the revocation server's read that every
+// mailbox server answers too (TestEveryMailboxServerIsARevocationServer).
+func TestTheReadTheBoxReplacedIsGone(t *testing.T) {
 	e := newEnv(t, relaxed())
 	b := e.box(protocol.Classic)
-	for path, want := range map[string]int{
-		"/identity":    http.StatusNotFound,
-		"/revocations": http.StatusMethodNotAllowed,
-	} {
-		resp, err := http.Get(e.srv.URL + "/v1/" + b.Address().String() + path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = resp.Body.Close()
-		if resp.StatusCode != want || resp.Header.Get("Content-Type") == protocol.ProblemContentType {
-			t.Errorf("GET …%s: %d %s, want the router's plain %d", path, resp.StatusCode, resp.Header.Get("Content-Type"), want)
-		}
-		if want == http.StatusMethodNotAllowed && resp.Header.Get("Allow") != http.MethodPut {
-			t.Errorf("GET …%s: Allow %q, want the PUT that stays", path, resp.Header.Get("Allow"))
-		}
+	resp, err := http.Get(e.srv.URL + "/v1/" + b.Address().String() + "/identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound || resp.Header.Get("Content-Type") == protocol.ProblemContentType {
+		t.Errorf("GET …/identity: %d %s, want the router's plain 404", resp.StatusCode, resp.Header.Get("Content-Type"))
 	}
 	e.want(e.do(http.MethodGet, "/v1/"+b.Address().String(), nil, ""), http.StatusOK, "")
 }

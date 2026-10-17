@@ -277,6 +277,55 @@ func TestARevokedBoxIsReadAsItsRecord(t *testing.T) {
 	}
 }
 
+// Every mailbox server is a revocation server (PROTOCOL.md §6.3): it answers
+// GET …/revocations with no pass, with the record it holds of the address, in
+// the same bytes the read of the box carries, and 404 not_revoked when it
+// holds none, for an address with no box as for one with a box and nothing
+// revoked.
+func TestEveryMailboxServerIsARevocationServer(t *testing.T) {
+	e := newEnv(t, relaxed())
+	none, certsOnly, ended := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+	e.want(e.do("GET", revocationPath(protocol.Address{7}), nil, ""), 404, protocol.CodeNotRevoked)
+	e.want(e.do("GET", none.path("/revocations"), nil, ""), 404, protocol.CodeNotRevoked)
+
+	certs := certsOnly.certs(1)
+	e.want(e.do("PUT", certsOnly.path("/revocations"), certs, ""), 200, "")
+	put := ended.certs(1)
+	e.want(e.do("PUT", ended.path("/revocations"), put, ""), 200, "")
+	var err error
+	if put.Revocation, err = protocol.SignRevocation(ended.signer, ended.id.Address()); err != nil {
+		t.Fatal(err)
+	}
+	e.want(e.do("PUT", ended.path("/revocations"), put, ""), 201, "")
+
+	for name, c := range map[string]struct {
+		box     *raw
+		put     protocol.Revocations
+		members int
+	}{
+		"certificates revoked":                  {certsOnly, certs, 4},
+		"revoked with its certificates revoked": {ended, put, 5},
+	} {
+		got := e.do("GET", c.box.path("/revocations"), nil, "")
+		e.want(got, 200, "")
+		var rec protocol.Revocations
+		if err := protocol.Unmarshal(got.body, &rec); err != nil {
+			t.Fatalf("%s: %v: %s", name, err, got.body)
+		}
+		if !bytes.Equal(rec.Identity, c.box.id.Document()) || !bytes.Equal(rec.Revocation, c.put.Revocation) ||
+			!bytes.Equal(rec.RevokedCertificates, c.put.RevokedCertificates) || !bytes.Equal(rec.RevokedCertificatesSignature, c.put.RevokedCertificatesSignature) {
+			t.Errorf("%s: the record is not what was put: %s", name, got.body)
+		}
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal(got.body, &members); err != nil || len(members) != c.members || !bytes.HasPrefix(got.body, []byte(`{"type":"revocation_record",`)) {
+			t.Errorf("%s: the record has %d members, want its type first and %d more: %s", name, len(members), c.members-1, got.body)
+		}
+		if shown := held(t, e.do("GET", c.box.path(""), nil, "")); !bytes.Equal(shown.RevokedCertificates, rec.RevokedCertificates) || !bytes.Equal(shown.Revocation, rec.Revocation) {
+			t.Errorf("%s: the read of the box shows another record than the revocation server's read", name)
+		}
+	}
+}
+
 // A body that is not a revocation costs the server a signature check that
 // nothing has paid for, so it counts as a lookup of a box that does not
 // exist does. A revocation that verifies is never refused for that.
