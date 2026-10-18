@@ -259,7 +259,8 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
   prekey-lifetime            how long each new prekey is valid for, in seconds: 33 days unless its owner sets less, down to a day and an hour (PROTOCOL §6.4)
   peers/<addr>/              the pinned identity document, the highest prekey serial and certificate serial seen, the last statement fetched.
                              Made on a send once the peer's prekey statement verified, and on a receive once a message from it passed every check
-  seen                       ciphertext hash, sent_at, from, msg_id: 33 days (PROTOCOL §5)
+  seen                       ciphertext hash, sent_at, from, msg_id: 33 days and an hour from each sent_at (PROTOCOL §5 check 9)
+  seen-floor                 the highest cutoff a prune of seen dropped a line at: mail sent before it is stale
   outbox/                    each signed envelope line awaiting a receipt, and nothing else: a seal is made for each post and never kept
   outbox/failed/             entries that can never be delivered: refused for good, or older than 33 days
   inbox/, quarantine/        accepted mail, one line of JSON each built from the checked fields; refused mail, never delivered (PROTOCOL §5).
