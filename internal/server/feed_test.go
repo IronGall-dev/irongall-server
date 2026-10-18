@@ -286,9 +286,9 @@ func TestAccountRecords(t *testing.T) {
 		return stypes.Record{EventName: op, Dynamodb: &stypes.StreamRecord{Keys: keys, NewImage: img}}
 	}
 	modify, remove := stypes.OperationTypeModify, stypes.OperationTypeRemove
-	member := append([]byte{skMember}, make([]byte, 32)...)
+	other := append([]byte{skAdoptKey}, make([]byte, 16)...) // an adopt key's item
 	s.accCache.put(&Account{ID: "acme", Rev: 1})
-	s.applyAccountRecord(rec(modify, "acme", member, 5, true))
+	s.applyAccountRecord(rec(modify, "acme", other, 5, true))
 	s.applyAccountRecord(rec(modify, "other", []byte{skAccount}, 2, true))
 	if a, _ := s.accCache.get("acme"); a.Unmetered || a.Rev != 1 {
 		t.Fatalf("another item changed the account: %+v", a)
@@ -300,9 +300,9 @@ func TestAccountRecords(t *testing.T) {
 	if a, _ := s.accCache.get("acme"); !a.Unmetered || a.Rev != 2 {
 		t.Fatalf("not refreshed: %+v", a)
 	}
-	s.applyAccountRecord(rec(remove, "acme", member, 0, false))
+	s.applyAccountRecord(rec(remove, "acme", other, 0, false))
 	if _, ok := s.accCache.get("acme"); !ok {
-		t.Fatal("a removed member item evicted the account")
+		t.Fatal("a removed adopt key evicted the account")
 	}
 	s.applyAccountRecord(rec(remove, "acme", []byte{skAccount}, 0, false))
 	if _, ok := s.accCache.get("acme"); ok {

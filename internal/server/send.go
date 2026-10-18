@@ -125,10 +125,10 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	switch {
-	case rcpt == nil, rcpt.State == Closed:
-		return noSuchMailbox
-	case rcpt.State == Revoked:
+	case rcpt != nil && rcpt.State == Revoked:
 		return revoked()
+	case !rcpt.open():
+		return noSuchMailbox
 	}
 
 	// 6. Dedupe, before anything asks whether the box takes new mail: a

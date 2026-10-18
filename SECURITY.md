@@ -31,7 +31,7 @@ gh api repos/IronGall-dev/irongall-server/security-advisories/reports \
 | **The operator's commands are reached only through a Unix socket the server makes 0600, never through the API,** and nothing logs which address one acted on | `internal/server/admin.go`, `cmd/irongalld/limits.go`; `admin_test.go`, `cmd/irongalld/limits_test.go` |
 | **Keyed hashing is HMAC or HKDF only,** never `hash(secret ‖ …)` | `internal/server/index.go`, `keys.go` |
 | **Every error is RFC 9457 Problem Details, its `type` its code's own, and every value in its `detail` is a member of its own,** so no client needs to show a server's words | `problem_test.go`; `api/apitest`, which every test server is wrapped in, fails a `type` that is not its `code`'s; the spec's §13 |
-| **Revocation is kept as the identity signed it,** and answered for an address it covers before anything else | `revocation_test.go`, `revokedcerts_test.go` |
+| **Revocation is kept as the identity signed it, box or none,** and answered for an address it covers before anything else; a registration is held to it | `revocation_test.go`, `revokedcerts_test.go`, `expiry_test.go` |
 | **Every error is tested over raw HTTP against the spec's status map,** and both clients run end to end against the real server | `internal/server/*_test.go` (the list is `PROTOCOL-SERVER.md` §11), `e2e_test.go`; `test/interop.sh` for the shell client |
 
 **Run them:** `README.md` § Build and run.

@@ -10,8 +10,9 @@ import (
 
 // recCache is a bounded LRU of records, each at a rev. The stream replaces or
 // evicts an entry when its record changes; a record never moves back to an
-// older rev. Two are kept: box records (ARCHITECTURE.md § Memory, for
-// sends and reads of a box) and account records (for a sender's limits).
+// older rev. Two are kept: what is held of each address, a box's record with
+// its identity's revocations (ARCHITECTURE.md § Memory, for sends and reads
+// of a box), and account records (for a sender's limits).
 type recCache[K comparable, V any] struct {
 	mu  sync.Mutex
 	max int // 0: no cache
@@ -21,12 +22,17 @@ type recCache[K comparable, V any] struct {
 	key   func(V) K
 	rev   func(V) uint64
 	clone func(V) V
+	// merge, if set, is what two copies of an entry hold together, old the
+	// cached one: put and refresh keep it in place of the newer copy alone.
+	merge func(old, cur V) V
 }
 
 type boxCache = recCache[protocol.Address, *Box]
 
 func newBoxCache(size int) *boxCache {
-	return newRecCache(size, func(b *Box) protocol.Address { return b.Addr }, func(b *Box) uint64 { return b.Rev }, cloneBox)
+	c := newRecCache(size, func(b *Box) protocol.Address { return b.Addr }, func(b *Box) uint64 { return b.Rev }, cloneBox)
+	c.merge = mergeViews // revocations are never taken away, so neither copy's are lost
+	return c
 }
 
 type accountCache = recCache[string, *Account]
@@ -60,7 +66,10 @@ func (c *recCache[K, V]) put(v V) {
 	defer c.mu.Unlock()
 	k := c.key(v)
 	if e, ok := c.m[k]; ok {
-		if c.rev(e.Value.(V)) <= c.rev(v) {
+		switch {
+		case c.merge != nil:
+			e.Value = c.merge(e.Value.(V), v)
+		case c.rev(e.Value.(V)) <= c.rev(v):
 			e.Value = c.clone(v)
 		}
 		c.ll.MoveToFront(e)
@@ -85,6 +94,27 @@ func (c *recCache[K, V]) refresh(k K, rev uint64, decode func() (V, error)) {
 	}
 	v, err := decode()
 	if err != nil {
+		c.ll.Remove(e)
+		delete(c.m, k)
+		return
+	}
+	if c.merge != nil {
+		v = c.merge(e.Value.(V), v)
+	}
+	e.Value = v
+}
+
+// modify replaces a cached entry with what f makes of it, or evicts it when
+// f says not to keep it; one not cached stays uncached.
+func (c *recCache[K, V]) modify(k K, f func(V) (V, bool)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.m[k]
+	if !ok {
+		return
+	}
+	v, keep := f(c.clone(e.Value.(V)))
+	if !keep {
 		c.ll.Remove(e)
 		delete(c.m, k)
 		return

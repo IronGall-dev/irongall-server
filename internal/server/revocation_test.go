@@ -157,7 +157,10 @@ func TestRevocation(t *testing.T) {
 	}
 	stored, err := e.store.Box(ctx, a.Address())
 	if err != nil || stored.State != Revoked || string(stored.Revocation) != string(rec.Revocation) {
-		t.Fatalf("the record after a revocation: %+v, %v", stored, err)
+		t.Fatalf("what is held after a revocation: %+v, %v", stored, err)
+	}
+	if stored.hasRecord() {
+		t.Errorf("the box's record outlived the revocation of its address: rev %d", stored.Rev)
 	}
 	if n, _ := e.store.Count(ctx, a.Address()); n != 0 {
 		t.Errorf("a revoked box still holds %d messages", n)
@@ -208,28 +211,96 @@ func TestRevocation(t *testing.T) {
 	e.want(e.do("GET", read, nil, ""), 410, protocol.CodeRevoked)
 }
 
-// A closed box can be revoked, and then no prekey reopens it.
-func TestAClosedBoxIsRevoked(t *testing.T) {
-	ctx := context.Background()
+// A deleted box can be revoked, and then nothing brings it back: no
+// renewal, and no registration, which would have undone the delete.
+func TestADeletedBoxIsRevoked(t *testing.T) {
 	e := newEnv(t, relaxed())
-	a := e.box(protocol.Classic)
-	e.want(e.do("DELETE", "/v1/"+a.Address().String(), nil, e.pass(a)), 204, "")
-	closed := e.do("GET", boxPath(a.Address()), nil, "")
-	e.want(closed, 200, "")
-	if got := held(t, closed); got != nil {
-		t.Fatalf("a closed box nobody revoked is read with a revocation: %s", closed.body)
+	r := e.raw().register(protocol.MaxPrekeyLifetime)
+	e.want(e.do("DELETE", r.path(""), nil, r.pass(1)), 204, "")
+	e.want(e.do("GET", r.path(""), nil, ""), 404, protocol.CodeNoSuchMailbox)
+	rev, err := protocol.SignRevocation(r.signer, r.id.Address())
+	if err != nil {
+		t.Fatal(err)
 	}
-	rec := record(t, a)
-	e.want(e.do("PUT", revocationPath(a.Address()), rec, ""), 201, "")
-	var gone *client.RevokedError
-	if _, err := a.Rekey(ctx, protocol.Classic); !errors.As(err, &gone) || !gone.Own {
-		t.Fatalf("a prekey for a box closed and then revoked: %v", err)
-	}
-	shown := e.do("GET", boxPath(a.Address()), nil, "")
+	rec := protocol.Revocations{Identity: r.id.Document(), Revocation: rev}
+	e.want(e.do("PUT", r.path("/revocations"), rec, ""), 201, "")
+	shown := e.do("GET", r.path(""), nil, "")
 	e.want(shown, 410, protocol.CodeRevoked)
-	if got := held(t, shown); got == nil || !bytes.Equal(got.Revocation, rec.Revocation) {
-		t.Fatalf("a box closed and then revoked is read without its revocation: %s", shown.body)
+	if got := held(t, shown); got == nil || !bytes.Equal(got.Revocation, rev) {
+		t.Fatalf("a box deleted and then revoked is read without its revocation: %s", shown.body)
 	}
+	r.prekey(2, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(2), r.pass(2)), 410, protocol.CodeRevoked)
+	e.want(e.do("PUT", r.path(""), r.registration(2), r.pass(2)), 410, protocol.CodeRevoked)
+}
+
+// A server keeps a revocation for an address it has no box for (PROTOCOL.md
+// §6.3): of an address never registered, and of one whose box was deleted.
+// It serves it from both reads, and holds a later registration to it: 410
+// while the address is revoked, and nothing under a certificate its identity
+// revoked. A revocation of certificates alone leaves the read 404, and a
+// registration above it carries it.
+func TestARevocationIsKeptWithNoBox(t *testing.T) {
+	e := newEnv(t, relaxed())
+	now := e.clock.Now()
+
+	// Certificates revoked of an address nobody registered: kept, served,
+	// and a registration under one of them refused.
+	r := e.raw()
+	floor := r.certs(5)
+	e.want(e.do("PUT", r.path("/revocations"), floor, ""), 200, "")
+	e.want(e.do("GET", r.path(""), nil, ""), 404, protocol.CodeNoSuchMailbox)
+	got := e.do("GET", r.path("/revocations"), nil, "")
+	e.want(got, 200, "")
+	var served protocol.Revocations
+	if err := json.Unmarshal(got.body, &served); err != nil || !bytes.Equal(served.RevokedCertificates, floor.RevokedCertificates) || served.Revocation != nil {
+		t.Fatalf("the revocation of certificates of an address with no box: %s", got.body)
+	}
+	e.want(e.do("PUT", r.path("/revocations"), floor, ""), 200, "")                         // the same one again changes nothing
+	e.want(e.do("PUT", r.path("/revocations"), r.certs(4), ""), 409, protocol.CodeConflict) // nor does one that revokes fewer
+	r.prekey(5, now.Add(protocol.MaxPrekeyLifetime), nil)
+	e.want(e.do("PUT", r.path(""), r.registration(5), r.pass(5)), 401, protocol.CodeCertificateRevoked)
+	r.prekey(6, now.Add(protocol.MaxPrekeyLifetime), nil)
+	e.want(e.do("PUT", r.path(""), r.registration(6), r.pass(6)), 201, "")
+	if b := held(t, e.do("GET", r.path(""), nil, "")); b == nil || !bytes.Equal(b.RevokedCertificates, floor.RevokedCertificates) {
+		t.Fatal("a box registered above its identity's revocation of certificates is read without it")
+	}
+
+	// The address revoked with no box: the read is 410 with the record, and
+	// a registration of it is too.
+	q := e.raw()
+	rev, err := protocol.SignRevocation(q.signer, q.id.Address())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.want(e.do("PUT", q.path("/revocations"), protocol.Revocations{Identity: q.id.Document(), Revocation: rev}, ""), 201, "")
+	shown := e.do("GET", q.path(""), nil, "")
+	e.want(shown, 410, protocol.CodeRevoked)
+	if b := held(t, shown); b == nil || !bytes.Equal(b.Revocation, rev) {
+		t.Fatalf("an address revoked with no box is read without its record: %s", shown.body)
+	}
+	q.prekey(1, now.Add(protocol.MaxPrekeyLifetime), nil)
+	e.want(e.do("PUT", q.path(""), q.registration(1), q.pass(1)), 410, protocol.CodeRevoked)
+}
+
+// Keeping a revocation for an address a server holds nothing of is keeping
+// a record for good, so it is counted as a registration is, against its
+// caller's address; one for an address with a box, or with revocations
+// already, is not.
+func TestARevocationWithNoBoxIsCountedAsARegistration(t *testing.T) {
+	l := relaxed()
+	l.RegistrationsPerHour = 1
+	e := newEnv(t, l)
+	boxed := e.raw().register(protocol.MaxPrekeyLifetime) // the address's one registration this hour
+	e.clock.Add(time.Hour)
+	e.want(e.do("PUT", boxed.path("/revocations"), boxed.certs(1), ""), 200, "") // a box's: counted against nothing
+	none := e.raw()
+	e.want(e.do("PUT", none.path("/revocations"), none.certs(1), ""), 200, "")
+	e.want(e.do("PUT", none.path("/revocations"), none.certs(2), ""), 200, "") // a raise of what is held
+	other := e.raw()
+	e.want(e.do("PUT", other.path("/revocations"), other.certs(1), ""), 429, protocol.CodeRateLimited)
+	other.prekey(2, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	e.want(e.do("PUT", other.path(""), other.registration(2), other.pass(2)), 429, protocol.CodeRateLimited)
 }
 
 // A revoked box is read as its record: 410 revoked, carrying all this server
@@ -381,7 +452,7 @@ func mustJSONBytes(t *testing.T, b []byte) []byte {
 	return j[1 : len(j)-1]
 }
 
-// The revocation is in the box's record, so a process that starts later, or
+// The revocation is in the address's revocations item, so a process that starts later, or
 // another one beside this, serves the same proof and the same 410: nothing
 // about a revoked box lives only in the memory of the process that took the
 // revocation. AWS only: the in-memory store has one process.

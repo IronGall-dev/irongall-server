@@ -391,16 +391,20 @@ func TestARevocationOfCertificatesOutlivesTheProcess(t *testing.T) {
 	e2.want(e2.do("GET", r.path("/messages"), nil, r2.pass(2)), 200, "")
 }
 
-// What memory holds of a box comes from its record two ways: from the record
-// decoded whole, when a process loads the box, and from the standing read off
-// a stream record, when another process wrote it. Both say the same of a
-// revocation of certificates: whether it covers the box's current one.
-func TestARecordsStandingKnowsItsRevokedCertificates(t *testing.T) {
+// A revocation of certificates is kept apart from the box's record, in its
+// address's revocations item, which nothing but a higher one replaces. What
+// memory holds of a loaded box and the box read whole say the same of it:
+// whether it covers the box's current certificate. The record carries none
+// of it.
+func TestTheStandingKnowsTheRevokedCertificates(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t, relaxed())
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
 	r.prekey(3, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(3), r.pass(3)), 200, "") // the box stands at certificate 3
+	if _, err := e.store.Count(ctx, r.id.Address()); err != nil {           // a process that has loaded it
+		t.Fatal(err)
+	}
 	for i, c := range []struct {
 		through uint64
 		listed  bool
@@ -416,15 +420,18 @@ func TestARecordsStandingKnowsItsRevokedCertificates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		it := item(boxItem(b))
-		st, rev, err := decodeStanding(it)
-		want, werr := b.standing()
-		if err != nil || werr != nil || st != want || st.Listed != c.listed || rev != b.Rev {
-			t.Errorf("case %d: the standing read off the record says listed %v at rev %d (%v), the box's own says %v at rev %d (%v), want %v, and the two the same throughout", i, st.Listed, rev, err, want.Listed, b.Rev, werr, c.listed)
+		whole, ok, err := b.standing()
+		mem, held := e.store.Held(r.id.Address())
+		if err != nil || !ok || !held || whole.Listed != c.listed || mem.Listed != c.listed {
+			t.Errorf("case %d: the box read whole says listed %v (%v), memory says %v (held %v), want %v", i, whole.Listed, err, mem.Listed, held, c.listed)
 		}
-		back, err := decodeBox(it)
-		if err != nil || !bytes.Equal(back.RevokedCerts, b.RevokedCerts) || !bytes.Equal(back.RevokedCertsSig, b.RevokedCertsSig) || (c.through != 0) != (len(back.RevokedCerts) > 0) {
-			t.Errorf("case %d: the revocation of certificates does not come back from the record as it went in: %v", i, err)
+		if c.through != 0 && (len(b.RevokedCerts) == 0 || len(b.RevokedCertsSig) == 0) {
+			t.Errorf("case %d: the box is read without its revocation of certificates", i)
+		}
+		for _, name := range []string{"revocation", "revoked_certs", "revoked_certs_sig", "through"} {
+			if _, ok := boxItem(b)[name]; ok {
+				t.Errorf("case %d: the record carries %s", i, name)
+			}
 		}
 	}
 }

@@ -218,16 +218,13 @@ func TestAccounts(t *testing.T) {
 		if got := adopt(t, a, key2); got != second.ID || e.accountOf(a) != second.ID {
 			t.Fatalf("moved to %q", e.accountOf(a))
 		}
-		if s, ok := e.store.(*DynamoStore); ok {
-			if s.member(t, first.ID, a.Address()) || !s.member(t, second.ID, a.Address()) {
-				t.Fatal("the accounts' side does not match the box record")
-			}
+		if s, ok := e.store.(*DynamoStore); ok { // the index of each account's boxes follows the box record
+			s.lists(t, first.ID, a.Address(), false)
+			s.lists(t, second.ID, a.Address(), true)
 			if err := a.Leave(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if s.member(t, second.ID, a.Address()) {
-				t.Fatal("the account still holds a box that left")
-			}
+			s.lists(t, second.ID, a.Address(), false)
 		}
 	})
 

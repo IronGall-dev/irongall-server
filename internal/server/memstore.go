@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -12,16 +13,19 @@ import (
 
 // MemStore is the dev server's store: everything in memory, nothing
 // persisted. Expired messages and dedupe records vanish at their ExpiresAt.
+// A box's record stays past its Expires, as one in DynamoDB does until the
+// TTL deletes it, which may be days after: a test stands in for the TTL with
+// DeleteBox, which is the delete the TTL makes.
 type MemStore struct {
 	now func() time.Time
 
-	mu       sync.Mutex
-	boxes    map[protocol.Address]*Box
-	held     map[protocol.Address]Standing // each box's standing, as of its last write
-	messages map[protocol.Address]map[[32]byte]*memMessage
-	dedupe   map[protocol.Address]map[[32]byte]Header
-	accounts map[string]*Account
-	keys     map[adoptKeyRef]*AdoptKey
+	mu          sync.Mutex
+	boxes       map[protocol.Address]*Box         // each box's record, with none of its revocations
+	revocations map[protocol.Address]*Revocations // each address's revocations item
+	messages    map[protocol.Address]map[[32]byte]*memMessage
+	dedupe      map[protocol.Address]map[[32]byte]Header
+	accounts    map[string]*Account
+	keys        map[adoptKeyRef]*AdoptKey
 }
 
 type adoptKeyRef struct {
@@ -38,13 +42,13 @@ type memMessage struct {
 // NewMemStore returns an empty store on the given clock.
 func NewMemStore(now func() time.Time) *MemStore {
 	return &MemStore{
-		now:      now,
-		boxes:    map[protocol.Address]*Box{},
-		held:     map[protocol.Address]Standing{},
-		messages: map[protocol.Address]map[[32]byte]*memMessage{},
-		dedupe:   map[protocol.Address]map[[32]byte]Header{},
-		accounts: map[string]*Account{},
-		keys:     map[adoptKeyRef]*AdoptKey{},
+		now:         now,
+		boxes:       map[protocol.Address]*Box{},
+		revocations: map[protocol.Address]*Revocations{},
+		messages:    map[protocol.Address]map[[32]byte]*memMessage{},
+		dedupe:      map[protocol.Address]map[[32]byte]Header{},
+		accounts:    map[string]*Account{},
+		keys:        map[adoptKeyRef]*AdoptKey{},
 	}
 }
 
@@ -72,23 +76,38 @@ func cloneACL(a *protocol.ACL) *protocol.ACL {
 	return &c
 }
 
+// record returns a's record, or nil.
+func (s *MemStore) record(a protocol.Address) *Box { return s.boxes[a] }
+
+func (s *MemStore) viewLocked(a protocol.Address) *Box {
+	var rv *Revocations
+	if r, ok := s.revocations[a]; ok {
+		c := *r
+		rv = &c
+	}
+	return view(a, s.record(a), rv)
+}
+
 // Held implements Store: the dev store holds every box in memory.
 func (s *MemStore) Held(a protocol.Address) (Standing, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st, ok := s.held[a]
-	return st, ok
+	b := s.viewLocked(a)
+	if b == nil {
+		return Standing{}, false
+	}
+	st, ok, err := b.standing()
+	return st, ok && err == nil
 }
 
 // Box implements Store.
 func (s *MemStore) Box(_ context.Context, a protocol.Address) (*Box, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	b, ok := s.boxes[a]
-	if !ok {
-		return nil, ErrNotFound
+	if b := s.viewLocked(a); b != nil {
+		return b, nil
 	}
-	return cloneBox(b), nil
+	return nil, ErrNotFound
 }
 
 // Known implements Store: every box is in memory, and nothing remembers a
@@ -96,26 +115,25 @@ func (s *MemStore) Box(_ context.Context, a protocol.Address) (*Box, error) {
 func (s *MemStore) Known(a protocol.Address) (*Box, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	b, ok := s.boxes[a]
-	if !ok {
-		return nil, false
-	}
-	return cloneBox(b), true
+	b := s.viewLocked(a)
+	return b, b != nil
 }
 
 // CreateBox implements Store.
 func (s *MemStore) CreateBox(_ context.Context, b *Box) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.boxes[b.Addr]; ok {
+	if s.record(b.Addr) != nil {
 		return ErrExists
 	}
-	st, err := b.standing()
-	if err != nil {
+	if err := b.writable(); err != nil {
 		return err
 	}
+	if _, err := identityWire(b.Identity); err != nil {
+		return fmt.Errorf("the identity: %w", err)
+	}
 	b.Rev = 1
-	s.boxes[b.Addr], s.held[b.Addr] = cloneBox(b), st
+	s.boxes[b.Addr] = storedRecord(b)
 	return nil
 }
 
@@ -123,16 +141,48 @@ func (s *MemStore) CreateBox(_ context.Context, b *Box) error {
 func (s *MemStore) UpdateBox(_ context.Context, b *Box) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cur, ok := s.boxes[b.Addr]
-	if !ok || cur.Rev != b.Rev {
-		return ErrStale
-	}
-	st, err := b.standing()
-	if err != nil {
+	if err := b.writable(); err != nil {
 		return err
 	}
+	cur := s.record(b.Addr)
+	if cur == nil || cur.Rev != b.Rev {
+		return ErrStale
+	}
 	b.Rev++
-	s.boxes[b.Addr], s.held[b.Addr] = cloneBox(b), st
+	s.boxes[b.Addr] = storedRecord(b)
+	return nil
+}
+
+// storedRecord is what a store keeps of b as its record: none of what its
+// identity revoked, which is kept apart, and the state the record says.
+func storedRecord(b *Box) *Box {
+	c := cloneBox(b)
+	c.Revocation, c.RevokedCerts, c.RevokedCertsSig = nil, nil, nil
+	return c
+}
+
+// DeleteBox implements Store.
+func (s *MemStore) DeleteBox(_ context.Context, a protocol.Address) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.boxes, a)
+	return nil
+}
+
+// Revoke implements Store.
+func (s *MemStore) Revoke(_ context.Context, a protocol.Address, rv *Revocations) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.revocations[a]
+	if !ok {
+		cur = &Revocations{}
+	}
+	if rv.Through > 0 && cur.Through >= rv.Through {
+		return ErrStale
+	}
+	c := *cur
+	c.merge(rv)
+	s.revocations[a] = &c
 	return nil
 }
 
@@ -357,8 +407,8 @@ func (s *MemStore) PutAdoptKey(_ context.Context, k *AdoptKey) error {
 func (s *MemStore) Adopt(_ context.Context, b *Box, account string, key [16]byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cur, ok := s.boxes[b.Addr]
-	if !ok || cur.Rev != b.Rev {
+	cur := s.record(b.Addr)
+	if cur == nil || cur.Rev != b.Rev {
 		return ErrStale
 	}
 	k, ok := s.keys[adoptKeyRef{account, key}]
@@ -368,10 +418,6 @@ func (s *MemStore) Adopt(_ context.Context, b *Box, account string, key [16]byte
 	k.Uses--
 	cur.Account, cur.Rev = account, cur.Rev+1
 	b.Account, b.Rev = account, cur.Rev
-	if st, ok := s.held[b.Addr]; ok {
-		st.InAccount = cur.Account != ""
-		s.held[b.Addr] = st
-	}
 	return nil
 }
 
@@ -379,15 +425,11 @@ func (s *MemStore) Adopt(_ context.Context, b *Box, account string, key [16]byte
 func (s *MemStore) Leave(_ context.Context, b *Box) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cur, ok := s.boxes[b.Addr]
-	if !ok || cur.Rev != b.Rev {
+	cur := s.record(b.Addr)
+	if cur == nil || cur.Rev != b.Rev {
 		return ErrStale
 	}
 	cur.Account, cur.Rev = "", cur.Rev+1
 	b.Account, b.Rev = "", cur.Rev
-	if st, ok := s.held[b.Addr]; ok {
-		st.InAccount = cur.Account != ""
-		s.held[b.Addr] = st
-	}
 	return nil
 }

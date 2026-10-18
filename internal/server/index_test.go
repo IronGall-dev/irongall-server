@@ -123,17 +123,50 @@ func TestIndex(t *testing.T) {
 		if st, ok := x.standing(box); !ok || st != second {
 			t.Fatalf("standing %v %v", st, ok)
 		}
-		x.setStanding(box, Standing{State: Revoked, Cert: [32]byte{2}}, 4)
-		if st, _ := x.standing(box); st.State != Revoked {
-			t.Fatal("revoked not kept")
+		x.setStanding(box, Standing{State: Deleted, Cert: [32]byte{2}}, 4)
+		if st, _ := x.standing(box); st.State != Deleted {
+			t.Fatal("deleted not kept")
 		}
-		x.dropStanding(box)
+		x.forget(box)
 		if _, ok := x.standing(box); ok {
 			t.Fatal("a deleted record kept its standing")
 		}
-		x.setStanding(box, first, 1) // registered again
-		if st, ok := x.standing(box); !ok || st != first {
-			t.Fatal("a new record after a deletion was not taken")
+		x.setStanding(box, first, 1) // registered again: the next use loads it, so nothing is held until then
+		if _, ok := x.standing(box); ok {
+			t.Fatal("a box memory forgot was taken back from a change")
+		}
+	})
+
+	t.Run("revocations only add", func(t *testing.T) {
+		x := loaded(t, box, boxRead{exists: true, st: Standing{State: Active, CertSerial: 5}, rev: 1})
+		x.setRevocations(box, false, 4)
+		if st, _ := x.standing(box); st.Listed {
+			t.Fatal("certificates revoked through 4 listed the box's 5")
+		}
+		x.setRevocations(box, false, 5)
+		x.setRevocations(box, false, 2) // a lower one changes nothing
+		if st, _ := x.standing(box); !st.Listed {
+			t.Fatal("certificates revoked through 5 did not list the box's 5")
+		}
+		x.setStanding(box, Standing{State: Active, CertSerial: 6}, 2) // a renewal above them
+		if st, _ := x.standing(box); st.Listed {
+			t.Fatal("a renewal above the revoked certificates is still listed")
+		}
+		x.setRevocations(box, true, 0)
+		x.setStanding(box, Standing{State: Active, CertSerial: 7}, 3)
+		if st, ok := x.standing(box); !ok || st.State != Revoked {
+			t.Fatalf("a revoked address: %+v %v", st, ok)
+		}
+	})
+
+	t.Run("a revoked address with no record", func(t *testing.T) {
+		x := loaded(t, box, boxRead{revoked: true})
+		if st, ok := x.standing(box); !ok || st.State != Revoked {
+			t.Fatalf("a revoked address with no record: %+v %v", st, ok)
+		}
+		y := loaded(t, box, boxRead{through: 9})
+		if _, ok := y.standing(box); ok {
+			t.Fatal("an address with no box has a standing")
 		}
 	})
 }

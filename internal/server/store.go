@@ -13,20 +13,34 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
-// State is a box's state (PROTOCOL.md §3a).
+// State is what a server holds of an address (PROTOCOL.md §3a). A box's
+// record is Active or Deleted; Revoked and NoBox are what the store answers
+// from the address's revocations alone.
 type State string
 
-// The box states.
+// The states.
 const (
-	Active  State = "active"
-	Closed  State = "closed"
+	// Active is a registered box.
+	Active State = "active"
+	// Deleted is a box its owner deleted: answered as if never registered,
+	// but to a registration, which undoes the delete. Its record is kept
+	// until its newest certificate ends, then DynamoDB's TTL takes it.
+	Deleted State = "deleted"
+	// Revoked is an address its identity revoked. Its record is deleted,
+	// and the revocation is kept for good.
 	Revoked State = "revoked"
+	// NoBox is an address with no box whose identity revoked certificates:
+	// a later registration is held above them.
+	NoBox State = "none"
 )
 
-// Box is a box's record.
+// Box is what a server holds of an address: its box's record, if it has
+// one, and what its identity revoked, if anything, which is kept in an item
+// of its own (Revocations) with or without a box. A revocation of the
+// address is the State whatever the record says.
 type Box struct {
 	Addr     protocol.Address
-	Identity []byte // the identity document, exactly as registered
+	Identity []byte // the identity document, exactly as registered or as the revocations carried it
 	State    State
 	// The current prekey: its statement, the working key's signature over it,
 	// which carries the key's certificate, and the statement parsed.
@@ -48,15 +62,23 @@ type Box struct {
 	// Retired holds the newest retired prekeys (Limits.RetiredKept), each
 	// until its not_after: its key may not come back.
 	Retired []Retired
-	Rev     uint64 // the record's revision; a write must name the one it read
+	Rev     uint64 // the record's revision, 0 with no record; a write must name the one it read
 	Created time.Time
+	// Expires is when the record may go: DynamoDB's TTL deletes it some time
+	// after (PROTOCOL.md §7). Every registration and renewal moves it to
+	// when nothing of the box is valid any more, and a delete to when its
+	// newest certificate ends. Zero: never.
+	Expires time.Time
 	// Account is the account the box belongs to, or "" (PROTOCOL.md §6.5).
 	// Only Adopt and Leave change it.
 	Account string
-	// Revocation is the identity's signature that revoked the box, kept for
-	// good and served to whoever asks (PROTOCOL.md §6.3): nil unless State
-	// is Revoked. With Identity it proves itself, so nobody takes this
-	// server's word that the box is revoked.
+	// What the identity revoked, from the address's revocations item
+	// (Revocations): kept for good and served to whoever asks.
+	//
+	// Revocation is the identity's signature that revoked the address
+	// (PROTOCOL.md §6.3): nil unless State is Revoked. With Identity it
+	// proves itself, so nobody takes this server's word that the box is
+	// revoked.
 	Revocation []byte
 	// RevokedCerts is the identity's highest revocation of its certificates,
 	// exactly as it signed it, and RevokedCertsSig its signature
@@ -73,6 +95,23 @@ type Box struct {
 	ACL *protocol.ACL
 }
 
+// open reports whether b is a box that takes calls: one registered, not
+// deleted and not revoked. Every other state is answered as no box, but
+// Revoked, which is 410.
+func (b *Box) open() bool { return b != nil && b.State == Active }
+
+// writable returns an error unless b's state is one a record holds: what
+// the store answers from revocations alone is never written as a record.
+func (b *Box) writable() error {
+	if b.State != Active && b.State != Deleted {
+		return fmt.Errorf("a box record is %s or %s, never %s", Active, Deleted, b.State)
+	}
+	return nil
+}
+
+// hasRecord reports whether b's box has a record, whatever its state.
+func (b *Box) hasRecord() bool { return b != nil && b.Rev > 0 }
+
 // listed reports whether the box's identity has revoked the certificate of
 // this serial, by the revocation on record. A box with none has revoked none.
 func (b *Box) listed(serial uint64) (bool, error) {
@@ -80,6 +119,120 @@ func (b *Box) listed(serial uint64) (bool, error) {
 		return false, nil
 	}
 	return listNames(b.RevokedCerts, serial)
+}
+
+// Revocations is what an address's identity has revoked, as kept in an item
+// of its own beside the box's record, box or none (PROTOCOL.md §6.3, §6.3a):
+// the revocation of the address once, and the highest revocation of its
+// certificates. Nothing in it is ever taken away, so two copies merge to the
+// larger of each.
+type Revocations struct {
+	Identity []byte
+	// Address is the identity's signature that revoked the address, or nil.
+	Address []byte
+	// Certs and CertsSig are its highest revocation of its certificates, or
+	// nil; Through is the serial it revokes through, 0 with none.
+	Certs, CertsSig []byte
+	Through         uint64
+}
+
+// merge adds what o holds to r: the revocation of the address if r has none,
+// and o's revocation of certificates if it reaches higher.
+func (r *Revocations) merge(o *Revocations) {
+	if o == nil {
+		return
+	}
+	if len(r.Identity) == 0 {
+		r.Identity = o.Identity
+	}
+	if len(r.Address) == 0 {
+		r.Address = o.Address
+	}
+	if o.Through > r.Through {
+		r.Certs, r.CertsSig, r.Through = o.Certs, o.CertsSig, o.Through
+	}
+}
+
+// revocations returns what b holds of its identity's revocations, or nil.
+func (b *Box) revocations() (*Revocations, error) {
+	if len(b.Revocation) == 0 && len(b.RevokedCerts) == 0 {
+		return nil, nil
+	}
+	r := &Revocations{Identity: b.Identity, Address: b.Revocation, Certs: b.RevokedCerts, CertsSig: b.RevokedCertsSig}
+	if len(b.RevokedCerts) > 0 {
+		c, err := protocol.ParseRevokedCertificates(b.RevokedCerts)
+		if err != nil {
+			return nil, fmt.Errorf("the stored revocation of certificates: %w", err)
+		}
+		r.Through = c.Through
+	}
+	return r, nil
+}
+
+// view is what a server holds of address a: its box's record rec, or nil,
+// with its identity's revocations rv, or nil. It is nil if neither is held.
+// A revocation of the address makes the state Revoked, whatever the record
+// says: a registration that raced the revocation leaves a record that is
+// never served, and its TTL takes it.
+func view(a protocol.Address, rec *Box, rv *Revocations) *Box {
+	if rec == nil && rv == nil {
+		return nil
+	}
+	b := &Box{Addr: a, State: NoBox}
+	if rec != nil {
+		b = cloneBox(rec)
+	}
+	if rv != nil {
+		if len(b.Identity) == 0 {
+			b.Identity = rv.Identity
+		}
+		b.Revocation, b.RevokedCerts, b.RevokedCertsSig = rv.Address, rv.Certs, rv.CertsSig
+		if len(rv.Address) > 0 {
+			b.State = Revoked
+		}
+	}
+	return b
+}
+
+// withRevocations is b with rv merged into what it holds of its identity's
+// revocations.
+func (b *Box) withRevocations(rv *Revocations) (*Box, error) {
+	held, err := b.revocations()
+	if err != nil {
+		return nil, err
+	}
+	if held == nil {
+		held = &Revocations{}
+	}
+	held.merge(rv)
+	c := cloneBox(b)
+	if len(c.Identity) == 0 {
+		c.Identity = held.Identity
+	}
+	c.Revocation, c.RevokedCerts, c.RevokedCertsSig = held.Address, held.Certs, held.CertsSig
+	if len(c.Revocation) > 0 {
+		c.State = Revoked
+	}
+	return c, nil
+}
+
+// mergeViews is what two reads of one address hold together: the record of
+// the higher rev, and every revocation either holds, since none is ever
+// taken away.
+func mergeViews(old, cur *Box) *Box {
+	base, other := cur, old
+	if old.Rev > cur.Rev {
+		base, other = old, cur
+	}
+	rv, err := other.revocations()
+	if err != nil {
+		return cloneBox(base)
+	}
+	m, err := base.withRevocations(rv)
+	if err != nil {
+		return cloneBox(base)
+	}
+	return m
 }
 
 // listNames reports whether a stored revocation of certificates covers a
@@ -137,6 +290,8 @@ type Standing struct {
 	State State
 	Key   string   // the identity's key in SSH wire form, of whatever type: what line 2 of its document holds
 	Cert  [32]byte // Box.Cert
+	// CertSerial is Box.CertSerial, which Listed is judged by.
+	CertSerial uint64
 	// Listed is true while the box's current certificate is one its identity
 	// has revoked (PROTOCOL.md §6.3a): no pass of the box is taken until it
 	// publishes a prekey under a new certificate.
@@ -146,17 +301,23 @@ type Standing struct {
 	InAccount bool
 }
 
-// standing is b's standing.
-func (b *Box) standing() (Standing, error) {
+// standing is b's standing. ok is false for an address with no box: one
+// whose identity revoked certificates and registered nothing.
+func (b *Box) standing() (st Standing, ok bool, err error) {
+	if b.State == NoBox {
+		return Standing{}, false, nil
+	}
 	key, err := identityWire(b.Identity)
 	if err != nil {
-		return Standing{}, fmt.Errorf("the stored identity: %w", err)
+		return Standing{}, false, fmt.Errorf("the stored identity: %w", err)
 	}
-	listed, err := b.listed(b.CertSerial)
-	if err != nil {
-		return Standing{}, err
+	st = Standing{State: b.State, Key: key, Cert: b.Cert, CertSerial: b.CertSerial, InAccount: b.Account != ""}
+	if b.State != Revoked {
+		if st.Listed, err = b.listed(b.CertSerial); err != nil {
+			return Standing{}, false, err
+		}
 	}
-	return Standing{State: b.State, Key: key, Cert: b.Cert, Listed: listed, InAccount: b.Account != ""}, nil
+	return st, true, nil
 }
 
 // identityWire is the key of a stored identity document, in SSH wire form:
@@ -200,6 +361,17 @@ func identityType(doc []byte) string {
 // certHash names a certificate by the SHA-256 of its bytes.
 func certHash(c *protocol.Certificate) [32]byte { return sha256.Sum256(c.Marshal()) }
 
+// expiry is when the record of a box whose current statement is p, under
+// cert, may go (PROTOCOL.md §7): once the certificate has ended, so that no
+// working key of it is left to register with, and the last mail sealed to p
+// has expired.
+func expiry(p *protocol.Prekey, cert *protocol.Certificate) time.Time {
+	if end := p.NotAfter.Add(protocol.TTL); end.After(cert.NotAfter()) {
+		return end
+	}
+	return cert.NotAfter()
+}
+
 // Store errors.
 var (
 	ErrNotFound = errors.New("not found")
@@ -218,17 +390,27 @@ type Store interface {
 	// false for a box this process has not loaded, which only its record
 	// answers for: Known, then Box (ARCHITECTURE.md § Memory).
 	Held(a protocol.Address) (st Standing, ok bool)
-	// Box returns a box's record, or ErrNotFound.
+	// Box returns what is held of an address (view): its box's record and
+	// its identity's revocations, or ErrNotFound if neither.
 	Box(ctx context.Context, a protocol.Address) (*Box, error)
-	// Known returns what memory holds of a box, with no read: its record, or
-	// nil for an address it holds as missing. ok is false when only a read
-	// can tell, which is what Box then does.
+	// Known returns what memory holds of an address, with no read: what Box
+	// returns, or nil for an address it holds as missing. ok is false when
+	// only a read can tell, which is what Box then does.
 	Known(a protocol.Address) (b *Box, ok bool)
-	// CreateBox stores a new box at Rev 1, or returns ErrExists.
+	// CreateBox stores a new box's record at Rev 1, or returns ErrExists if
+	// the address has one, of a deleted box or not.
 	CreateBox(ctx context.Context, b *Box) error
-	// UpdateBox stores b if the stored record is still at b.Rev, and bumps
-	// b.Rev; otherwise ErrStale.
+	// UpdateBox stores b's record if the stored one is still at b.Rev, and
+	// bumps b.Rev; otherwise ErrStale. It writes nothing of the revocations.
 	UpdateBox(ctx context.Context, b *Box) error
+	// DeleteBox deletes a's record, and keeps its revocations.
+	DeleteBox(ctx context.Context, a protocol.Address) error
+	// Revoke keeps what the identity of address a revoked, box or none, in
+	// the address's revocations item: rv's revocation of the address, kept
+	// once, and its revocation of certificates, which only one through a
+	// higher serial replaces: ErrStale if one through as high a serial was
+	// stored first.
+	Revoke(ctx context.Context, a protocol.Address, rv *Revocations) error
 
 	// Dedupe returns the header of the message box already holds with this
 	// id, acked or not, until it expires; or ErrNotFound.
@@ -246,7 +428,8 @@ type Store interface {
 	// its dedupe record stays until it expires. ErrNotFound if it is not
 	// live.
 	DeleteMessage(ctx context.Context, box protocol.Address, id [32]byte) error
-	// DeleteMessages deletes every live message in a box (close).
+	// DeleteMessages deletes every live message in a box (a delete, a
+	// revocation).
 	DeleteMessages(ctx context.Context, box protocol.Address) error
 	// DeleteFrom deletes every live message in a box whose sender from
 	// matches, as acks do: what an ACL's deny list now refuses (PROTOCOL.md

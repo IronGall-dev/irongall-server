@@ -110,10 +110,10 @@ A set keyed by message id absorbs all three. The penciled Redis count cache was 
   - The list has no `ETag` and no `304` (`PROTOCOL.md` §5.1), which would carry no `poll_after`, so a poll of a box that holds mail is a Query of one page, capped by the poll rate and the page size. An empty box's poll is memory's count alone, either way.
 
 **The rest of each process's memory:**
-- the standing of every box this process has used: its state, its identity's public key, the SHA-256 of its current certificate, and the record's rev. It is what a pass is checked against with no read (`PROTOCOL-SERVER.md` §6.1b);
+- the standing of every box this process has used: its state, its identity's public key, the SHA-256 and the serial of its current certificate, the record's rev, and what its identity revoked (the address, and the serial its certificates are revoked through). It is what a pass is checked against with no read (`PROTOCOL-SERVER.md` §6.1b);
 - the pass each box showed last, until it runs out, so that a call carrying it again is a lookup;
 - the poll buckets;
-- an LRU of box records for sends and reads of a box, which the stream invalidates. A record carries its box's ACL, two sorted lists of 32-byte addresses that `-acl-entries` bounds, so a send's check of it reads nothing more (`PROTOCOL-SERVER.md` §6.2);
+- an LRU of what is held of each address, a box's record with its identity's revocations, for sends and reads of a box, which the stream keeps current. A record carries its box's ACL, two sorted lists of 32-byte addresses that `-acl-entries` bounds, so a send's check of it reads nothing more (`PROTOCOL-SERVER.md` §6.2);
 - an LRU of account records, as many as box records, for a sender in an account (`PROTOCOL.md` §6.5): filled on first use by a strongly consistent read, refreshed or evicted by the accounts stream;
 - the server MAC keys, from the 0600 secrets file: they make adopt keys (`PROTOCOL.md` §6.5).
 
@@ -156,9 +156,9 @@ sequenceDiagram
 ### Following the stream
 - **Nothing is kept across restarts.** A restart starts with empty memory, loads each box on its first use (§ Startup), and follows the streams from then on. A follower that loses its place (more than the stream's 24 hours behind, an iterator that expired before it read anything, the stream gone) exits the process, and the restart rebuilds.
 - Each process reads the streams of the boxes, messages and accounts tables itself, with the `NEW_IMAGE` view, one follower per stream.
-  - **Boxes:** a record's image refreshes the LRU and the standing; a removal evicts it. Other items under a box (`sk` ≠ `0x00`) are not memory's.
+  - **Boxes:** a record's image (`sk` `0x00`) refreshes the LRU and the standing. An address's revocations (`sk` `0x01`) add to what memory holds of it, since nothing in them is ever taken away. A record's removal, by the TTL or a revocation of its address, makes the process forget the box: its next use reads it again, so a removal that arrives after a later registration costs one read and loses nothing. Other items under an address are not memory's.
   - **Messages:** an image with `live` adds the message's mark; one without (an ack, or a body found gone) removes it. Removals are ignored: only the TTL deletes a message item, after it expired, and memory drops a mark at its expiry.
-  - **Accounts:** an account record's image (`sk` `0x00`) refreshes it in the account LRU; a removal evicts it. Its other items (boxes held, adopt keys) are not memory's.
+  - **Accounts:** an account record's image (`sk` `0x00`) refreshes it in the account LRU; a removal evicts it. Its other items (adopt keys) are not memory's. Which boxes an account holds is the box records' to say, through the boxes table's index on `account`, which nothing in memory follows.
 - **With one process the followers are a placeholder for stage 2.** The process applies its own writes to memory at once and a box loads from the tables on first use, so the streams carry only its own echoes (which clear its ack tombs) and hand edits to the tables. So with one process `-stream-interval` can be long: at ten times the interval, idle CPU and Streams reads both fell tenfold (measured). Lower it when a second process arrives: each empty `GetRecords` costs ~0.34 ms of CPU (measured; never profiled).
 - **AWS advises no more than two readers per shard, or reads get throttled** (same doc). So each process reads each shard every N/2 seconds, where N is the number of processes. Up to 4 processes stay within 2 s.
 - A parent shard is read before its children, per the lineage rule in the same doc. There's no Go KCL, so we write ~300 lines of shard following (estimate).
@@ -354,7 +354,7 @@ Decided 2026-10-10 and gone from this list: DynamoDB Streams as the change log (
 - **The default budget for layer 2.** Proposed: on, with a byte budget; 0 means counts only.
 - **Limits and resident state:**
   - per-process shares plus edge rules for the per-IP limits;
-  - closed-box eviction.
+  - eviction of a box nothing uses: the index holds a loaded box until the process restarts or its record is deleted, a deleted box's marked record included.
 - **The readiness threshold:** 30 s of stream lag, proposed.
 
 ## Estimates and measurements

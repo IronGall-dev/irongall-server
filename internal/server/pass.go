@@ -72,7 +72,8 @@ func (ps *passes) keep(a protocol.Address, p seenPass, now time.Time) {
 
 // standingOf returns what checking box a's pass needs: from memory when this
 // process holds the box, so that a poll never leaves it, and otherwise from
-// the box's record (lookup). ok is false for an address with no box.
+// what is held of the address (lookup). ok is false for an address with no
+// box.
 func (s *Server) standingOf(r *http.Request, a protocol.Address) (st Standing, ok bool, err error) {
 	if st, ok := s.store.Held(a); ok {
 		return st, true, nil
@@ -81,8 +82,7 @@ func (s *Server) standingOf(r *http.Request, a protocol.Address) (st Standing, o
 	if err != nil || b == nil {
 		return Standing{}, false, err
 	}
-	st, err = b.standing()
-	return st, err == nil, err
+	return b.standing()
 }
 
 // serverName is the name the caller called this server by, if it is one of
@@ -297,7 +297,7 @@ func (s *Server) owner(r *http.Request, params ...string) (protocol.Address, err
 	switch {
 	case err != nil:
 		return a, err
-	case !ok, st.State == Closed:
+	case !ok, st.State == Deleted: // a deleted box is answered as if never registered
 		return a, noSuchMailbox
 	case st.State == Revoked:
 		return a, revoked()
@@ -320,8 +320,8 @@ func (s *Server) sender(r *http.Request) (protocol.Address, error) {
 	switch {
 	case err != nil:
 		return a, err
-	case !ok, st.State == Closed:
-		return a, fail(protocol.CodeUnknownSender, "register your own box first: irongall init", "the box the pass names is not registered, or is closed")
+	case !ok, st.State == Deleted:
+		return a, fail(protocol.CodeUnknownSender, "register your own box first: irongall init", "the box the pass names is not registered")
 	case st.State == Revoked:
 		return a, fail(protocol.CodeSenderRevoked, "your box is revoked: make a new one, irongall init", "the sending box is revoked")
 	case st.Listed:

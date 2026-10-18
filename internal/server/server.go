@@ -154,7 +154,7 @@ func (s *Server) routes() []route {
 	return []route{
 		{"GET /v1/{addr}", s.getBox},
 		{"PUT /v1/{addr}", s.register},
-		{"DELETE /v1/{addr}", s.closeBox},
+		{"DELETE /v1/{addr}", s.deleteBox},
 		{"PUT /v1/{addr}/prekey", s.prekey},
 		{"PUT /v1/{addr}/revocations", s.revoke},
 		{"GET /v1/{addr}/revocations", s.getRevocations},

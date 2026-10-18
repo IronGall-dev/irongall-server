@@ -167,14 +167,18 @@ func (s *DynamoStore) Start(ctx context.Context) error {
 // Ready reports whether the three streams are followed.
 func (s *DynamoStore) Ready() bool { return s.ready.Load() }
 
-// Keys. Every key is binary. Boxes: addr is the box's address, sk 0x00 its
-// record; the box's own items will sit under other sk values. Messages: box
+// Keys. Every key is binary. Boxes: addr is the address, sk 0x00 its box's
+// record and 0x01 its revocations, the identity's, kept with or without a
+// box; one Query of the address reads both. A record in an account carries
+// account, the key of the sparse index of each account's boxes. Messages: box
 // and id, and while the message is unacked, live = received_at (ms, u64
 // big-endian) ‖ id, the sort key of the sparse index that lists a box's
 // unacked mail oldest first.
 const (
-	skBox     byte = 0x00
-	liveIndex      = "live"
+	skBox         byte = 0x00
+	skRevocations byte = 0x01
+	liveIndex          = "live"
+	accountIndex       = "account"
 )
 
 var ttlMs = uint64(protocol.TTL / time.Millisecond)
@@ -190,6 +194,10 @@ func ttlSeconds(expMs uint64) uint64 { return (expMs + 999) / 1000 }
 
 func boxKey(a protocol.Address) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{"addr": bin(a[:]), "sk": bin([]byte{skBox})}
+}
+
+func revocationsKey(a protocol.Address) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{"addr": bin(a[:]), "sk": bin([]byte{skRevocations})}
 }
 
 func msgKey(box protocol.Address, id [32]byte) map[string]types.AttributeValue {
@@ -257,18 +265,15 @@ func (it item) string(name string) (string, error) {
 	return "", fmt.Errorf("item: %s is missing or not a string", name)
 }
 
-// boxRecord reads the key of an item of the -boxes-table table: its address, and
-// whether it is the box's record.
-func boxRecord(it item) (protocol.Address, bool, error) {
+// boxItemKey reads the key of an item of the -boxes-table table: its
+// address, and its sk.
+func boxItemKey(it item) (protocol.Address, []byte, error) {
 	a, err := it.hash("addr")
 	if err != nil {
-		return a, false, err
+		return a, nil, err
 	}
 	sk, err := it.bytes("sk")
-	if err != nil {
-		return a, false, err
-	}
-	return a, bytes.Equal(sk, []byte{skBox}), nil
+	return a, sk, err
 }
 
 // The box record.
@@ -297,16 +302,9 @@ func boxState(b *Box) map[string]types.AttributeValue {
 		"retired":       &types.AttributeValueMemberL{Value: retired},
 		"rev":           num(b.Rev),
 	}
-	// Written once, when the box is revoked, and never taken away.
-	if len(b.Revocation) > 0 {
-		st["revocation"] = bin(b.Revocation)
-	}
-	// The identity's revocation of its certificates and its signature: absent
-	// until one is published, then replaced whole by one through a higher
-	// serial.
-	if len(b.RevokedCerts) > 0 {
-		st["revoked_certs"] = bin(b.RevokedCerts)
-		st["revoked_certs_sig"] = bin(b.RevokedCertsSig)
+	// The TTL attribute: DynamoDB deletes the record some time after it.
+	if !b.Expires.IsZero() {
+		st["expires_at"] = num(uint64(b.Expires.Unix())) //nolint:gosec // a time after 1970
 	}
 	// The box's ACL, as the document GET answers: absent until the box puts
 	// one, then replaced whole. No route removes it, and UpdateBox only sets.
@@ -330,11 +328,14 @@ func boxItem(b *Box) map[string]types.AttributeValue {
 }
 
 // decodeStanding reads from a box record what memory holds of it, at its
-// rev.
+// rev. Listed is the revocations' to say (index.standing).
 func decodeStanding(it item) (Standing, uint64, error) {
 	state, err := it.string("state")
 	if err != nil {
 		return Standing{}, 0, err
+	}
+	if State(state) != Active && State(state) != Deleted {
+		return Standing{}, 0, fmt.Errorf("item: a record's state is %q", state)
 	}
 	doc, err := it.bytes("identity")
 	if err != nil {
@@ -352,26 +353,17 @@ func decodeStanding(it item) (Standing, uint64, error) {
 	if err != nil {
 		return Standing{}, 0, err
 	}
-	st := Standing{State: State(state), Key: key, Cert: cert}
+	serial, err := it.uint("cert_serial")
+	if err != nil {
+		return Standing{}, 0, err
+	}
+	st := Standing{State: State(state), Key: key, Cert: cert, CertSerial: serial}
 	if _, ok := it["account"]; ok {
 		acc, err := it.bytes("account")
 		if err != nil {
 			return Standing{}, 0, err
 		}
 		st.InAccount = len(acc) > 0
-	}
-	if _, ok := it["revoked_certs"]; ok {
-		list, err := it.bytes("revoked_certs")
-		if err != nil {
-			return Standing{}, 0, err
-		}
-		serial, err := it.uint("cert_serial")
-		if err != nil {
-			return Standing{}, 0, err
-		}
-		if st.Listed, err = listNames(list, serial); err != nil {
-			return Standing{}, 0, fmt.Errorf("item: %w", err)
-		}
 	}
 	return st, rev, nil
 }
@@ -403,11 +395,8 @@ func decodeBox(it item) (*Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &Box{Addr: a, State: st.State, Cert: st.Cert, Rev: rev}
+	b := &Box{Addr: a, State: st.State, Cert: st.Cert, CertSerial: st.CertSerial, Rev: rev}
 	if b.Identity, err = it.bytes("identity"); err != nil {
-		return nil, err
-	}
-	if b.CertSerial, err = it.uint("cert_serial"); err != nil {
 		return nil, err
 	}
 	if _, ok := it["account"]; ok {
@@ -417,18 +406,12 @@ func decodeBox(it item) (*Box, error) {
 		}
 		b.Account = string(acc)
 	}
-	if _, ok := it["revocation"]; ok {
-		if b.Revocation, err = it.bytes("revocation"); err != nil {
+	if _, ok := it["expires_at"]; ok {
+		exp, err := it.uint("expires_at")
+		if err != nil {
 			return nil, err
 		}
-	}
-	if _, ok := it["revoked_certs"]; ok {
-		if b.RevokedCerts, err = it.bytes("revoked_certs"); err != nil {
-			return nil, err
-		}
-		if b.RevokedCertsSig, err = it.bytes("revoked_certs_sig"); err != nil {
-			return nil, err
-		}
+		b.Expires = time.Unix(int64(exp), 0).UTC() //nolint:gosec // written from a time after 1970
 	}
 	if _, ok := it["acl"]; ok {
 		if b.ACL, err = decodeACL(it); err != nil {
@@ -491,6 +474,71 @@ func decodeBox(it item) (*Box, error) {
 		b.Retired = append(b.Retired, ret)
 	}
 	return b, nil
+}
+
+// The revocations item.
+
+// decodeRevocations reads an address's revocations item.
+func decodeRevocations(it item) (*Revocations, error) {
+	rv := &Revocations{}
+	var err error
+	if rv.Identity, err = it.bytes("identity"); err != nil {
+		return nil, err
+	}
+	if _, ok := it["revocation"]; ok {
+		if rv.Address, err = it.bytes("revocation"); err != nil {
+			return nil, err
+		}
+	}
+	if _, ok := it["through"]; ok {
+		if rv.Through, err = it.uint("through"); err != nil {
+			return nil, err
+		}
+		if rv.Certs, err = it.bytes("revoked_certs"); err != nil {
+			return nil, err
+		}
+		if rv.CertsSig, err = it.bytes("revoked_certs_sig"); err != nil {
+			return nil, err
+		}
+	}
+	return rv, nil
+}
+
+// readAddress reads what the boxes table holds of address a, in one Query
+// of its items: its box's record and its revocations, each nil if absent.
+func (s *DynamoStore) readAddress(ctx context.Context, a protocol.Address, consistent bool) (*Box, *Revocations, error) {
+	var rec *Box
+	var rv *Revocations
+	p := dynamodb.NewQueryPaginator(s.db, &dynamodb.QueryInput{
+		TableName:                 &s.boxes,
+		KeyConditionExpression:    aws.String("#a = :a"),
+		ExpressionAttributeNames:  map[string]string{"#a": "addr"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":a": bin(a[:])},
+		ConsistentRead:            aws.Bool(consistent),
+	})
+	for p.HasMorePages() {
+		out, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, it := range out.Items {
+			_, sk, err := boxItemKey(it)
+			if err != nil {
+				return nil, nil, err
+			}
+			switch {
+			case bytes.Equal(sk, []byte{skBox}):
+				if rec, err = decodeBox(it); err != nil {
+					return nil, nil, err
+				}
+			case bytes.Equal(sk, []byte{skRevocations}):
+				if rv, err = decodeRevocations(it); err != nil {
+					return nil, nil, err
+				}
+			}
+		}
+	}
+	return rec, rv, nil
 }
 
 // Message items.
@@ -599,28 +647,30 @@ func (s *DynamoStore) ensure(ctx context.Context, a protocol.Address) error {
 	})
 }
 
-// readBox reads what memory holds of a box: its record's standing and its
-// live messages, strongly consistent, so a change made before the read is in
-// it (one made after reaches memory by a stream). The record joins the cache.
+// readBox reads what memory holds of a box: its record's standing, its
+// identity's revocations and its live messages, strongly consistent, so a
+// change made before the read is in it (one made after reaches memory by a
+// stream). What it read joins the cache.
 func (s *DynamoStore) readBox(ctx context.Context, a protocol.Address) (boxRead, error) {
 	s.loads.Add(1)
 	var r boxRead
-	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.boxes, Key: boxKey(a), ConsistentRead: aws.Bool(true)})
+	rec, rv, err := s.readAddress(ctx, a, true)
 	if err != nil {
 		return r, err
 	}
-	if out.Item == nil {
+	if b := view(a, rec, rv); b != nil {
+		s.cache.put(b)
+	}
+	if rv != nil {
+		r.revoked, r.through = len(rv.Address) > 0, rv.Through
+	}
+	if rec == nil {
 		return r, nil // no box: no mail either
 	}
-	b, err := decodeBox(out.Item)
-	if err != nil {
+	if r.st, _, err = rec.standing(); err != nil {
 		return r, err
 	}
-	s.cache.put(b)
-	if r.st, err = b.standing(); err != nil {
-		return r, err
-	}
-	r.exists, r.rev = true, b.Rev
+	r.exists, r.rev = true, rec.Rev
 	p := dynamodb.NewQueryPaginator(s.db, s.liveQuery(a, s.liveFrom(), true))
 	for p.HasMorePages() {
 		out, err := p.NextPage(ctx)
@@ -658,11 +708,12 @@ func (s *DynamoStore) liveQuery(box protocol.Address, lo []byte, consistent bool
 // Held implements Store: the standing of a box memory has loaded.
 func (s *DynamoStore) Held(a protocol.Address) (Standing, bool) { return s.idx.standing(a) }
 
-// applyBox records a box this process wrote.
+// applyBox records a box record this process wrote: b is what is held of
+// its address, the record and the revocations read with it.
 func (s *DynamoStore) applyBox(b *Box) {
 	s.misses.wrote(b.Addr)
 	s.cache.put(b)
-	st, err := b.standing()
+	st, _, err := storedRecord(b).standing()
 	if err != nil { // a record this process just checked and wrote
 		s.logf("boxes: a record written with a bad identity: %v", err)
 		return
@@ -670,9 +721,30 @@ func (s *DynamoStore) applyBox(b *Box) {
 	s.idx.setStanding(b.Addr, st, b.Rev)
 }
 
-// Box implements Store: the cache, or a read. A box the read does not find is
-// remembered as missing for a while (missCache), so naming it again costs no
-// read.
+// applyRevocations records an address's revocations as they now are, from
+// this process's write or the stream.
+func (s *DynamoStore) applyRevocations(a protocol.Address, rv *Revocations) {
+	s.misses.wrote(a)
+	s.cache.modify(a, func(b *Box) (*Box, bool) {
+		m, err := b.withRevocations(rv)
+		return m, err == nil // one that fails is evicted: the next use reads it
+	})
+	s.idx.setRevocations(a, len(rv.Address) > 0, rv.Through)
+}
+
+// forget drops what memory holds of an address whose record was deleted,
+// so that its next use reads it again. A deletion seen on the stream may be
+// of a record older than one this process has written since: the read after
+// it is what tells.
+func (s *DynamoStore) forget(a protocol.Address) {
+	s.misses.wrote(a)
+	s.cache.evict(a)
+	s.idx.forget(a)
+}
+
+// Box implements Store: the cache, or a read. An address the read finds
+// nothing of is remembered as missing for a while (missCache), so naming it
+// again costs no read.
 func (s *DynamoStore) Box(ctx context.Context, a protocol.Address) (*Box, error) {
 	if b, ok := s.cache.get(a); ok {
 		return b, nil
@@ -681,17 +753,14 @@ func (s *DynamoStore) Box(ctx context.Context, a protocol.Address) (*Box, error)
 	if missing {
 		return nil, ErrNotFound
 	}
-	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.boxes, Key: boxKey(a), ConsistentRead: aws.Bool(s.consistent)})
+	rec, rv, err := s.readAddress(ctx, a, s.consistent)
 	if err != nil {
 		return nil, err
 	}
-	if out.Item == nil {
+	b := view(a, rec, rv)
+	if b == nil {
 		s.misses.missed(a, seq, s.now())
 		return nil, ErrNotFound
-	}
-	b, err := decodeBox(out.Item)
-	if err != nil {
-		return nil, err
 	}
 	s.cache.put(b)
 	return b, nil
@@ -709,6 +778,9 @@ func (s *DynamoStore) Known(a protocol.Address) (*Box, bool) {
 
 // CreateBox implements Store.
 func (s *DynamoStore) CreateBox(ctx context.Context, b *Box) error {
+	if err := b.writable(); err != nil {
+		return err
+	}
 	b.Rev = 1
 	_, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                &s.boxes,
@@ -718,6 +790,7 @@ func (s *DynamoStore) CreateBox(ctx context.Context, b *Box) error {
 	})
 	if _, ok := isConditionFailed(err); ok {
 		s.misses.wrote(b.Addr) // it has a record, whoever wrote it
+		s.cache.evict(b.Addr)  // and what is cached of it is the stale view
 		return ErrExists
 	}
 	if err != nil {
@@ -730,6 +803,9 @@ func (s *DynamoStore) CreateBox(ctx context.Context, b *Box) error {
 // UpdateBox implements Store: every attribute that can change, if the record
 // is still at b.Rev. Attributes it does not name are left alone.
 func (s *DynamoStore) UpdateBox(ctx context.Context, b *Box) error {
+	if err := b.writable(); err != nil {
+		return err
+	}
 	next := cloneBox(b)
 	next.Rev = b.Rev + 1
 	names := map[string]string{}
@@ -758,6 +834,58 @@ func (s *DynamoStore) UpdateBox(ctx context.Context, b *Box) error {
 	}
 	b.Rev = next.Rev
 	s.applyBox(b)
+	return nil
+}
+
+// DeleteBox implements Store.
+func (s *DynamoStore) DeleteBox(ctx context.Context, a protocol.Address) error {
+	if _, err := s.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &s.boxes, Key: boxKey(a)}); err != nil {
+		return err
+	}
+	s.forget(a)
+	return nil
+}
+
+// Revoke implements Store: one UpdateItem of the address's revocations
+// item, which keeps the revocation of the address once and takes a
+// revocation of certificates only through a higher serial than the one it
+// holds.
+func (s *DynamoStore) Revoke(ctx context.Context, a protocol.Address, rv *Revocations) error {
+	names := map[string]string{"#i": "identity"}
+	values := map[string]types.AttributeValue{":i": bin(rv.Identity)}
+	sets := []string{"#i = if_not_exists(#i, :i)"}
+	var cond *string
+	if len(rv.Address) > 0 {
+		names["#r"], values[":r"] = "revocation", bin(rv.Address)
+		sets = append(sets, "#r = if_not_exists(#r, :r)")
+	}
+	if rv.Through > 0 {
+		names["#c"], names["#s"], names["#t"] = "revoked_certs", "revoked_certs_sig", "through"
+		values[":c"], values[":s"], values[":t"] = bin(rv.Certs), bin(rv.CertsSig), num(rv.Through)
+		sets = append(sets, "#c = :c", "#s = :s", "#t = :t")
+		cond = aws.String("attribute_not_exists(#t) OR #t < :t")
+	}
+	out, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 &s.boxes,
+		Key:                       revocationsKey(a),
+		UpdateExpression:          aws.String("SET " + strings.Join(sets, ", ")),
+		ConditionExpression:       cond,
+		ExpressionAttributeNames:  names,
+		ExpressionAttributeValues: values,
+		ReturnValues:              types.ReturnValueAllNew,
+	})
+	if _, ok := isConditionFailed(err); ok {
+		s.cache.evict(a) // what it holds may be the stale one
+		return ErrStale
+	}
+	if err != nil {
+		return err
+	}
+	held, err := decodeRevocations(out.Attributes)
+	if err != nil {
+		return err
+	}
+	s.applyRevocations(a, held)
 	return nil
 }
 
@@ -1046,37 +1174,45 @@ func (s *DynamoStore) Fetched(ctx context.Context, box protocol.Address, id [32]
 	return held, again, nil
 }
 
-// applyBoxImage applies an item of the -boxes-table table as it now is, from the
-// stream. Only a box's record counts; its other items are not memory's.
+// applyBoxImage applies an item of the -boxes-table table as it now is,
+// from the stream: a box's record, or an address's revocations.
 func (s *DynamoStore) applyBoxImage(it item) {
-	a, rec, err := boxRecord(it)
+	a, sk, err := boxItemKey(it)
 	if err != nil {
 		s.logf("boxes: skipping an item: %v", err)
 		return
 	}
-	if !rec {
-		return
+	switch {
+	case bytes.Equal(sk, []byte{skBox}):
+		st, rev, err := decodeStanding(it)
+		if err != nil {
+			s.logf("boxes: skipping a box record: %v", err)
+			return
+		}
+		s.misses.wrote(a)
+		s.idx.setStanding(a, st, rev)
+		s.cache.refresh(a, rev, func() (*Box, error) { return decodeBox(it) })
+	case bytes.Equal(sk, []byte{skRevocations}):
+		rv, err := decodeRevocations(it)
+		if err != nil {
+			s.logf("boxes: skipping an address's revocations: %v", err)
+			return
+		}
+		s.applyRevocations(a, rv)
 	}
-	st, rev, err := decodeStanding(it)
-	if err != nil {
-		s.logf("boxes: skipping a box record: %v", err)
-		return
-	}
-	s.misses.wrote(a)
-	s.idx.setStanding(a, st, rev)
-	s.cache.refresh(a, rev, func() (*Box, error) { return decodeBox(it) })
 }
 
-// applyBoxRemoval applies a deleted item's key, from the stream.
+// applyBoxRemoval applies a deleted item's key, from the stream: a record
+// the TTL took, or one a revocation of its address deleted. Revocations are
+// never deleted.
 func (s *DynamoStore) applyBoxRemoval(key item) {
-	a, rec, err := boxRecord(key)
+	a, sk, err := boxItemKey(key)
 	if err != nil {
 		s.logf("boxes: skipping a removal: %v", err)
 		return
 	}
-	if rec {
-		s.idx.dropStanding(a)
-		s.cache.evict(a)
+	if bytes.Equal(sk, []byte{skBox}) {
+		s.forget(a)
 	}
 }
 

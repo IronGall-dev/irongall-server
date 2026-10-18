@@ -439,7 +439,6 @@ func TestRegistration(t *testing.T) {
 
 func TestOwnerCalls(t *testing.T) {
 	e := newEnv(t, relaxed())
-	now := e.clock.Now()
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
 	pass := r.pass(1)
 
@@ -500,38 +499,44 @@ func TestOwnerCalls(t *testing.T) {
 	e.clock.Add(time.Second)
 	e.want(e.do("GET", r.path("/messages"), nil, ahead), 200, "")
 
-	// Close: mail deleted, owner calls 404, the read of the box still answers
-	// so the owner can read its serial; a new prekey reopens it, in use at
-	// once.
+	// Delete: the box is answered as if it had never been registered, and its
+	// mail is deleted at once. A renewal brings nothing back; a registration
+	// under a later certificate than the box's last, with a key it never
+	// published, undoes the delete while its record is kept, and the box
+	// comes back as it was, its ACL with it, but for the mail.
 	a := e.box(protocol.Classic)
-	if _, err := a.Send(context.Background(), r.id.Address(), "deleted by close"); err != nil {
+	if _, err := a.Send(context.Background(), r.id.Address(), "deleted with the box"); err != nil {
 		t.Fatal(err)
 	}
+	e.want(e.do("PUT", r.path("/acl"), aclOf(1, []string{"*"}, nil), pass), 200, "")
 	e.want(e.do("DELETE", r.path(""), nil, pass), 204, "")
 	e.want(e.do("GET", r.path("/messages"), nil, pass), 404, protocol.CodeNoSuchMailbox)
-	e.want(e.do("GET", r.path(""), nil, ""), 200, "")
-	e.want(e.do("PUT", r.path(""), r.registration(1), pass), 409, protocol.CodeConflict)
-	if _, err := a.Send(context.Background(), r.id.Address(), "to a closed box"); client.Code(err) != protocol.CodeNoSuchMailbox {
-		t.Fatalf("send to a closed box: %v", err)
+	e.want(e.do("GET", r.path(""), nil, ""), 404, protocol.CodeNoSuchMailbox)
+	e.want(e.do("GET", r.path("/revocations"), nil, ""), 404, protocol.CodeNotRevoked)
+	e.want(e.do("DELETE", r.path(""), nil, pass), 404, protocol.CodeNoSuchMailbox)
+	if _, err := a.Send(context.Background(), r.id.Address(), "to a deleted box"); client.Code(err) != protocol.CodeNoSuchMailbox {
+		t.Fatalf("send to a deleted box: %v", err)
 	}
-	e.want(e.do("PUT", r.path("/prekey"), r.upload(1), pass), 200, "") // an identical retry reopens nothing
-	e.want(e.do("GET", r.path("/messages"), nil, pass), 404, protocol.CodeNoSuchMailbox)
-	r.prekey(2, now.Add(protocol.MaxPrekeyLifetime), nil)
-	reopened := e.do("PUT", r.path("/prekey"), r.upload(2), r.pass(2))
-	e.want(reopened, 200, "")
-	if string(bytes.TrimSpace(reopened.body)) != "{}" {
-		t.Fatalf("a prekey upload answered %s", reopened.body)
-	}
-	if _, err := a.Send(context.Background(), r.id.Address(), "to a reopened box"); err != nil {
-		t.Fatalf("send to a reopened box: %v", err)
+	e.want(e.do("PUT", r.path("/prekey"), r.upload(1), pass), 404, protocol.CodeNoSuchMailbox)
+	e.want(e.do("PUT", r.path(""), r.registration(1), pass), 401, protocol.CodeCertificateNotCurrent)
+	r.prekey(2, e.clock.Now().Add(protocol.MaxPrekeyLifetime), r.keys[1])
+	e.want(e.do("PUT", r.path(""), r.registration(2), r.pass(2)), 400, protocol.CodePrekeyNotNew)
+	r.prekey(3, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	e.want(e.do("PUT", r.path(""), r.registration(3), r.pass(3)), 201, "")
+	e.want(e.do("PUT", r.path(""), r.registration(3), r.pass(3)), 200, "") // an identical retry, now of a registered box
+	if _, err := a.Send(context.Background(), r.id.Address(), "to a box whose delete was undone"); err != nil {
+		t.Fatalf("send to a box whose delete was undone: %v", err)
 	}
 	// The pass from before the new certificate is refused, though the server
 	// took it a moment ago; one under the new certificate is taken.
 	e.want(e.do("GET", r.path("/messages"), nil, pass), 401, protocol.CodeCertificateNotCurrent)
-	list := e.do("GET", r.path("/messages"), nil, r.pass(2))
+	list := e.do("GET", r.path("/messages"), nil, r.pass(3))
 	e.want(list, 200, "")
 	if !bytes.Contains(list.body, []byte(`"count":1`)) {
-		t.Fatalf("close did not delete the mail: %s", list.body)
+		t.Fatalf("the delete did not delete the mail: %s", list.body)
+	}
+	if got := e.do("GET", r.path("/acl"), nil, r.pass(3)); got.status != 200 || !bytes.Contains(got.body, []byte(`"version":1`)) {
+		t.Fatalf("the ACL did not come back with the box: %d %s", got.status, got.body)
 	}
 }
 
@@ -917,7 +922,7 @@ func TestSendPipeline(t *testing.T) {
 	e.clock.Add(protocol.PassLifetime)
 	e.want(e.do("POST", to+"/messages", ok, ranOut), 401, protocol.CodePassExpired)
 
-	// A registered sender that is closed.
+	// A registered sender that its owner deleted (TestOwnerCalls has the rest).
 	c := e.raw().register(time.Hour)
 	e.want(e.do("DELETE", c.path(""), nil, c.pass(1)), 204, "")
 	e.want(e.do("POST", to+"/messages", ok, c.pass(1)), 403, protocol.CodeUnknownSender)
@@ -949,23 +954,23 @@ func TestSendPipeline(t *testing.T) {
 		t.Fatalf("a fetched message: %v, %d bytes", fetched.header, len(fetched.body))
 	}
 
-	// Revoked boxes, set by hand, each with the revocation its identity
-	// signed as the route keeps it: this test puts B back afterwards, which no
-	// route does. The route itself is TestRevocation.
-	for _, box := range []*client.Box{a, b} {
-		rec, _ := e.store.Box(ctx, box.Address())
-		rec.State, rec.Revocation = Revoked, record(t, box).Revocation
-		_ = e.store.UpdateBox(ctx, rec)
+	// Revoked addresses, A a sender and F a recipient, each kept as the route
+	// keeps it: by its identity's own signature, with the box's record left
+	// in place, which the revocation answers for. The route itself is
+	// TestRevocation.
+	f := e.box(protocol.Classic)
+	for _, box := range []*client.Box{a, f} {
+		rv := record(t, box)
+		if err := e.store.Revoke(ctx, box.Address(), &Revocations{Identity: rv.Identity, Address: rv.Revocation}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	e.want(e.do("POST", to+"/messages", seal(pqRecipient), pass), 403, protocol.CodeSenderRevoked)
-	e.want(e.do("POST", to+"/messages", seal(pqRecipient), e.pass(d)), 410, protocol.CodeRevoked)
+	e.want(e.do("POST", "/v1/"+f.Address().String()+"/messages", seal(pqRecipient), e.pass(d)), 410, protocol.CodeRevoked)
 	e.want(e.do("GET", "/v1/"+a.Address().String(), nil, ""), 410, protocol.CodeRevoked)
 	e.want(e.do("GET", "/v1/"+a.Address().String()+"/messages", nil, pass), 410, protocol.CodeRevoked)
 
 	// An expired recipient prekey.
-	rec, _ := e.store.Box(ctx, b.Address())
-	rec.State, rec.Revocation = Active, nil
-	_ = e.store.UpdateBox(ctx, rec)
 	e.clock.Add(protocol.MaxPrekeyLifetime)
 	e.want(e.do("POST", to+"/messages", seal(pqRecipient), e.pass(d)), 409, protocol.CodePrekeyExpired)
 }

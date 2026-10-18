@@ -21,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	stypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
@@ -102,14 +103,28 @@ func idOf(t *testing.T, r *protocol.Receipt) [32]byte {
 	return id
 }
 
-// member reports whether an account's side holds a box.
-func (s *DynamoStore) member(t *testing.T, account string, a protocol.Address) bool {
+// lists holds the boxes table's index of each account's boxes to whether it
+// lists box a under account: the index is read eventually consistent, as
+// every global secondary index is, so it is asked for up to ten seconds.
+func (s *DynamoStore) lists(t *testing.T, account string, a protocol.Address, want bool) {
 	t.Helper()
-	out, err := s.db.GetItem(context.Background(), &dynamodb.GetItemInput{TableName: &s.accts, Key: memberKey(account, a), ConsistentRead: aws.Bool(true)})
-	if err != nil {
-		t.Fatal(err)
+	for range 100 {
+		out, err := s.db.Query(context.Background(), &dynamodb.QueryInput{
+			TableName:                 &s.boxes,
+			IndexName:                 aws.String(accountIndex),
+			KeyConditionExpression:    aws.String("#c = :c AND #a = :a"),
+			ExpressionAttributeNames:  map[string]string{"#c": "account", "#a": "addr"},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":c": bin([]byte(account)), ":a": bin(a[:])},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (len(out.Items) > 0) == want {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	return out.Item != nil
+	t.Fatalf("after ten seconds the account index does not list %s under %q: want %v", a, account, want)
 }
 
 // stored reads a message's item from the table as it is, or nil.
@@ -341,9 +356,9 @@ func TestRestartLoadsLazily(t *testing.T) {
 	if _, err := c.Rekey(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	send(t, a, d, "deleted by the close")
+	send(t, a, d, "deleted with the box")
 	if r := e.do(http.MethodDelete, "/v1/"+d.Address().String(), nil, e.pass(d)); r.status != http.StatusNoContent {
-		t.Fatalf("close: %d %s", r.status, r.body)
+		t.Fatalf("delete: %d %s", r.status, r.body)
 	}
 	renewed, err := e.store.Box(ctx, c.Address())
 	if err != nil {
@@ -384,10 +399,10 @@ func TestRestartLoadsLazily(t *testing.T) {
 		t.Fatalf("rekeyed box: %v %v", st, ok)
 	}
 	if n, _ := fresh.Count(ctx, d.Address()); n != 0 {
-		t.Fatal("the close left mail in the table")
+		t.Fatal("the delete left mail in the table")
 	}
-	if st, ok := fresh.Held(d.Address()); !ok || st.State != Closed {
-		t.Fatalf("closed box: %v %v", st, ok)
+	if st, ok := fresh.Held(d.Address()); !ok || st.State != Deleted {
+		t.Fatalf("deleted box: %v %v", st, ok)
 	}
 	var nobody protocol.Address
 	if n, err := fresh.Count(ctx, nobody); n != 0 || err != nil {
@@ -522,7 +537,7 @@ func (c *countingStore) DeleteMessage(ctx context.Context, box protocol.Address,
 
 // An empty poll never leaves the process (ARCHITECTURE.md § Memory): a box
 // showing a new pass, one showing a pass the server has taken, a renewed
-// one, a pass from before the renewal, a closed box and a revoked one are all
+// one, a pass from before the renewal, a deleted box and a revoked one are all
 // answered from memory.
 func TestPollStaysInMemory(t *testing.T) {
 	e := newEnv(t, relaxed())
@@ -563,18 +578,14 @@ func TestPollStaysInMemory(t *testing.T) {
 		t.Fatalf("the pass from before the renewal: %d %s", r.status, r.body)
 	}
 	if r := e.do(http.MethodDelete, "/v1/"+c.Address().String(), nil, e.pass(c)); r.status != http.StatusNoContent {
-		t.Fatalf("close: %d %s", r.status, r.body)
+		t.Fatalf("delete: %d %s", r.status, r.body)
 	}
 	if r := poll(c, e2.pass(c)); r.code() != protocol.CodeNoSuchMailbox {
-		t.Fatalf("closed box: %d %s", r.status, r.body)
+		t.Fatalf("deleted box: %d %s", r.status, r.body)
 	}
 	before := cs.reads.Load()
-	rec, err := e.store.Box(ctx, b.Address())
-	if err != nil {
-		t.Fatal(err)
-	}
-	rec.State = Revoked
-	if err := e.store.UpdateBox(ctx, rec); err != nil {
+	rv := record(t, b)
+	if err := e.store.Revoke(ctx, b.Address(), &Revocations{Identity: rv.Identity, Address: rv.Revocation}); err != nil {
 		t.Fatal(err)
 	}
 	if cs.reads.Load() != before {
@@ -634,14 +645,16 @@ func TestResendAfterExpiryIsRefused(t *testing.T) {
 	}
 }
 
-// Only a box's record (sk 0x00) is memory's: another item under the box,
-// whatever it holds, changes nothing on the stream.
-func TestOnlyTheBoxRecordIsMemorys(t *testing.T) {
+// A box's record (sk 0x00) and its address's revocations (sk 0x01) are
+// memory's, and nothing else under the address is: another item, whatever it
+// holds, changes nothing on the stream. A revocation adds to what memory
+// holds; the record's removal drops the box, whose next use reads it again.
+func TestTheRecordAndTheRevocationsAreMemorys(t *testing.T) {
 	s := NewDynamoStore(DynamoConfig{BoxCache: 10})
 	var a protocol.Address
 	a[0] = 7
 	if err := s.idx.ensure(context.Background(), a, func() (boxRead, error) {
-		return boxRead{exists: true, st: Standing{State: Closed}, rev: 1}, nil
+		return boxRead{exists: true, st: Standing{State: Active, CertSerial: 5}, rev: 1}, nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -651,24 +664,41 @@ func TestOnlyTheBoxRecordIsMemorys(t *testing.T) {
 	}
 	other := keys([]byte("a-later-item"))
 	img := map[string]stypes.AttributeValue{
-		"addr": other["addr"], "sk": other["sk"], "state": &stypes.AttributeValueMemberS{Value: string(Revoked)},
-		"epoch": &stypes.AttributeValueMemberN{Value: "7"}, "rev": &stypes.AttributeValueMemberN{Value: "9"},
+		"addr": other["addr"], "sk": other["sk"], "state": &stypes.AttributeValueMemberS{Value: string(Deleted)},
+		"identity": b([]byte("x")), "revocation": b([]byte("x")), "rev": &stypes.AttributeValueMemberN{Value: "9"},
 	}
 	record := func(op stypes.OperationType, k, img map[string]stypes.AttributeValue) stypes.Record {
 		return stypes.Record{EventName: op, Dynamodb: &stypes.StreamRecord{Keys: k, NewImage: img}}
 	}
 	standing := func() (Standing, bool) { return s.idx.standing(a) }
 	s.applyBoxRecord(record(stypes.OperationTypeInsert, other, img))
-	if st, _ := standing(); st.State != Closed {
+	if st, _ := standing(); st.State != Active {
 		t.Fatalf("another item set the standing: %v", st)
 	}
 	s.applyBoxRecord(record(stypes.OperationTypeRemove, other, nil))
 	if _, ok := standing(); !ok {
 		t.Fatal("another item's removal dropped the box")
 	}
+	revs := keys([]byte{skRevocations})
+	certs := map[string]stypes.AttributeValue{"addr": revs["addr"], "sk": revs["sk"], "identity": b([]byte("x")),
+		"revoked_certs": b([]byte("x")), "revoked_certs_sig": b([]byte("x")), "through": &stypes.AttributeValueMemberN{Value: "5"}}
+	s.applyBoxRecord(record(stypes.OperationTypeInsert, revs, certs))
+	if st, _ := standing(); st.State != Active || !st.Listed {
+		t.Fatalf("a revocation of the box's certificate: %+v", st)
+	}
+	certs["through"] = &stypes.AttributeValueMemberN{Value: "3"} // lower: changes nothing
+	s.applyBoxRecord(record(stypes.OperationTypeModify, revs, certs))
+	if st, _ := standing(); !st.Listed {
+		t.Fatal("a lower revocation of certificates took the box's back")
+	}
+	certs["revocation"] = b([]byte("x"))
+	s.applyBoxRecord(record(stypes.OperationTypeModify, revs, certs))
+	if st, _ := standing(); st.State != Revoked {
+		t.Fatalf("a revocation of the address: %+v", st)
+	}
 	s.applyBoxRecord(record(stypes.OperationTypeRemove, keys([]byte{skBox}), nil))
 	if _, ok := standing(); ok {
-		t.Fatal("the record's removal was not applied")
+		t.Fatal("the record's removal left the box in memory")
 	}
 }
 
@@ -683,7 +713,7 @@ func TestUpdateBoxIsConditional(t *testing.T) {
 	if err := e.store.UpdateBox(ctx, first); err != nil {
 		t.Fatal(err)
 	}
-	second.State = Closed
+	second.State = Deleted
 	if err := e.store.UpdateBox(ctx, second); !errors.Is(err, ErrStale) {
 		t.Fatalf("an update over a stale read: %v", err)
 	}
@@ -692,33 +722,35 @@ func TestUpdateBoxIsConditional(t *testing.T) {
 	}
 }
 
-// Closing a box deletes its mail, bodies included: a sender's retry after
-// the box is closed and reopened is answered, and nothing comes back.
-func TestRetryAfterCloseIsNotRedelivered(t *testing.T) {
+// A delete deletes the box's mail, bodies included: a sender's retry after
+// the delete is undone is answered, and nothing comes back.
+func TestRetryAfterDeleteIsNotRedelivered(t *testing.T) {
 	e := newEnv(t, relaxed())
-	ctx := context.Background()
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	sent := capture(e, "/v1/"+b.Address().String())
 	send(t, a, b, "deleted unread")
 	e.setMiddle(nil)
 	if r := e.do(http.MethodDelete, "/v1/"+b.Address().String(), nil, e.pass(b)); r.status != http.StatusNoContent {
-		t.Fatalf("close: %d %s", r.status, r.body)
+		t.Fatalf("delete: %d %s", r.status, r.body)
 	}
-	if _, err := b.Rekey(ctx, ""); err != nil { // reopen
-		t.Fatal(err)
-	}
+	// The delete undone, by a registration under a later certificate.
+	again := e.raw()
+	again.signer, again.id = signer(t, b), b.Identity()
+	_, under := e.numbers(b.Address())
+	again.prekey(under+1, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	e.want(e.do("PUT", again.path(""), again.registration(under+1), again.pass(under+1)), 201, "")
 	// A retry of the same bytes is answered as the first send was, from the
 	// dedupe record, though it names the retired serial (PROTOCOL.md §4.5
-	// step 6): it stores nothing, and what the close deleted stays deleted.
+	// step 6): it stores nothing, and what the delete deleted stays deleted.
 	if r := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a)); r.status != http.StatusOK {
 		t.Fatalf("retry: %d %s", r.status, r.body)
 	}
-	if res := receive(t, b); len(res.Delivered) != 0 {
-		t.Fatal("mail deleted by the close came back")
+	if list := listOf(t, e.do("GET", "/v1/"+b.Address().String()+"/messages", nil, again.pass(under+1))); len(list.Messages) != 0 {
+		t.Fatalf("mail deleted with the box came back: %+v", list)
 	}
 	if s, ok := e.store.(*DynamoStore); ok {
 		if id := sha256.Sum256(sent.ciphertext); s.listed(t, b.Address(), id) || s.bodyExists(t, b.Address(), id) {
-			t.Fatal("mail the close deleted is still listed, or its body kept")
+			t.Fatal("mail the delete deleted is still listed, or its body kept")
 		}
 	}
 }
@@ -760,7 +792,7 @@ func TestBoxCache(t *testing.T) {
 }
 
 // A box's state answers before its pass is looked at: a call naming no box,
-// a closed one or a revoked one is told so whatever it carries, and only a
+// a deleted one or a revoked one is told so whatever it carries, and only a
 // call on a box in use is asked for that box's pass.
 func TestTheBoxsStateAnswersBeforeItsPass(t *testing.T) {
 	e := newEnv(t, relaxed())
@@ -790,14 +822,17 @@ func TestTheBoxsStateAnswersBeforeItsPass(t *testing.T) {
 		t.Fatalf("unknown box: %d %s", r.status, r.body)
 	}
 	pass := e.pass(c)
-	set(c, func(x *Box) { x.State = Closed })
+	set(c, func(x *Box) { x.State = Deleted })
 	for _, p := range []string{"", pass} {
 		if r := poll(c.Address(), p); r.code() != protocol.CodeNoSuchMailbox {
-			t.Fatalf("closed box: %d %s", r.status, r.body)
+			t.Fatalf("deleted box: %d %s", r.status, r.body)
 		}
 	}
 	pass = e.pass(d)
-	set(d, func(x *Box) { x.State = Revoked })
+	rv := record(t, d)
+	if err := e.store.Revoke(ctx, d.Address(), &Revocations{Identity: rv.Identity, Address: rv.Revocation}); err != nil {
+		t.Fatal(err)
+	}
 	for _, p := range []string{"", pass} {
 		if r := poll(d.Address(), p); r.code() != protocol.CodeRevoked {
 			t.Fatalf("revoked box: %d %s", r.status, r.body)

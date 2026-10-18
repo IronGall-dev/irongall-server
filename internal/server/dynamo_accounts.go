@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/IronGall-dev/irongall-client/protocol"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -13,22 +12,18 @@ import (
 )
 
 // The accounts table (PROTOCOL.md §6.5): account is the account id's
-// bytes; sk 0x00 is the account's record, 0x01 ‖ addr a box it holds (the
-// mirror of the box record's account), 0x04 ‖ id an adopt key's state. A box
-// joins or leaves in one transaction over both tables, so the two sides
-// never disagree.
+// bytes; sk 0x00 is the account's record and 0x04 ‖ id an adopt key's state.
+// Which boxes an account holds is the box records' to say: each names its
+// account, and the boxes table's sparse index on it lists an account's
+// boxes, so a box that leaves, or that DynamoDB's TTL takes, leaves nothing
+// behind here.
 const (
 	skAccount  byte = 0x00
-	skMember   byte = 0x01
 	skAdoptKey byte = 0x04
 )
 
 func accountKey(id string, sk ...byte) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{"account": bin([]byte(id)), "sk": bin(sk)}
-}
-
-func memberKey(id string, a protocol.Address) map[string]types.AttributeValue {
-	return accountKey(id, append([]byte{skMember}, a[:]...)...)
 }
 
 func adoptKeyKey(id string, key [16]byte) map[string]types.AttributeValue {
@@ -141,14 +136,12 @@ func boxRevCheck(b *Box, expr string, names map[string]string, values map[string
 }
 
 // Adopt implements Store: in one transaction, the box record names the
-// account, the account holds the box, the key loses a use, and the box's
-// old account, if any, lets it go.
+// account, and the key loses a use.
 func (s *DynamoStore) Adopt(ctx context.Context, b *Box, account string, key [16]byte) error {
 	upd := boxRevCheck(b, "SET #acct = :acct, #rev = :new", map[string]string{"#acct": "account"}, map[string]types.AttributeValue{":acct": bin([]byte(account))})
 	upd.TableName = &s.boxes
 	items := []types.TransactWriteItem{
 		{Update: upd},
-		{Put: &types.Put{TableName: &s.accts, Item: memberKey(account, b.Addr)}},
 		{Update: &types.Update{
 			TableName:                 &s.accts,
 			Key:                       adoptKeyKey(account, key),
@@ -158,10 +151,7 @@ func (s *DynamoStore) Adopt(ctx context.Context, b *Box, account string, key [16
 			ExpressionAttributeValues: map[string]types.AttributeValue{":one": num(1), ":now": num(s.nowMs())},
 		}},
 	}
-	if b.Account != "" {
-		items = append(items, types.TransactWriteItem{Delete: &types.Delete{TableName: &s.accts, Key: memberKey(b.Account, b.Addr)}})
-	}
-	if err := s.transact(ctx, b, items, map[int]error{0: ErrStale, 2: ErrKeyRefused}); err != nil {
+	if err := s.transact(ctx, b, items, map[int]error{0: ErrStale, 1: ErrKeyRefused}); err != nil {
 		return err
 	}
 	b.Account, b.Rev = account, b.Rev+1
@@ -169,16 +159,22 @@ func (s *DynamoStore) Adopt(ctx context.Context, b *Box, account string, key [16
 	return nil
 }
 
-// Leave implements Store: in one transaction, the box record names no
-// account and the account no longer holds the box.
+// Leave implements Store: the box record names no account.
 func (s *DynamoStore) Leave(ctx context.Context, b *Box) error {
 	upd := boxRevCheck(b, "REMOVE #acct SET #rev = :new", map[string]string{"#acct": "account"}, map[string]types.AttributeValue{})
-	upd.TableName = &s.boxes
-	items := []types.TransactWriteItem{
-		{Update: upd},
-		{Delete: &types.Delete{TableName: &s.accts, Key: memberKey(b.Account, b.Addr)}},
+	_, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 &s.boxes,
+		Key:                       upd.Key,
+		UpdateExpression:          upd.UpdateExpression,
+		ConditionExpression:       upd.ConditionExpression,
+		ExpressionAttributeNames:  upd.ExpressionAttributeNames,
+		ExpressionAttributeValues: upd.ExpressionAttributeValues,
+	})
+	if _, ok := isConditionFailed(err); ok {
+		s.cache.evict(b.Addr) // the cached record may be the stale one
+		return ErrStale
 	}
-	if err := s.transact(ctx, b, items, map[int]error{0: ErrStale}); err != nil {
+	if err != nil {
 		return err
 	}
 	b.Account, b.Rev = "", b.Rev+1

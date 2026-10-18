@@ -53,9 +53,16 @@ type mark struct {
 type boxMem struct {
 	loading *boxLoad // set while the box's first load is in flight
 	exists  bool     // the box has a record
-	st      Standing
+	st      Standing // its record's, with Listed unset: standing judges it
 	rev     uint64
-	marks   []mark
+	// What its identity revoked, from its revocations item: the address,
+	// and certificates through a serial (0: none). Neither is taken away.
+	revoked bool
+	through uint64
+	// stale is set when the record was deleted while the box loaded: the
+	// load may have read it before, so the box is dropped after it.
+	stale bool
+	marks []mark
 	// tombs are messages this process removed whose removal the stream has
 	// not echoed yet: the stream's late insert must not bring them back. The
 	// echo clears one; so does its expiry, in case the echo came first.
@@ -71,12 +78,14 @@ type boxLoad struct {
 }
 
 // boxRead is what a load reads of a box: whether it has a record, its
-// standing at rev, and its live messages.
+// standing at rev, what its identity revoked, and its live messages.
 type boxRead struct {
-	exists bool
-	st     Standing
-	rev    uint64
-	marks  []mark
+	exists  bool
+	st      Standing
+	rev     uint64
+	revoked bool
+	through uint64
+	marks   []mark
 }
 
 func newIndex() *index {
@@ -136,10 +145,14 @@ func (x *index) ensure(ctx context.Context, a protocol.Address, read func() (box
 		delete(sh.boxes, a) // and its queued changes: the next read sees them
 	} else {
 		m.exists, m.st, m.rev, m.marks = r.exists, r.st, r.rev, r.marks
+		m.revoked, m.through = r.revoked, r.through
 		for _, op := range l.queued {
 			op(m)
 		}
 		m.loading = nil
+		if m.stale {
+			delete(sh.boxes, a) // its callers go on with what they waited for; the next use reads it again
+		}
 	}
 	l.err = err
 	sh.mu.Unlock()
@@ -312,19 +325,49 @@ func (x *index) setStanding(a protocol.Address, st Standing, rev uint64) {
 	})
 }
 
-// dropStanding records that a box's record was deleted.
-func (x *index) dropStanding(a protocol.Address) {
-	x.apply(a, func(m *boxMem) { m.exists, m.st, m.rev = false, Standing{}, 0 })
+// setRevocations records what an address's identity revoked, adding to
+// what memory holds: nothing it revoked is taken away.
+func (x *index) setRevocations(a protocol.Address, revoked bool, through uint64) {
+	x.apply(a, func(m *boxMem) {
+		m.revoked = m.revoked || revoked
+		m.through = max(m.through, through)
+	})
 }
 
-// standing returns a loaded box's standing, and whether it has a record.
+// forget drops box a from memory, whose record was deleted: its next use
+// reads it again. One loading is dropped once its load is done.
+func (x *index) forget(a protocol.Address) {
+	sh := x.shard(a)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	switch m := sh.boxes[a]; {
+	case m == nil:
+	case m.loading != nil:
+		m.stale = true
+	default:
+		delete(sh.boxes, a)
+	}
+}
+
+// standing returns a loaded box's standing, and whether it has one: a
+// revoked address has, whether or not a record is left, and an address with
+// no record has none.
 func (x *index) standing(a protocol.Address) (Standing, bool) {
 	sh := x.shard(a)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	m := sh.held(a)
-	if m == nil || !m.exists {
+	switch {
+	case m == nil:
+		return Standing{}, false
+	case m.revoked:
+		st := m.st
+		st.State, st.Listed = Revoked, false
+		return st, true
+	case !m.exists:
 		return Standing{}, false
 	}
-	return m.st, true
+	st := m.st
+	st.Listed = m.through > 0 && st.CertSerial <= m.through
+	return st, true
 }
