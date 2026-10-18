@@ -11,7 +11,7 @@ The server of [irongall.dev](https://irongall.dev): end-to-end encrypted, sender
 | Path | Holds |
 |---|---|
 | `cmd/irongalld/` | The command: `irongalld serve`, and `irongalld account` and `irongalld limits` for the operator |
-| `internal/server/` | The API (every route under `/v1/`, and `/to/<address>`, the page a box's link opens), what each process holds in memory, the DynamoDB stream followers, the two stores (DynamoDB with S3 Express One Zone, and in memory) and the limits |
+| `internal/server/` | The API (every route under `/v1/`, and `/to/<address>`, the page a box's link opens), a deployment's site when it gives one (`-site`), what each process holds in memory, the DynamoDB stream followers, the two stores (DynamoDB with S3 Express One Zone, and in memory) and the limits |
 | [`PROTOCOL-SERVER.md`](PROTOCOL-SERVER.md) | How this server does each step of the specification, under the specification's section numbers |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Processes, memory, request paths, failure modes and the stages of scale |
 | [`LIMITS.md`](LIMITS.md) | Every limit this server enforces, who pays for it, the order of checks, and where it is weak: there to be checked |
@@ -19,10 +19,10 @@ The server of [irongall.dev](https://irongall.dev): end-to-end encrypted, sender
 | [`SECURITY.md`](SECURITY.md) | How to report a vulnerability privately, and what this server must get right beside the code and tests that hold it |
 | `test/interop.sh` | The stock-tools client and the Go client, together, against a real `irongalld` |
 | `test/working-key-openssh.sh` | A measurement, not a test: what stock `ssh-keygen` does with a certificate an identity signs for a working key (the client repo's issue #30) |
-| `Dockerfile` | `irongalld` as a static binary on Debian slim, and the echo box as a second target; it needs the client checkout as a build context named `client` |
+| `Dockerfile` | `irongalld` as a static binary on Debian slim, and the echo box as a second target; it needs the client checkout as a build context named `client`, and takes a site's rendered pages as one named `site` |
 | `bench/` | The measurements behind the microsecond figures |
 
-A site's own pages (irongall.dev's front page and `llms.txt`) are not in this repo: a web server in front serves them and passes `/v1/` and `/to/` here.
+A site's own pages (irongall.dev's front page and `llms.txt`) are not in this repo. `serve -site <directory>` serves a directory of them at every path outside `/v1/` and `/to/`, each at its own path and a file named `index` at its directory's; the image takes that directory as its build context named `site` and holds it at `/site`.
 
 ## Build and run
 

@@ -27,11 +27,17 @@ COPY --from=echo-build /out/irongall-echo /out/irongall /usr/local/bin/
 USER 65532:65532
 ENTRYPOINT ["irongall-echo"]
 
+# A deployment's site, which serve -site /site serves: empty here, since no
+# site is in this repo. A build context named "site" replaces this stage
+# (docker build --build-context site=<a directory of rendered pages> .).
+FROM scratch AS site
+
 # Debian slim, an exact tag, so a check for base-image updates can follow it.
 # Nothing runs in it but the binary, as uid 65532; the CA bundle comes from
 # the build stage, for TLS to AWS.
 FROM debian:13.7-slim
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /irongalld /irongalld
+COPY --from=site / /site/
 USER 65532:65532
 ENTRYPOINT ["/irongalld", "serve"]

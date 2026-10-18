@@ -10,9 +10,10 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
-// The one page this server has outside /v1/: the page a box's link opens
-// (PROTOCOL.md § Terms). It needs no store, so it is served while the API
-// still answers 503. A site's other pages are not the server's.
+// The one page of this server's own outside /v1/: the page a box's link
+// opens (PROTOCOL.md § Terms). It needs no store, so it is served while the
+// API still answers 503. A site's pages, when there is one, are a
+// deployment's (site.go).
 
 // pageMaxAge bounds how long a cache and clients keep the page after a
 // deploy changes it.

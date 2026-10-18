@@ -49,6 +49,9 @@ type Config struct {
 	// one every client makes and verifies (PROTOCOL.md §2). None: every type
 	// this build verifies.
 	IdentityTypes []string
+	// Site, when set, is served at every path outside /v1/ and the link
+	// page (LoadSite). None: those paths are 404.
+	Site *Site
 }
 
 // Server is the API.
@@ -62,6 +65,7 @@ type Server struct {
 	names   []string
 	// identityTypes are the identity key types a box may register with.
 	identityTypes []string
+	site          *Site
 
 	polls    *buckets // per box
 	pages    *buckets // per box: list pages after the first
@@ -104,6 +108,7 @@ func New(c Config) *Server {
 		proxies:       c.TrustedProxies,
 		names:         c.Names,
 		identityTypes: c.IdentityTypes,
+		site:          c.Site,
 		polls:         newBuckets(c.Limits.PollBurst, c.Limits.PollRefill),
 		pages:         c.Limits.continuations(),
 		repeats:       newBuckets(c.Limits.PollBurst, c.Limits.PollRefill),
@@ -153,10 +158,14 @@ func (s *Server) routes() []route {
 	}
 }
 
-// linkRoute is the page a box's link opens, the one route outside /v1/.
+// linkRoute is the page a box's link opens, the server's one route outside
+// /v1/; a site, when there is one, answers the rest.
 const linkRoute = "GET " + protocol.LinkPath + "{addr}"
 
-// Handler returns the API's routes and the page a box's link opens.
+// Handler returns the API's routes, the page a box's link opens, and the
+// site, if there is one. A page of the site is a call with no pass, as the
+// link page is: each moves bytes, and the site is answered before the API is
+// ready, since it reads no store.
 func (s *Server) Handler() http.Handler {
 	api := http.NewServeMux()
 	for _, r := range s.routes() {
@@ -165,6 +174,9 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle(linkRoute, s.publicPage(s.linkPage()))
 	mux.Handle("/v1/", notStored(s.whenReady(api)))
+	if s.site != nil {
+		mux.Handle("/", s.publicPage(s.site))
+	}
 	return s.accessLog(s.dated(mux))
 }
 

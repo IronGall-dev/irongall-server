@@ -24,7 +24,7 @@
 - 🛑 **`CRYPTO-ANALYSIS.md` changes in the same pass as any protocol change.**
 - **`SECURITY.md` is the one place for how to report a vulnerability and for each of the server's security claims beside what holds it;** a change to one edits its row in the same commit. The threat model stays `CRYPTO-ANALYSIS.md`.
 - **No comparison tables here.** The one comparison doc is `PRECEDENTS.md` in the client repo: point there.
-- **The only page outside `/v1/` is `/to/<address>`,** the page a box's link opens (`internal/server/link.go`). A site's other pages are served by whatever stands in front.
+- **The server's own page outside `/v1/` is `/to/<address>`,** the page a box's link opens (`internal/server/link.go`). **With `-site` it also serves a deployment's pages, a directory rendered elsewhere, at every other path** (`internal/server/site.go`; the image's `site` stage). 🛑 No site's content goes in this repo.
 
 ### Before every push
 
