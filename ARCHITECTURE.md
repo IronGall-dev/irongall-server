@@ -197,7 +197,7 @@ What changes:
 - **The passes remembered are per process,** so with N processes a box's new pass is checked once on each it calls.
 
 ### Background jobs
-**Not built.** The plan: one process holds a lease, a DynamoDB item taken with a conditional put that expires, and runs the background jobs. None is planned now: sweeps of abandoned boxes are deferred, since nothing forces them. There is no dormant reaper and no `last_seen`. A closed box is not in memory unless something used it, since memory loads per box (§ Startup).
+**Not built.** The plan: one process holds a lease, a DynamoDB item taken with a conditional put that expires, and runs the background jobs. None is planned now: DynamoDB's TTL deletes a box's record once nothing valid for it is left (`PROTOCOL-SERVER.md` §7), so there is no reaper of our own and no `last_seen`. A deleted box is not in memory unless something used it, since memory loads per box (§ Startup).
 
 ### Failure modes
 
