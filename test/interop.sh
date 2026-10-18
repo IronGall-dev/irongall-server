@@ -23,12 +23,12 @@
 # that bucket instead of --dev: tables and a bucket kept for tests, never the ones a running server uses.
 # For post-quantum script boxes where the packaged age is older than 1.3, put age ≥ 1.3 first in PATH:
 #   GOBIN=<dir> go install filippo.io/age/cmd/...@v1.3.2   (never under ulimit -v)
-# The work dir is a LITERAL path, so no rm -rf ever runs on a variable. It is on disk, never /tmp, which may be
-# tmpfs (memory): it holds two builds. A run that passes deletes it; one that fails leaves it to look at.
+# The work dir is a LITERAL path, so no rm -rf ever runs on a variable. A run that passes deletes it, since /tmp may
+# be tmpfs (memory) and it holds two builds; one that fails leaves it to look at.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd); repo=$(dirname "$here")
 SCRIPT=${SCRIPT:-$(dirname "$repo")/irongall-client/sh/irongall.sh}
-rm -rf /var/tmp/irongall-interop; mkdir -p /var/tmp/irongall-interop; work=/var/tmp/irongall-interop
+rm -rf /tmp/irongall-interop; mkdir -p /tmp/irongall-interop; work=/tmp/irongall-interop
 pass=0; fail=0
 ok(){ echo "PASS $*"; pass=$((pass + 1)); }
 bad(){ echo "FAIL $*"; fail=$((fail + 1)); }
@@ -322,4 +322,4 @@ out=$(gocli "$G" peer block "$XBL" 2>&1) && curl -s -H "Authorization: $(cat "$G
 
 echo "interop: $pass PASS, $fail FAIL"
 [ "$fail" -eq 0 ] || exit 1
-rm -rf /var/tmp/irongall-interop
+rm -rf /tmp/irongall-interop
