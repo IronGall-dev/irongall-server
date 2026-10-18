@@ -4,7 +4,6 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -26,7 +25,6 @@ import (
 // Config configures a Server.
 type Config struct {
 	Store  Store
-	Keys   *Keys
 	Limits Limits
 	Now    func() time.Time // time.Now if nil
 	Log    *log.Logger      // no access log if nil
@@ -56,7 +54,6 @@ type Config struct {
 // Server is the API.
 type Server struct {
 	store   Store
-	keys    *Keys
 	limits  Limits
 	now     func() time.Time
 	log     *log.Logger
@@ -100,7 +97,6 @@ type Server struct {
 func New(c Config) *Server {
 	s := &Server{
 		store:         c.Store,
-		keys:          c.Keys,
 		limits:        c.Limits,
 		now:           c.Now,
 		log:           c.Log,
@@ -123,18 +119,6 @@ func New(c Config) *Server {
 	}
 	if s.now == nil {
 		s.now = time.Now
-	}
-	// What memory tags each live message with: from the server's keys, so
-	// it is the same on every process; with none, random, and this
-	// process's alone.
-	var mk [32]byte
-	if c.Keys != nil {
-		mk, _ = c.Keys.markKey()
-	} else {
-		_, _ = rand.Read(mk[:])
-	}
-	if c.Store != nil {
-		c.Store.UseMarkKey(mk)
 	}
 	if len(s.identityTypes) == 0 {
 		s.identityTypes = protocol.IdentityTypes()

@@ -258,14 +258,17 @@ type Account struct {
 	Rev       uint64
 }
 
-// AdoptKey is the state of an adopt key: the key itself is an HMAC, never
-// stored (keys.go).
+// AdoptKey is what is kept of an adopt key: its hash, never the key
+// (adoptkey.go).
 type AdoptKey struct {
 	Account string
-	ID      [16]byte
-	Uses    int // left
+	Hash    [32]byte // SHA-256 of the key
+	Uses    int      // left
 	Expires time.Time
 }
+
+// good reports whether the key has a use left and has not expired.
+func (k *AdoptKey) good(now time.Time) bool { return k.Uses >= 1 && now.Before(k.Expires) }
 
 // Retired is what is kept of a retired prekey while it is live.
 type Retired struct {
@@ -443,18 +446,19 @@ type Store interface {
 	CreateAccount(ctx context.Context, a *Account) error
 	// PutAdoptKey stores a new adopt key's state, or returns ErrExists.
 	PutAdoptKey(ctx context.Context, k *AdoptKey) error
-	// Adopt moves box b, as read, into account, spending a use of the adopt
-	// key id of that account, in one write: ErrStale if the record changed,
-	// ErrKeyRefused if the key is spent, expired or gone. It sets b.Account
-	// and bumps b.Rev.
-	Adopt(ctx context.Context, b *Box, account string, key [16]byte) error
+	// AdoptKey returns the state of account's adopt key whose hash is given,
+	// or ErrNotFound. It reads it strongly consistent, so a key just made is
+	// found.
+	AdoptKey(ctx context.Context, account string, hash [32]byte) (*AdoptKey, error)
+	// Adopt moves box b, as read, into account, spending a use of account's
+	// adopt key whose hash is given, in one write: ErrStale if the record
+	// changed, ErrKeyRefused if the key is spent, expired or gone. It sets
+	// b.Account and bumps b.Rev.
+	Adopt(ctx context.Context, b *Box, account string, key [32]byte) error
 	// Leave takes box b, as read, out of its account, or returns ErrStale.
 	// It clears b.Account and bumps b.Rev.
 	Leave(ctx context.Context, b *Box) error
 
-	// UseMarkKey sets the key a store tags each live message with in memory
-	// (markTag), before it is first used: New calls it with the server's.
-	UseMarkKey(key [32]byte)
 	// Count returns the number of live messages in a box. Count and
 	// PairCount answer from memory: a store with memory loads the box on its
 	// first use, then answers from memory.

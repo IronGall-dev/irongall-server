@@ -384,7 +384,7 @@ func (s slowPut) PutMessage(ctx context.Context, box protocol.Address, h *Header
 // stored.
 func concurrently(t *testing.T, e *env, l Limits, to *raw, froms []*raw, n int) int {
 	t.Helper()
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: slowPut{e.store, 50 * time.Millisecond}, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: slowPut{e.store, 50 * time.Millisecond}, Limits: l, Now: e.clock.Now}).Handler()))
 	t.Cleanup(srv.Close)
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	type post struct {
@@ -480,7 +480,7 @@ func TestLookupsOfOneAddressShareARead(t *testing.T) {
 	l.MissesPerMinute = 1
 	e := newEnv(t, l)
 	var n atomic.Int64
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: slowBox{e.store, &n}, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: slowBox{e.store, &n}, Limits: l, Now: e.clock.Now}).Handler()))
 	t.Cleanup(srv.Close)
 	var nobody protocol.Address
 	nobody[0] = 9

@@ -286,7 +286,7 @@ func TestAccountRecords(t *testing.T) {
 		return stypes.Record{EventName: op, Dynamodb: &stypes.StreamRecord{Keys: keys, NewImage: img}}
 	}
 	modify, remove := stypes.OperationTypeModify, stypes.OperationTypeRemove
-	other := append([]byte{skAdoptKey}, make([]byte, 16)...) // an adopt key's item
+	other := append([]byte{skAdoptKey}, make([]byte, 32)...) // an adopt key's item
 	s.accCache.put(&Account{ID: "acme", Rev: 1})
 	s.applyAccountRecord(rec(modify, "acme", other, 5, true))
 	s.applyAccountRecord(rec(modify, "other", []byte{skAccount}, 2, true))

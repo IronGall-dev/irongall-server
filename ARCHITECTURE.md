@@ -77,7 +77,7 @@ flowchart LR
 
 ```go
 type mark struct { // layer 1
-	tag  uint64 // first 8 bytes of HMAC-SHA-256 of the whole id, under a key derived from the server's keys: what the mark is known by
+	tag  uint64 // first 8 bytes of HMAC-SHA-256 of the whole id, under a key this process made at random: what the mark is known by
 	id   uint64 // first 8 bytes of the message id, for the list's order within a millisecond only
 	from uint64 // first 8 bytes of the sender's address, for the per-pair cap
 	exp  uint64 // expiry in unix ms: received_at + the TTL (33 days), so it also gives the header's key (PROTOCOL-SERVER.md §7)
@@ -99,7 +99,7 @@ type Listing struct { // layer 2: optional, LRU under a byte budget
 - messages expire with no event at all.
 
 A set keyed by message id absorbs all three. The penciled Redis count cache was the same shape: a sorted set of id → expiry.
-- **A mark is known by a keyed tag, not by its id's first eight bytes.** The id is the SHA-256 of a ciphertext its sender chose, so those bytes are the sender's to steer: an id that only shared a held message's prefix passed for it, so a forged ack wrote to storage (this repo's #10). The tag is HMAC-SHA-256 of the whole id under a key derived from the server's keys (HKDF), which nobody outside the server can compute. The same issue found that a box's version, the XOR of the prefixes, could be steered to an empty box's, which mattered while the list's `ETag` was made of it: since 2026-10-17 the list has no `ETag` and no `304`, and memory keeps no version.
+- **A mark is known by a keyed tag, not by its id's first eight bytes.** The id is the SHA-256 of a ciphertext its sender chose, so those bytes are the sender's to steer: an id that only shared a held message's prefix passed for it, so a forged ack wrote to storage (this repo's #10). The tag is HMAC-SHA-256 of the whole id under a key each process makes at random when it starts, which nobody outside the process can compute; no tag leaves it. The same issue found that a box's version, the XOR of the prefixes, could be steered to an empty box's, which mattered while the list's `ETag` was made of it: since 2026-10-17 the list has no `ETag` and no `304`, and memory keeps no version.
 - The same marks give the per-pair cap (`from`), so the poll needs nothing else.
 
 **How the listing layer stays honest:**
@@ -115,7 +115,7 @@ A set keyed by message id absorbs all three. The penciled Redis count cache was 
 - the poll buckets;
 - an LRU of what is held of each address, a box's record with its identity's revocations, for sends and reads of a box, which the stream keeps current. A record carries its box's ACL, two sorted lists of 32-byte addresses that `-acl-entries` bounds, so a send's check of it reads nothing more (`PROTOCOL-SERVER.md` §6.2);
 - an LRU of account records, as many as box records, for a sender in an account (`PROTOCOL.md` §6.5): filled on first use by a strongly consistent read, refreshed or evicted by the accounts stream;
-- the server MAC keys, from the 0600 secrets file: they make adopt keys (`PROTOCOL.md` §6.5).
+- the key its marks are tagged under, made at random when it starts.
 
 That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go maps). As built it measures 566 B a polling box: 271 in the index, 127 for the poll bucket and 168 for the pass remembered (2026-10-13), so 0.57 GB per million. It was 286 B before a box proved itself with a pass: the identity's key, kept in SSH wire form so that it can be of any type, and the certificate's hash are 112 B of the difference, and the pass the rest. A box on a P-256 identity holds a 104-byte key where an Ed25519 one holds 51. The other maps are bounded: a bucket key goes once its bucket is full again, a remembered pass within an hour of running out, and the boxes remembered as missing hold at most `-box-cache` entries.
 

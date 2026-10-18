@@ -370,7 +370,7 @@ func TestARevocationOfCertificatesOutlivesTheProcess(t *testing.T) {
 	e.want(e.do("PUT", r.path("/revocations"), rec, ""), 200, "")
 
 	later := startDynamo(t, e.clock.Now) // its memory holds nothing of the box
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: later, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: later.Ready}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: later, Limits: relaxed(), Now: e.clock.Now, Ready: later.Ready}).Handler()))
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	r2 := *r

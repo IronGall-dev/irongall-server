@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"slices"
@@ -24,7 +25,7 @@ import (
 // and a standing only moves to a newer rev.
 type index struct {
 	shards [256]indexShard // by the address's first byte
-	// key tags each mark (markTag): set once, before the index is used.
+	// key tags each mark (markTag): random, made with the index.
 	key [32]byte
 }
 
@@ -88,8 +89,11 @@ type boxRead struct {
 	marks   []mark
 }
 
+// newIndex returns an empty index under a random key: the tags are this
+// process's alone, and nothing made of one leaves it.
 func newIndex() *index {
 	x := &index{}
+	_, _ = rand.Read(x.key[:])
 	for i := range x.shards {
 		x.shards[i].boxes = map[protocol.Address]*boxMem{}
 	}

@@ -21,7 +21,7 @@ func TestTheOperatorClearsAnAddress(t *testing.T) {
 	e := newEnv(t, l)
 	b := e.box(protocol.Classic)
 	l.PublicBurst, l.PublicRefill = 2, time.Hour
-	s := New(Config{Store: e.store, Keys: e.keys, Limits: l, Now: e.clock.Now})
+	s := New(Config{Store: e.store, Limits: l, Now: e.clock.Now})
 	srv := httptest.NewServer(apitest.Handler(t, s.Handler()))
 	t.Cleanup(srv.Close)
 	api := &env{t: t, clock: e.clock, srv: srv}

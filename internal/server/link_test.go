@@ -18,8 +18,7 @@ import (
 // pages (a front page, llms.txt, docs) are served by whatever stands in
 // front of it.
 func TestNoPagesButTheLinkPage(t *testing.T) {
-	keys, _ := NewDevKeys()
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Ready: func() bool { return false }}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Limits: relaxed(), Ready: func() bool { return false }}).Handler()))
 	defer srv.Close()
 	for _, p := range []string{"/", "/llms.txt", "/docs/", "/docs", "/index.html", "/to.html", "/nope"} {
 		resp, err := http.Get(srv.URL + p)
@@ -47,8 +46,7 @@ func TestNoPagesButTheLinkPage(t *testing.T) {
 // 404. A server with no names of its own (the dev server's) names itself as
 // the request does.
 func TestLinkPage(t *testing.T) {
-	keys, _ := NewDevKeys()
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Ready: func() bool { return false }}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Limits: relaxed(), Ready: func() bool { return false }}).Handler()))
 	defer srv.Close()
 	get := func(method, path string) (*http.Response, string) {
 		t.Helper()
@@ -95,7 +93,6 @@ func TestLinkPage(t *testing.T) {
 // the first of them, and by the scheme the caller reached it by, which a
 // trusted proxy in front says in X-Forwarded-Proto and nobody else can.
 func TestTheLinkPageNamesItsOwnServer(t *testing.T) {
-	keys, _ := NewDevKeys()
 	for _, c := range []struct {
 		name    string
 		proxies []netip.Prefix
@@ -113,7 +110,7 @@ func TestTheLinkPageNamesItsOwnServer(t *testing.T) {
 		{"no proxy is trusted", nil, "mail.example", "https", "http://mail.example"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(),
+			srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Limits: relaxed(),
 				Names: []string{"mail.example", "mail.example:8443"}, TrustedProxies: c.proxies}).Handler()))
 			defer srv.Close()
 			a := strings.Repeat("0a", 32)
@@ -141,8 +138,7 @@ var loopback = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
 // a line of the README, at the address the client code carries, on a server
 // called irongall.dev through TLS in front of it.
 func TestLinkPageCommandIsInTheClientREADME(t *testing.T) {
-	keys, _ := NewDevKeys()
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Names: []string{"irongall.dev"}, TrustedProxies: loopback}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Limits: relaxed(), Names: []string{"irongall.dev"}, TrustedProxies: loopback}).Handler()))
 	defer srv.Close()
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/to/"+client.EchoAddress, nil)
 	req.Host = "irongall.dev"

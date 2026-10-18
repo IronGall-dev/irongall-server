@@ -12,6 +12,15 @@ import (
 )
 
 // loaded is an index holding box, loaded with read.
+// Each index tags its marks under a random key of its own, so nobody
+// outside the process can compute a tag.
+func TestTheMarkKeyIsRandom(t *testing.T) {
+	x, y := newIndex(), newIndex()
+	if x.key == ([32]byte{}) || x.key == y.key {
+		t.Fatalf("mark keys %x and %x", x.key, y.key)
+	}
+}
+
 func loaded(t *testing.T, box protocol.Address, read boxRead) *index {
 	t.Helper()
 	x := newIndex()

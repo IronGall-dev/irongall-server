@@ -44,7 +44,8 @@ func keyRefused() *problem {
 
 // adopt is PUT /v1/<address>/account (with the pass): the box joins the account its
 // adopt key names, spending one of the key's uses. Naming the account the
-// box is already in spends none.
+// box is already in spends none, so a retry whose answer was lost is 200
+// even once the key is spent.
 func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
 	a, err := s.owner(r)
 	if err != nil {
@@ -57,9 +58,18 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
 	if err := decodeBody(w, r, 4<<10, &req); err != nil {
 		return err
 	}
-	account, id, err := s.keys.VerifyAdopt(req.Key)
-	if err != nil {
+	account, hash, ok := parseAdopt(req.Key)
+	if !ok {
 		return keyRefused()
+	}
+	// The key is read before anything is written, so one that is not ours
+	// costs a read of the accounts table and no write of the box's record.
+	k, err := s.store.AdoptKey(r.Context(), account, hash)
+	if errors.Is(err, ErrNotFound) {
+		return keyRefused()
+	}
+	if err != nil {
+		return err
 	}
 	b, err := s.box(r.Context(), a)
 	if err != nil {
@@ -69,7 +79,10 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
 		return noSuchMailbox
 	}
 	if b.Account != account {
-		switch err := s.store.Adopt(r.Context(), b, account, id); {
+		if !k.good(s.now()) {
+			return keyRefused()
+		}
+		switch err := s.store.Adopt(r.Context(), b, account, hash); {
 		case errors.Is(err, ErrKeyRefused):
 			return keyRefused()
 		case errors.Is(err, ErrStale):

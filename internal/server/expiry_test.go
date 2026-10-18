@@ -153,7 +153,7 @@ func TestTheRecordAndTheRevocationsAreTwoItems(t *testing.T) {
 func TestASecondProcessLearnsWhatIsRevokedAndDeleted(t *testing.T) {
 	e, _ := dynamoEnv(t)
 	other := startDynamo(t, e.clock.Now)
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: other, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: other.Ready}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: other, Limits: relaxed(), Now: e.clock.Now, Ready: other.Ready}).Handler()))
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	// within waits up to ten seconds for the second process to answer as

@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -279,7 +278,7 @@ func TestTwoProcesses(t *testing.T) {
 	e, _ := dynamoEnv(t)
 	ctx := context.Background()
 	other := startDynamo(t, e.clock.Now)
-	srv2 := httptest.NewServer(apitest.Handler(t, New(Config{Store: other, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: other.Ready}).Handler()))
+	srv2 := httptest.NewServer(apitest.Handler(t, New(Config{Store: other, Limits: relaxed(), Now: e.clock.Now, Ready: other.Ready}).Handler()))
 	t.Cleanup(srv2.Close)
 	e2 := &env{t: t, clock: e.clock, store: other, srv: srv2}
 
@@ -366,11 +365,6 @@ func TestRestartLoadsLazily(t *testing.T) {
 	}
 
 	fresh := startDynamo(t, e.clock.Now)
-	mk, err := e.keys.markKey() // a restart reads the same keys file: the same tags
-	if err != nil {
-		t.Fatal(err)
-	}
-	fresh.UseMarkKey(mk)
 	if !fresh.Ready() || fresh.loads.Load() != 0 {
 		t.Fatalf("ready %v after %d loads: want ready with none", fresh.Ready(), fresh.loads.Load())
 	}
@@ -450,7 +444,7 @@ func (throttled) Count(context.Context, protocol.Address) (int, error) {
 func TestThrottleIs503(t *testing.T) {
 	e := newEnv(t, relaxed())
 	b := e.box(protocol.Classic)
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: throttled{e.store}, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: throttled{e.store}, Limits: relaxed(), Now: e.clock.Now}).Handler()))
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e2.pass(b))
@@ -464,42 +458,12 @@ func TestThrottleIs503(t *testing.T) {
 
 // Until the store has loaded its memory, every call is a 503.
 func TestNotReadyIs503(t *testing.T) {
-	keys, _ := NewDevKeys()
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Keys: keys, Limits: relaxed(), Ready: func() bool { return false }}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Limits: relaxed(), Ready: func() bool { return false }}).Handler()))
 	defer srv.Close()
 	e := &env{t: t, srv: srv}
 	var a protocol.Address
 	if r := e.do(http.MethodGet, "/v1/"+a.String()+"/messages", nil, ""); r.status != http.StatusServiceUnavailable || r.header.Get("Retry-After") == "" {
 		t.Fatalf("%d %s", r.status, r.body)
-	}
-}
-
-func TestLoadKeys(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys")
-	k32 := "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
-	if err := os.WriteFile(path, []byte("# server keys\n2 "+k32+"\n1 "+k32+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	k, err := LoadKeys(path)
-	if err != nil || k.Current != 2 || len(k.keys) != 2 {
-		t.Fatalf("%v %+v", err, k)
-	}
-	if acc, _, err := k.VerifyAdopt(k.MintAdopt("echo", [16]byte{1})); err != nil || acc != "echo" {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(path, 0o640); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := LoadKeys(path); err == nil {
-		t.Fatal("a group-readable key file was loaded")
-	}
-	for _, bad := range []string{"", "1\n", "1 c2hvcnQ=\n", "1 " + k32 + "\n1 " + k32 + "\n", "x " + k32 + "\n"} {
-		_ = os.WriteFile(path, []byte(bad), 0o600)
-		_ = os.Chmod(path, 0o600)
-		if _, err := LoadKeys(path); err == nil {
-			t.Fatalf("loaded %q", bad)
-		}
 	}
 }
 
@@ -544,7 +508,7 @@ func TestPollStaysInMemory(t *testing.T) {
 	ctx := context.Background()
 	b, c := e.box(protocol.Classic), e.box(protocol.Classic)
 	cs := &countingStore{Store: e.store}
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: cs, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: cs, Limits: relaxed(), Now: e.clock.Now}).Handler()))
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	poll := func(x *client.Box, pass string) reply {

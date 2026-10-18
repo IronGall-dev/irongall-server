@@ -12,7 +12,8 @@ import (
 )
 
 // The accounts table (PROTOCOL.md §6.5): account is the account id's
-// bytes; sk 0x00 is the account's record and 0x04 ‖ id an adopt key's state.
+// bytes; sk 0x00 is the account's record and 0x04 ‖ SHA-256 of the key an
+// adopt key's state.
 // Which boxes an account holds is the box records' to say: each names its
 // account, and the boxes table's sparse index on it lists an account's
 // boxes, so a box that leaves, or that DynamoDB's TTL takes, leaves nothing
@@ -26,8 +27,8 @@ func accountKey(id string, sk ...byte) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{"account": bin([]byte(id)), "sk": bin(sk)}
 }
 
-func adoptKeyKey(id string, key [16]byte) map[string]types.AttributeValue {
-	return accountKey(id, append([]byte{skAdoptKey}, key[:]...)...)
+func adoptKeyKey(id string, hash [32]byte) map[string]types.AttributeValue {
+	return accountKey(id, append([]byte{skAdoptKey}, hash[:]...)...)
 }
 
 func accountItem(a *Account) map[string]types.AttributeValue {
@@ -106,7 +107,7 @@ func (s *DynamoStore) CreateAccount(ctx context.Context, a *Account) error {
 
 // PutAdoptKey implements Store. Its expiry is also the item's TTL.
 func (s *DynamoStore) PutAdoptKey(ctx context.Context, k *AdoptKey) error {
-	it := adoptKeyKey(k.Account, k.ID)
+	it := adoptKeyKey(k.Account, k.Hash)
 	it["uses"] = num(uint64(k.Uses)) //nolint:gosec // uses are not negative
 	it["expires"] = num(ms(k.Expires))
 	it["expires_at"] = num(ttlSeconds(ms(k.Expires)))
@@ -120,6 +121,27 @@ func (s *DynamoStore) PutAdoptKey(ctx context.Context, k *AdoptKey) error {
 		return ErrExists
 	}
 	return err
+}
+
+// AdoptKey implements Store.
+func (s *DynamoStore) AdoptKey(ctx context.Context, account string, hash [32]byte) (*AdoptKey, error) {
+	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.accts, Key: adoptKeyKey(account, hash), ConsistentRead: aws.Bool(true)})
+	if err != nil {
+		return nil, err
+	}
+	if out.Item == nil {
+		return nil, ErrNotFound
+	}
+	it := item(out.Item)
+	uses, err := it.uint("uses")
+	if err != nil {
+		return nil, err
+	}
+	exp, err := it.uint("expires")
+	if err != nil {
+		return nil, err
+	}
+	return &AdoptKey{Account: account, Hash: hash, Uses: int(uses), Expires: fromMs(exp)}, nil //nolint:gosec // uses are a count we wrote
 }
 
 // boxRevCheck is the update of a box record at b.Rev that bumps it.
@@ -137,7 +159,7 @@ func boxRevCheck(b *Box, expr string, names map[string]string, values map[string
 
 // Adopt implements Store: in one transaction, the box record names the
 // account, and the key loses a use.
-func (s *DynamoStore) Adopt(ctx context.Context, b *Box, account string, key [16]byte) error {
+func (s *DynamoStore) Adopt(ctx context.Context, b *Box, account string, key [32]byte) error {
 	upd := boxRevCheck(b, "SET #acct = :acct, #rev = :new", map[string]string{"#acct": "account"}, map[string]types.AttributeValue{":acct": bin([]byte(account))})
 	upd.TableName = &s.boxes
 	items := []types.TransactWriteItem{

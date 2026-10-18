@@ -463,7 +463,7 @@ func TestARevocationOutlivesTheProcess(t *testing.T) {
 	e.want(e.do("PUT", revocationPath(a.Address()), rec, ""), 201, "")
 
 	later := startDynamo(t, e.clock.Now) // its memory holds nothing of A
-	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: later, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: later.Ready}).Handler()))
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: later, Limits: relaxed(), Now: e.clock.Now, Ready: later.Ready}).Handler()))
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
 	shown := e2.do("GET", boxPath(a.Address()), nil, "")
@@ -511,15 +511,11 @@ func (s *countingDeletes) deletes() int {
 // countingEnv is an env whose store counts DeleteMessages.
 func countingEnv(t *testing.T) (*env, *countingDeletes) {
 	t.Helper()
-	keys, err := NewDevKeys()
-	if err != nil {
-		t.Fatal(err)
-	}
 	clk := &clock{t: time.Now().UTC().Truncate(time.Second)}
 	inner, ready := newTestStore(t, clk.Now)
 	cs := &countingDeletes{Store: inner}
-	e := &env{t: t, clock: clk, keys: keys, store: cs}
-	e.server = New(Config{Store: cs, Keys: keys, Limits: relaxed(), Now: clk.Now, Ready: ready})
+	e := &env{t: t, clock: clk, store: cs}
+	e.server = New(Config{Store: cs, Limits: relaxed(), Now: clk.Now, Ready: ready})
 	e.srv = httptest.NewServer(apitest.Handler(t, e.server.Handler()))
 	t.Cleanup(e.srv.Close)
 	return e, cs

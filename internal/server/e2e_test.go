@@ -44,7 +44,6 @@ func (c *clock) Add(d time.Duration) {
 type env struct {
 	t      *testing.T
 	clock  *clock
-	keys   *Keys
 	store  Store
 	server *Server
 	srv    *httptest.Server
@@ -61,14 +60,10 @@ func relaxed() Limits {
 
 func newEnv(t *testing.T, l Limits) *env {
 	t.Helper()
-	keys, err := NewDevKeys()
-	if err != nil {
-		t.Fatal(err)
-	}
-	e := &env{t: t, clock: &clock{t: time.Now().UTC().Truncate(time.Second)}, keys: keys}
+	e := &env{t: t, clock: &clock{t: time.Now().UTC().Truncate(time.Second)}}
 	var ready func() bool
 	e.store, ready = newTestStore(t, e.clock.Now)
-	e.server = New(Config{Store: e.store, Keys: keys, Limits: l, Now: e.clock.Now, Ready: ready})
+	e.server = New(Config{Store: e.store, Limits: l, Now: e.clock.Now, Ready: ready})
 	h := apitest.Handler(t, e.server.Handler())
 	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e.mu.Lock()

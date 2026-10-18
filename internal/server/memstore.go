@@ -30,7 +30,7 @@ type MemStore struct {
 
 type adoptKeyRef struct {
 	account string
-	id      [16]byte
+	hash    [32]byte
 }
 
 type memMessage struct {
@@ -300,10 +300,6 @@ func (s *MemStore) DeleteFrom(_ context.Context, box protocol.Address, from func
 	return nil
 }
 
-// UseMarkKey implements Store. This store keeps each message by its whole
-// id, and tags none.
-func (s *MemStore) UseMarkKey([32]byte) {}
-
 // Count implements Store.
 func (s *MemStore) Count(_ context.Context, box protocol.Address) (int, error) {
 	s.mu.Lock()
@@ -394,7 +390,7 @@ func (s *MemStore) CreateAccount(_ context.Context, a *Account) error {
 func (s *MemStore) PutAdoptKey(_ context.Context, k *AdoptKey) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ref := adoptKeyRef{k.Account, k.ID}
+	ref := adoptKeyRef{k.Account, k.Hash}
 	if _, ok := s.keys[ref]; ok {
 		return ErrExists
 	}
@@ -403,8 +399,20 @@ func (s *MemStore) PutAdoptKey(_ context.Context, k *AdoptKey) error {
 	return nil
 }
 
+// AdoptKey implements Store.
+func (s *MemStore) AdoptKey(_ context.Context, account string, hash [32]byte) (*AdoptKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k, ok := s.keys[adoptKeyRef{account, hash}]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	c := *k
+	return &c, nil
+}
+
 // Adopt implements Store.
-func (s *MemStore) Adopt(_ context.Context, b *Box, account string, key [16]byte) error {
+func (s *MemStore) Adopt(_ context.Context, b *Box, account string, key [32]byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur := s.record(b.Addr)
@@ -412,7 +420,7 @@ func (s *MemStore) Adopt(_ context.Context, b *Box, account string, key [16]byte
 		return ErrStale
 	}
 	k, ok := s.keys[adoptKeyRef{account, key}]
-	if !ok || k.Uses < 1 || !s.now().Before(k.Expires) {
+	if !ok || !k.good(s.now()) {
 		return ErrKeyRefused
 	}
 	k.Uses--

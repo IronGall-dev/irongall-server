@@ -230,7 +230,7 @@ func TestACLDenyPurges(t *testing.T) {
 func TestACLReachesAnotherProcess(t *testing.T) {
 	e, _ := dynamoEnv(t)
 	other := startDynamo(t, e.clock.Now)
-	srv2 := httptest.NewServer(apitest.Handler(t, New(Config{Store: other, Keys: e.keys, Limits: relaxed(), Now: e.clock.Now, Ready: other.Ready}).Handler()))
+	srv2 := httptest.NewServer(apitest.Handler(t, New(Config{Store: other, Limits: relaxed(), Now: e.clock.Now, Ready: other.Ready}).Handler()))
 	t.Cleanup(srv2.Close)
 	e2 := &env{t: t, clock: e.clock, store: other, srv: srv2}
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)

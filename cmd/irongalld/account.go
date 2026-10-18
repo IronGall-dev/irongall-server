@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -41,29 +40,25 @@ func account(cmd string, args []string) error {
 			return nil
 		}
 	case "key":
-		keysFile := fs.String("keys", "", "the server keys file, mode 0600")
 		id := fs.String("account", "", "the account the key adopts boxes into")
 		uses := fs.Int("uses", 0, "how many boxes the key may adopt")
 		ttl := fs.Duration("ttl", 0, "how long the key is good for")
 		run = func(ctx context.Context, s *server.DynamoStore) error {
-			if *keysFile == "" || *id == "" || *uses < 1 || *ttl <= 0 {
-				return errors.New("name -keys, -account, -uses and -ttl")
-			}
-			keys, err := server.LoadKeys(*keysFile)
-			if err != nil {
-				return err
+			if *id == "" || *uses < 1 || *ttl <= 0 {
+				return errors.New("name -account, -uses and -ttl")
 			}
 			if _, err := s.Account(ctx, *id); err != nil {
 				return fmt.Errorf("account %s: %w", *id, err)
 			}
-			k := &server.AdoptKey{Account: *id, Uses: *uses, Expires: time.Now().Add(*ttl)}
-			if _, err := rand.Read(k.ID[:]); err != nil {
+			key, hash, err := server.NewAdoptKey(*id)
+			if err != nil {
 				return err
 			}
-			if err := s.PutAdoptKey(ctx, k); err != nil {
+			if err := s.PutAdoptKey(ctx, &server.AdoptKey{Account: *id, Hash: hash, Uses: *uses, Expires: time.Now().Add(*ttl)}); err != nil {
 				return err
 			}
-			fmt.Println(keys.MintAdopt(k.Account, k.ID))
+			// The one time the key is shown: only its hash is kept.
+			fmt.Println(key)
 			return nil
 		}
 	case "drop":

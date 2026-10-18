@@ -1,9 +1,9 @@
 // Command irongalld is the irongall.dev server.
 //
-//	irongalld serve -boxes-table T -msgs-table T -accounts-table T -bucket B -keys FILE -names NAMES [-listen addr] [options] [limits]
+//	irongalld serve -boxes-table T -msgs-table T -accounts-table T -bucket B -names NAMES [-listen addr] [options] [limits]
 //	irongalld serve --dev [-listen addr] [limits]
 //	irongalld account create -accounts-table T [-id NAME] [-unmetered]
-//	irongalld account key -accounts-table T -keys FILE -account ID -uses N -ttl D
+//	irongalld account key -accounts-table T -account ID -uses N -ttl D
 //	irongalld account drop -boxes-table T -accounts-table T -account ID -box ADDR
 //	irongalld limits clear -socket PATH -ip ADDR
 //
@@ -15,7 +15,7 @@
 // memory.
 //
 // --dev keeps everything in memory, with no AWS: the honest server every
-// client tests against. Nothing survives a restart, the server key included.
+// client tests against. Nothing survives a restart.
 // It takes a pass made for any name, unless -names is given.
 //
 // account is the operator's hand on accounts (PROTOCOL.md §6.5) until
@@ -53,7 +53,7 @@ func main() {
 	case len(os.Args) >= 3 && os.Args[1] == "limits":
 		err = limits(os.Args[2], os.Args[3:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: irongalld serve (-boxes-table T -msgs-table T -accounts-table T -bucket B -keys FILE -names NAMES | --dev) [-listen addr] [options] [limits]")
+		fmt.Fprintln(os.Stderr, "usage: irongalld serve (-boxes-table T -msgs-table T -accounts-table T -bucket B -names NAMES | --dev) [-listen addr] [options] [limits]")
 		fmt.Fprintln(os.Stderr, "       irongalld account (create | key | drop) [flags]")
 		fmt.Fprintln(os.Stderr, "       irongalld limits clear -socket PATH -ip ADDR")
 		os.Exit(2)
@@ -71,7 +71,6 @@ func serve(args []string) error {
 	msgs := fs.String("msgs-table", "", "the DynamoDB table of messages")
 	accts := fs.String("accounts-table", "", "the DynamoDB table of accounts")
 	bucket := fs.String("bucket", "", "the S3 Express One Zone directory bucket")
-	keysFile := fs.String("keys", "", "the server keys file (they make adopt keys), mode 0600: lines of \"<kid> <base64 of 32 bytes>\"")
 	names := fs.String("names", "", "comma-separated names clients call this server by: the host of its URL, lowercase, with its port only when that is not the scheme's default; a pass is taken only for one of them")
 	idTypes := fs.String("identity-types", strings.Join(protocol.IdentityTypes(), ","), "comma-separated identity key types a box may register with, of those this build verifies; "+protocol.IdentityEd25519+" is always one of them")
 	region := fs.String("region", "us-east-1", "the AWS region")
@@ -149,22 +148,14 @@ func serve(args []string) error {
 	var start func() error
 	switch {
 	case *dev:
-		if *boxes != "" || *msgs != "" || *accts != "" || *bucket != "" || *keysFile != "" {
-			return errors.New("--dev takes no tables, -bucket or -keys")
+		if *boxes != "" || *msgs != "" || *accts != "" || *bucket != "" {
+			return errors.New("--dev takes no tables or -bucket")
 		}
-		keys, err := server.NewDevKeys()
-		if err != nil {
-			return err
-		}
-		cfg.Store, cfg.Keys = server.NewMemStore(time.Now), keys
+		cfg.Store = server.NewMemStore(time.Now)
 		logger.Printf("irongalld --dev on %s (in memory: nothing survives a restart)", *listen)
-	case *boxes == "" || *msgs == "" || *accts == "" || *bucket == "" || *keysFile == "" || len(cfg.Names) == 0:
-		return errors.New("name -boxes-table, -msgs-table, -accounts-table, -bucket, -keys and -names, or run --dev")
+	case *boxes == "" || *msgs == "" || *accts == "" || *bucket == "" || len(cfg.Names) == 0:
+		return errors.New("name -boxes-table, -msgs-table, -accounts-table, -bucket and -names, or run --dev")
 	default:
-		keys, err := server.LoadKeys(*keysFile)
-		if err != nil {
-			return err
-		}
 		awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(*region))
 		if err != nil {
 			return err
@@ -181,7 +172,7 @@ func serve(args []string) error {
 			Log:            logger,
 			Fatal:          func(err error) { fatal <- err },
 		})
-		cfg.Store, cfg.Keys, cfg.Ready = store, keys, store.Ready
+		cfg.Store, cfg.Ready = store, store.Ready
 		start = func() error {
 			t := time.Now()
 			if err := store.Start(ctx); err != nil {

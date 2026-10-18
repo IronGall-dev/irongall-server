@@ -1123,9 +1123,6 @@ func (s *DynamoStore) List(ctx context.Context, box protocol.Address, after *Cur
 	return hs, nil
 }
 
-// UseMarkKey implements Store.
-func (s *DynamoStore) UseMarkKey(key [32]byte) { s.idx.key = key }
-
 // Count implements Store: from memory, after the box's load on its first
 // use.
 func (s *DynamoStore) Count(ctx context.Context, box protocol.Address) (int, error) {

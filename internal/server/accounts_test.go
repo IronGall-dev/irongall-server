@@ -3,14 +3,17 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,45 +24,72 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
+// An adopt key names its account, and is known by its SHA-256.
 func TestAdoptKeys(t *testing.T) {
-	k, _ := NewDevKeys()
-	var id [16]byte
-	id[0] = 7
-	key := k.MintAdopt("echo", id)
-	if acc, got, err := k.VerifyAdopt(key); err != nil || acc != "echo" || got != id {
-		t.Fatalf("verify: %q %x %v", acc, got, err)
+	key, hash, err := NewAdoptKey("echo")
+	if err != nil {
+		t.Fatal(err)
 	}
-	other, _ := NewDevKeys()
+	if acc, got, ok := parseAdopt(key); !ok || acc != "echo" || got != hash || got != sha256.Sum256([]byte(key)) {
+		t.Fatalf("parse: %q %x %v", acc, got, ok)
+	}
+	if again, _, _ := NewAdoptKey("echo"); again == key {
+		t.Fatal("two keys alike")
+	}
 	raw, _ := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(key, adoptPrefix))
-	flip := func(i int) string {
-		b := append([]byte(nil), raw...)
-		b[i] ^= 1
-		return adoptPrefix + base64.RawURLEncoding.EncodeToString(b)
+	if !bytes.HasPrefix(raw, []byte("echo")) || len(raw) != len("echo")+adoptSecretLen {
+		t.Fatalf("a key of %d bytes: %q", len(raw), raw)
 	}
+	enc := func(b []byte) string { return adoptPrefix + base64.RawURLEncoding.EncodeToString(b) }
+	secret := raw[len("echo"):]
 	for name, bad := range map[string]string{
-		"another server's": other.MintAdopt("echo", id),
-		"no prefix":        strings.TrimPrefix(key, adoptPrefix),
-		"truncated":        key[:len(key)-4],
-		"another key id":   flip(1),
-		"another account":  flip(18),
-		"a longer account": flip(17),
-		"a bad mac":        flip(len(raw) - 1),
-		"a bad account id": k.MintAdopt("Echo", id),
-		"an unknown kid":   flip(0),
-		"not base64":       adoptPrefix + "!!",
-		"an empty one":     "",
-		"an empty account": k.MintAdopt("", id),
-		"a too-long one":   key + "AAAA",
-		"too short":        adoptPrefix + "AAAA",
-		"a length past the end": func() string {
-			b := append([]byte(nil), raw...)
-			b[17] = 255
-			return adoptPrefix + base64.RawURLEncoding.EncodeToString(b)
-		}(),
+		"no prefix":           strings.TrimPrefix(key, adoptPrefix),
+		"not base64":          adoptPrefix + "!!",
+		"padded":              key + "=",
+		"an empty one":        "",
+		"too short":           adoptPrefix + "AAAA",
+		"no account":          enc(secret),
+		"a bad account id":    enc(append([]byte("Echo"), secret...)),
+		"an account too long": enc(append([]byte(strings.Repeat("a", 33)), secret...)),
 	} {
-		if _, _, err := k.VerifyAdopt(bad); err == nil {
-			t.Errorf("%s: verified", name)
+		if _, _, ok := parseAdopt(bad); ok {
+			t.Errorf("%s: parsed", name)
 		}
+	}
+	for _, a := range []string{"", "Echo", strings.Repeat("a", 33)} {
+		if _, _, err := NewAdoptKey(a); err == nil {
+			t.Errorf("a key into %q", a)
+		}
+	}
+}
+
+// The accounts table keeps an adopt key's SHA-256 and never the key, so a
+// copy of the table holds no key.
+func TestAnAdoptKeyIsKeptAsItsHash(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, relaxed())
+	acc, key := accountEnv(t, e, true, 1)
+	hash := sha256.Sum256([]byte(key))
+	if k, err := e.store.AdoptKey(ctx, acc.ID, hash); err != nil || k.Uses != 1 || k.Hash != hash || k.Account != acc.ID {
+		t.Fatalf("the key, by its hash: %+v %v", k, err)
+	}
+	if _, err := e.store.AdoptKey(ctx, acc.ID, sha256.Sum256([]byte(key+"A"))); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("another key: %v", err)
+	}
+	s, ok := e.store.(*DynamoStore)
+	if !ok {
+		return
+	}
+	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.accts, Key: adoptKeyKey(acc.ID, hash), ConsistentRead: aws.Bool(true)})
+	if err != nil || out.Item == nil {
+		t.Fatalf("the key's item: %v", err)
+	}
+	if sk := out.Item["sk"].(*types.AttributeValueMemberB).Value; !bytes.Equal(sk, append([]byte{skAdoptKey}, hash[:]...)) {
+		t.Fatalf("the key's item is at %x", sk)
+	}
+	names := slices.Sorted(maps.Keys(out.Item))
+	if !slices.Equal(names, []string{"account", "expires", "expires_at", "sk", "uses"}) {
+		t.Fatalf("the key's item holds %v", names)
 	}
 }
 
@@ -87,15 +117,18 @@ func accountEnv(t *testing.T, e *env, unmetered bool, uses int) (*Account, strin
 
 func (e *env) adoptKey(t *testing.T, account string, uses int, ttl time.Duration) string {
 	t.Helper()
-	k := &AdoptKey{Account: account, Uses: uses, Expires: e.clock.Now().Add(ttl)}
-	_, _ = rand.Read(k.ID[:])
+	key, hash, err := NewAdoptKey(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := &AdoptKey{Account: account, Hash: hash, Uses: uses, Expires: e.clock.Now().Add(ttl)}
 	if err := e.store.PutAdoptKey(context.Background(), k); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.store.PutAdoptKey(context.Background(), k); !errors.Is(err, ErrExists) {
 		t.Fatalf("the key again: %v", err)
 	}
-	return e.keys.MintAdopt(account, k.ID)
+	return key
 }
 
 func (e *env) accountOf(b *client.Box) string {
@@ -181,17 +214,19 @@ func TestAccounts(t *testing.T) {
 	t.Run("keys that are refused", func(t *testing.T) {
 		e := newEnv(t, l)
 		acc, key := accountEnv(t, e, true, 2)
+		other, _ := accountEnv(t, e, true, 1)
 		a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-		other, _ := NewDevKeys()
-		var unstored [16]byte
-		unstored[0] = 1
+		unstored, _, _ := NewAdoptKey(acc.ID)
+		raw, _ := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(key, adoptPrefix))
+		moved := adoptPrefix + base64.RawURLEncoding.EncodeToString(append([]byte(other.ID), raw[len(acc.ID):]...)) // its secret, naming another account
 		expiring := e.adoptKey(t, acc.ID, 1, time.Minute)
 		e.clock.Add(2 * time.Minute)
 		for name, k := range map[string]string{
-			"another server's": other.MintAdopt(acc.ID, unstored),
-			"never stored":     e.keys.MintAdopt(acc.ID, unstored),
-			"expired":          expiring,
-			"not a key":        "iga1_x",
+			"never stored":            unstored,
+			"naming another account":  moved,
+			"expired":                 expiring,
+			"not a key":               "iga1_x",
+			"a key's hash, not a key": adoptPrefix + base64.RawURLEncoding.EncodeToString(append([]byte(acc.ID), func() []byte { h := sha256.Sum256([]byte(key)); return h[:] }()...)),
 		} {
 			if _, err := a.Adopt(ctx, k); client.Code(err) != protocol.CodeAdoptKeyRefused {
 				t.Errorf("%s: %v", name, err)
@@ -200,12 +235,21 @@ func TestAccounts(t *testing.T) {
 		if e.accountOf(a) != "" {
 			t.Fatal("a refused key adopted the box")
 		}
-		// Adopting into the account the box is already in spends no use.
+		// Adopting into the account the box is already in spends no use,
+		// and a key that was never stored is refused there too.
 		adopt(t, a, key)
 		adopt(t, a, key)
+		if _, err := a.Adopt(ctx, unstored); client.Code(err) != protocol.CodeAdoptKeyRefused {
+			t.Fatalf("a key never stored, naming the box's own account: %v", err)
+		}
 		adopt(t, b, key)
 		if _, err := e.box(protocol.Classic).Adopt(ctx, key); client.Code(err) != protocol.CodeAdoptKeyRefused {
 			t.Fatalf("a third box on a two-use key: %v", err)
+		}
+		// The key is spent, and a box already in its account is still
+		// answered 200: a retry whose answer was lost.
+		if got := adopt(t, a, key); got != acc.ID {
+			t.Fatalf("a retry adopted into %q", got)
 		}
 	})
 
@@ -247,7 +291,7 @@ func TestAdoptAndLeaveNameTheRecord(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t, relaxed())
 	acc, key := accountEnv(t, e, true, 1)
-	_, id, _ := e.keys.VerifyAdopt(key)
+	_, id, _ := parseAdopt(key)
 	a := e.box(protocol.Classic)
 	old, err := e.store.Box(ctx, a.Address())
 	if err != nil {
@@ -276,8 +320,44 @@ func TestAdoptAndLeaveNameTheRecord(t *testing.T) {
 // staleStore loses every race to adopt or leave.
 type staleStore struct{ Store }
 
-func (staleStore) Adopt(context.Context, *Box, string, [16]byte) error { return ErrStale }
+func (staleStore) Adopt(context.Context, *Box, string, [32]byte) error { return ErrStale }
 func (staleStore) Leave(context.Context, *Box) error                   { return ErrStale }
+
+// adoptCounting counts the store's adopts: each writes the box's record.
+type adoptCounting struct {
+	Store
+	n atomic.Int32
+}
+
+func (s *adoptCounting) Adopt(ctx context.Context, b *Box, account string, key [32]byte) error {
+	s.n.Add(1)
+	return s.Store.Adopt(ctx, b, account, key)
+}
+
+// A key that is not this server's, or is spent or expired, is refused after
+// a read of its item, and never reaches the write of the box's record.
+func TestARefusedKeyWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	l := relaxed()
+	e := newEnv(t, l)
+	acc, key := accountEnv(t, e, true, 1)
+	cs := &adoptCounting{Store: e.store}
+	h := New(Config{Store: cs, Limits: l, Now: e.clock.Now}).Handler()
+	e.setMiddle(func(w http.ResponseWriter, r *http.Request, _ http.Handler) { h.ServeHTTP(w, r) })
+	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
+	adopt(t, a, key)
+	unstored, _, _ := NewAdoptKey(acc.ID)
+	expiring := e.adoptKey(t, acc.ID, 1, time.Minute)
+	e.clock.Add(2 * time.Minute)
+	for name, k := range map[string]string{"spent": key, "never stored": unstored, "expired": expiring} {
+		if _, err := b.Adopt(ctx, k); client.Code(err) != protocol.CodeAdoptKeyRefused {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if n := cs.n.Load(); n != 1 {
+		t.Fatalf("%d writes of a box's record, for one adopt", n)
+	}
+}
 
 func TestAdoptRaceIsAConflict(t *testing.T) {
 	l := relaxed()
@@ -285,7 +365,7 @@ func TestAdoptRaceIsAConflict(t *testing.T) {
 	acc, key := accountEnv(t, e, true, 2)
 	a := e.box(protocol.Classic)
 	adopt(t, a, e.adoptKey(t, acc.ID, 1, time.Hour))
-	stale := New(Config{Store: staleStore{e.store}, Keys: e.keys, Limits: l, Now: e.clock.Now}).Handler()
+	stale := New(Config{Store: staleStore{e.store}, Limits: l, Now: e.clock.Now}).Handler()
 	e.setMiddle(func(w http.ResponseWriter, r *http.Request, _ http.Handler) { stale.ServeHTTP(w, r) })
 	b := e.box(protocol.Classic)
 	if _, err := b.Adopt(context.Background(), key); client.Code(err) != protocol.CodeBoxChanged {

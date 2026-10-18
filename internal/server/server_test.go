@@ -649,10 +649,9 @@ func TestTwoAuthorizationLinesAreNoPass(t *testing.T) {
 // is not sent with the pass, so checked against whatever name a request
 // gives, a pass made for another server would pass here.
 func TestAPassIsForOneServer(t *testing.T) {
-	keys, _ := NewDevKeys()
 	clk := &clock{t: time.Now().UTC().Truncate(time.Second)}
-	e := &env{t: t, clock: clk, keys: keys, store: NewMemStore(clk.Now)}
-	e.srv = httptest.NewServer(apitest.Handler(t, New(Config{Store: e.store, Keys: keys, Limits: relaxed(), Now: clk.Now, Names: []string{"mail.example", "mail.example:8443"}}).Handler()))
+	e := &env{t: t, clock: clk, store: NewMemStore(clk.Now)}
+	e.srv = httptest.NewServer(apitest.Handler(t, New(Config{Store: e.store, Limits: relaxed(), Now: clk.Now, Names: []string{"mail.example", "mail.example:8443"}}).Handler()))
 	t.Cleanup(e.srv.Close)
 	r := e.raw()
 	r.prekey(1, clk.Now().Add(time.Hour), nil)
@@ -684,10 +683,9 @@ func TestAPassIsForOneServer(t *testing.T) {
 // call names mail.example:443. Each pass here is a new one, a second later:
 // one the server has taken is taken again without its name being read.
 func TestTheServerReadsItsHostAsAnOrigin(t *testing.T) {
-	keys, _ := NewDevKeys()
 	clk := &clock{t: time.Now().UTC().Truncate(time.Second)}
-	e := &env{t: t, clock: clk, keys: keys, store: NewMemStore(clk.Now)}
-	e.srv = httptest.NewServer(apitest.Handler(t, New(Config{Store: e.store, Keys: keys, Limits: relaxed(), Now: clk.Now, Names: []string{"mail.example", "mail.example:8443"}}).Handler()))
+	e := &env{t: t, clock: clk, store: NewMemStore(clk.Now)}
+	e.srv = httptest.NewServer(apitest.Handler(t, New(Config{Store: e.store, Limits: relaxed(), Now: clk.Now, Names: []string{"mail.example", "mail.example:8443"}}).Handler()))
 	t.Cleanup(e.srv.Close)
 	r := e.raw()
 	r.prekey(1, clk.Now().Add(time.Hour), nil)
@@ -1022,7 +1020,6 @@ func TestPerIPLimits(t *testing.T) {
 func TestClientIPFromTrustedProxy(t *testing.T) {
 	l := relaxed()
 	l.SendsPerMinutePerIP = 1
-	keys, _ := NewDevKeys()
 	clk := time.Now()
 	store := NewMemStore(func() time.Time { return clk })
 	for _, c := range []struct {
@@ -1034,7 +1031,7 @@ func TestClientIPFromTrustedProxy(t *testing.T) {
 		{"untrusted peer: the header is ignored", nil, http.StatusTooManyRequests},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: store, Keys: keys, Limits: l, TrustedProxies: c.trusted}).Handler()))
+			srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: store, Limits: l, TrustedProxies: c.trusted}).Handler()))
 			defer srv.Close()
 			call := func(ip string) int {
 				req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/"+protocol.Address{1}.String()+"/messages", nil)

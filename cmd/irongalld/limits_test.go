@@ -21,11 +21,7 @@ func TestTheAdminSocket(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	path := filepath.Join(dir, "admin.sock")
-	keys, err := server.NewDevKeys()
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := server.New(server.Config{Store: server.NewMemStore(time.Now), Keys: keys, Limits: server.DefaultLimits(), Now: time.Now})
+	s := server.New(server.Config{Store: server.NewMemStore(time.Now), Limits: server.DefaultLimits(), Now: time.Now})
 
 	first, err := listenAdmin(path)
 	if err != nil {

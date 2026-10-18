@@ -43,8 +43,7 @@ if age-keygen -pq > /dev/null 2>&1; then kt=pq; else kt=no-pq; fi
 echo "local age: $(age --version) → recipe boxes are $kt"
 port=$((20000 + RANDOM % 20000))
 if [ -n "${IRONGALL_TEST_MSGS_TABLE:-}" ]; then
-  (umask 077 && printf '1 %s\n' "$(head -c 32 /dev/urandom | base64)" > "$work/keys")
-  store=(-boxes-table "$IRONGALL_TEST_BOXES_TABLE" -msgs-table "$IRONGALL_TEST_MSGS_TABLE" -accounts-table "$IRONGALL_TEST_ACCOUNTS_TABLE" -bucket "$IRONGALL_TEST_BUCKET" -keys "$work/keys" -names "127.0.0.1:$port")
+  store=(-boxes-table "$IRONGALL_TEST_BOXES_TABLE" -msgs-table "$IRONGALL_TEST_MSGS_TABLE" -accounts-table "$IRONGALL_TEST_ACCOUNTS_TABLE" -bucket "$IRONGALL_TEST_BUCKET" -names "127.0.0.1:$port")
 else
   store=(--dev)
 fi

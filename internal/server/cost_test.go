@@ -153,13 +153,12 @@ func TestCostMemoryPerBox(t *testing.T) {
 	// it carries and two signature checks, the working key's and then the
 	// identity's; and every later call that carries it, a hash of the header
 	// and a lookup.
-	keys, _ := NewDevKeys()
 	box, work := costBox(t, false, 0)
 	store := NewMemStore(time.Now)
 	if err := store.CreateBox(ctx, box); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(Config{Store: store, Keys: keys, Limits: DefaultLimits()})
+	srv := New(Config{Store: store, Limits: DefaultLimits()})
 	const name = "irongall.example"
 	auth, _, err := protocol.NewPass(work, box.Addr, name, time.Now())
 	if err != nil {
