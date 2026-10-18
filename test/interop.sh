@@ -48,7 +48,7 @@ else
   store=(--dev)
 fi
 echo "server: irongalld serve ${store[*]:0:6}"
-"$work/irongalld" serve "${store[@]}" -listen "127.0.0.1:$port" -poll-burst 0 -registrations-per-hour 0 -public-burst 0 2> "$work/server.log" & srv=$!   # every box here registers from one address
+"$work/irongalld" serve "${store[@]}" -listen "127.0.0.1:$port" -poll-burst 0 -registrations-per-hour 0 2> "$work/server.log" & srv=$!   # every box here registers from one address
 export IG_BASE="http://127.0.0.1:$port" IRONGALL_BASE="http://127.0.0.1:$port"
 for _ in $(seq 300); do   # up once the API answers other than 503 (loading)
   code=$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$(printf '0%.0s' $(seq 64))"); [ "$code" != 000 ] && [ "$code" != 503 ] && break; sleep 0.1
@@ -263,7 +263,7 @@ out=$(gocli "$W3" revocation ask "$W2L" 2> /dev/null) && [ "$out" = "{\"type\":\
 # --- 9. a revocation server beside this one (PROTOCOL.md §6.3): a second irongalld, since every mailbox server is one ---
 # A server keeps a revocation for an address it has no box for, so no box here is registered at the second server: it holds only
 # what each box publishes to it.
-second(){ "$work/irongalld" serve --dev -listen "127.0.0.1:$1" -poll-burst 0 -registrations-per-hour 0 -public-burst 0 -misses-per-minute 0 2> "$work/server-$1.log" & }   # <port>: it holds no box of these, so each address it is asked about is a miss there
+second(){ "$work/irongalld" serve --dev -listen "127.0.0.1:$1" -poll-burst 0 -registrations-per-hour 0 -misses-per-minute 0 2> "$work/server-$1.log" & }   # <port>: it holds no box of these, so each address it is asked about is a miss there
 up(){ for _ in $(seq 300); do code=$(curl -s -o /dev/null -w '%{http_code}' "$1/v1/$(printf '0%.0s' $(seq 64))"); [ "$code" != 000 ] && [ "$code" != 503 ] && return 0; sleep 0.1; done; return 1; }   # <server>
 rport=$((port + 1)); REV="http://127.0.0.1:$rport"; second "$rport"; rev=$!; up "$REV" || bad "the second server did not come up"
 at(){ curl -s -o /dev/null -w '%{http_code}' "$1/v1/$2/revocations"; }   # <revocation server> <address> → the status of a lookup there

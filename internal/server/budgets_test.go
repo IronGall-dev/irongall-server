@@ -134,9 +134,10 @@ func errorsAs(err error, ae **client.APIError) bool {
 }
 
 // A lookup, the read of a box, is its caller's to pay for, once for each
-// read: with a pass, the box's calls (Limits.CallBurst); with none, its
-// address's calls with no pass (Limits.PublicBurst), as the page a link
-// opens is. A pass that does not verify is refused, not taken as none.
+// read: with a pass, the box's calls (Limits.CallBurst). With none it spends
+// nothing, as the page a link opens spends nothing: memory answers both, and
+// only a read that finds no box counts, as a miss. A pass that does not
+// verify is refused, not taken as none.
 func TestLookupsArePaidByTheirCaller(t *testing.T) {
 	t.Run("with a pass", func(t *testing.T) {
 		l := relaxed()
@@ -159,17 +160,19 @@ func TestLookupsArePaidByTheirCaller(t *testing.T) {
 		l := relaxed()
 		e := newEnv(t, l)
 		b := e.box(protocol.Classic)
-		l.PublicBurst, l.PublicRefill = 2, time.Minute
-		e2, _ := counted(t, e, l)
+		l.MissesPerMinute = 2
+		e2, cs := counted(t, e, l)
 		read := "/v1/" + b.Address().String()
 		e2.want(e2.do(http.MethodGet, read, nil, ""), http.StatusOK, "")
-		page := e2.do(http.MethodGet, protocol.LinkPath+b.Address().String(), nil, "")
-		if page.status != http.StatusOK {
-			t.Fatalf("the link page: %d", page.status)
+		before := cs.reads.Load()
+		for range 50 {
+			e2.want(e2.do(http.MethodGet, read, nil, ""), http.StatusOK, "")
+			if r := e2.do(http.MethodGet, protocol.LinkPath+b.Address().String(), nil, ""); r.status != http.StatusOK {
+				t.Fatalf("the link page: %d", r.status)
+			}
 		}
-		e2.want(e2.do(http.MethodGet, read, nil, ""), http.StatusTooManyRequests, protocol.CodeRateLimited)
-		if r := e2.do(http.MethodGet, protocol.LinkPath+b.Address().String(), nil, ""); r.status != http.StatusTooManyRequests || r.header.Get("Retry-After") == "" {
-			t.Fatalf("the link page past the address's calls: %d", r.status)
+		if got := cs.reads.Load(); got != before {
+			t.Errorf("50 more lookups of a box held in memory made %d storage calls, want none", got-before)
 		}
 	})
 }

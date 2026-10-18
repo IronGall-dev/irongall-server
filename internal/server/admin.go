@@ -11,8 +11,7 @@ import (
 // listener, so nothing that reaches the API reaches it.
 
 // ClearAddress forgets what the limits keyed by a caller's address hold of
-// ip: its calls with no pass, its misses, its registrations and its sends
-// before their pass, each bucket full again as if the address had never been
+// ip: its misses, its registrations and its sends before their pass, each bucket full again as if the address had never been
 // seen. ip is an IPv4 address or any IPv6 address of a /64, which is how the
 // limits key a caller (ipKey). It returns that key and the names of the
 // limits that held anything of it, and false if ip is no address.
@@ -25,7 +24,6 @@ func (s *Server) ClearAddress(ip string) (key string, cleared []string, ok bool)
 		name string
 		bs   *buckets
 	}{
-		{"public", s.public},
 		{"misses", s.misses},
 		{"registrations", s.regs},
 		{"sends", s.sendIPs},

@@ -97,8 +97,6 @@ func serve(args []string) error {
 	fs.DurationVar(&l.DrainRefill, "drain-refill", l.DrainRefill, "one more first fetch each")
 	fs.IntVar(&l.CallBurst, "call-burst", l.CallBurst, "a box's calls with its pass that no other budget counts, at once (0: off)")
 	fs.DurationVar(&l.CallRefill, "call-refill", l.CallRefill, "one more such call each")
-	fs.IntVar(&l.PublicBurst, "public-burst", l.PublicBurst, "calls with no pass per IPv4 address or IPv6 /64, at once (0: off)")
-	fs.DurationVar(&l.PublicRefill, "public-refill", l.PublicRefill, "one more such call each")
 	fs.IntVar(&l.CertificatesPerDay, "certificates-per-day", l.CertificatesPerDay, "per box per UTC day: renewals under a later certificate, but for one that replaces a revoked certificate (0: off)")
 	fs.IntVar(&l.CertificateRevocationsPerDay, "certificate-revocations-per-day", l.CertificateRevocationsPerDay, "per box per UTC day: raises of its revocation of certificates (0: off)")
 	fs.IntVar(&l.ACLEntries, "acl-entries", l.ACLEntries, "the most entries a box's ACL holds, its two lists together (0: off)")

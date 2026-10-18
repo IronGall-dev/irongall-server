@@ -73,7 +73,6 @@ type Server struct {
 	regs     *buckets // per IP
 	sendIPs  *buckets // per IP
 	misses   *buckets // per IP: reads of the boxes table that found no box, and checks that failed
-	public   *buckets // per IP: calls with no pass
 	calls    *buckets // per box: its calls with its pass that no other budget counts
 	receives *buckets // per box: new messages it takes
 	drained  *buckets // per box: its first fetches of held messages
@@ -115,7 +114,6 @@ func New(c Config) *Server {
 		regs:          perPeriod(c.Limits.RegistrationsPerHour, time.Hour),
 		sendIPs:       perPeriod(c.Limits.SendsPerMinutePerIP, time.Minute),
 		misses:        perPeriod(c.Limits.MissesPerMinute, time.Minute),
-		public:        newBuckets(c.Limits.PublicBurst, c.Limits.PublicRefill),
 		calls:         newBuckets(c.Limits.CallBurst, c.Limits.CallRefill),
 		receives:      newBuckets(c.Limits.ReceiveBurst, c.Limits.ReceiveRefill),
 		drained:       newBuckets(c.Limits.DrainBurst, c.Limits.DrainRefill),
@@ -163,19 +161,19 @@ func (s *Server) routes() []route {
 const linkRoute = "GET " + protocol.LinkPath + "{addr}"
 
 // Handler returns the API's routes, the page a box's link opens, and the
-// site, if there is one. A page of the site is a call with no pass, as the
-// link page is: each moves bytes, and the site is answered before the API is
-// ready, since it reads no store.
+// site, if there is one. Neither page is limited: each is answered from
+// memory, and a flood of pages is for whatever stands in front. Both are
+// answered before the API is ready, since neither reads a store.
 func (s *Server) Handler() http.Handler {
 	api := http.NewServeMux()
 	for _, r := range s.routes() {
 		api.HandleFunc(r.pattern, s.handle(r.h))
 	}
 	mux := http.NewServeMux()
-	mux.Handle(linkRoute, s.publicPage(s.linkPage()))
+	mux.Handle(linkRoute, s.linkPage())
 	mux.Handle("/v1/", notStored(s.whenReady(api)))
 	if s.site != nil {
-		mux.Handle("/", s.publicPage(s.site))
+		mux.Handle("/", s.site)
 	}
 	return s.accessLog(s.dated(mux))
 }
@@ -531,29 +529,6 @@ func (s *Server) miss(r *http.Request) (*reservation, error) {
 	return m, nil
 }
 
-// spendPublic spends one of the calls with no pass that the caller's address
-// may make (Limits.PublicBurst). A box's own calls carry its pass, and are
-// spent from the box's budgets instead.
-func (s *Server) spendPublic(r *http.Request) error {
-	if ok, wait := s.public.take(ipKey(s.clientIP(r)), s.now()); !ok {
-		return rateLimited(wait, "too many calls with no pass from this address; a box's calls carry its pass, and are counted against the box")
-	}
-	return nil
-}
-
-// publicPage serves h, a page anyone may open, once the caller's address has
-// spent a call with no pass on it.
-func (s *Server) publicPage(h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var p *problem
-		if err := s.spendPublic(r); errors.As(err, &p) {
-			writeProblem(w, p)
-			return
-		}
-		h.ServeHTTP(w, r)
-	})
-}
-
 // spendCall spends one of box a's calls (Limits.CallBurst), the budget of
 // every call with its pass that no other budget counts. An account that lifts
 // it comes with lim.CallBurst zero.
@@ -596,10 +571,11 @@ func (s *Server) spendOwner(ctx context.Context, a protocol.Address) error {
 
 // spendLookup spends a call that may carry its caller's pass, a GET of what
 // is public about a box (PROTOCOL.md §4.1): with a pass it is the calling
-// box's, once the pass is checked; with none, its address's.
+// box's, once the pass is checked. With none it spends nothing: memory
+// answers it, and a read that finds no box counts as a miss (lookup).
 func (s *Server) spendLookup(r *http.Request) error {
 	if auth, one := authorization(r); one && auth == "" {
-		return s.spendPublic(r)
+		return nil
 	}
 	from, err := s.sender(r)
 	if err != nil {

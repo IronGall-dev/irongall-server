@@ -34,8 +34,6 @@ type Limits struct {
 	DrainRefill                  time.Duration // (decided: 6 s, ten a minute)
 	CallBurst                    int           // per box: its calls with its pass that no other budget counts [tunable]; an account lifts it
 	CallRefill                   time.Duration // [tunable]
-	PublicBurst                  int           // per IP: calls with no pass [tunable]
-	PublicRefill                 time.Duration // [tunable]
 	CertificatesPerDay           int           // per box, per UTC day: renewals under a later certificate, but for one that replaces a revoked certificate (decided: 10, as renewals)
 	CertificateRevocationsPerDay int           // per box, per UTC day: raises of its revocation of certificates (decided 2026-10-16 to be counted apart; 10, as the count it was split from) [tunable]
 
@@ -74,8 +72,6 @@ func DefaultLimits() Limits {
 		DrainRefill:                  6 * time.Second,
 		CallBurst:                    50,
 		CallRefill:                   6 * time.Second,
-		PublicBurst:                  10,
-		PublicRefill:                 50 * time.Second,
 		CertificatesPerDay:           10,
 		CertificateRevocationsPerDay: 10,
 		ACLEntries:                   500,

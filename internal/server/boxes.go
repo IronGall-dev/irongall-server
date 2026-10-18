@@ -21,19 +21,16 @@ const registerLimit = 64 << 10
 // take as one.
 const hintDocument = "the identity document is \"irongall-v1\", LF, one SSH public key with no comment, LF: look for a comment, CRLF or a missing final newline"
 
-// register is PUT /v1/<address> (PROTOCOL.md §3). It is a call with no pass
-// of a box that exists yet, so its address pays for it; the statement and the
-// pass it carries are checked only for a box this process does not already
-// hold, after the address's count of registrations.
+// register is PUT /v1/<address> (PROTOCOL.md §3). It is a call of a box that
+// does not exist yet, so its address pays for it: the statement and the pass
+// it carries are checked only for a box this process does not already hold,
+// after the address's count of registrations.
 //
 // A registration is held to what is kept of the address, box or none: 410
 // while the address is revoked, nothing under a certificate its identity
 // revoked, and, while a deleted box's record is kept, a later certificate
 // than its last and a key it never published, which undoes the delete.
 func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
-	if err := s.spendPublic(r); err != nil {
-		return err
-	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -144,9 +141,9 @@ func settled(b *Box) bool { return b.open() || b != nil && b.State == Revoked }
 // registered answers a registration of a box that is registered, or of an
 // address that is revoked, from its record: registration never changes it.
 // An identical retry is answered 200 once its pass, under the box's current
-// certificate, is checked; nothing else is. What bounds that check is the
-// call's own budget, its address's (Limits.PublicBurst), or the count of
-// registrations taken before it.
+// certificate, is checked; nothing else is. A pass the server remembers costs
+// no check, and one that does not verify counts against the caller's address
+// (checkPassBounded).
 func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol.Identity, cur *Box, req *protocol.RegisterRequest) error {
 	switch {
 	case cur.State == Revoked:
@@ -419,9 +416,6 @@ func (s *Server) getBox(w http.ResponseWriter, r *http.Request) error {
 // a client that lists this server as one of its revocation servers. It takes
 // no pass, as the PUT beside it takes none.
 func (s *Server) getRevocations(w http.ResponseWriter, r *http.Request) error {
-	if err := s.spendPublic(r); err != nil {
-		return err
-	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -480,9 +474,6 @@ const (
 // Everything else in the body is checked before anything is changed, and a
 // check that fails counts against the caller's address (s.miss).
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
-	if err := s.spendPublic(r); err != nil {
-		return err
-	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err

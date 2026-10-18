@@ -132,23 +132,20 @@ func TestASitePageAnswersConditionally(t *testing.T) {
 	}
 }
 
-// A page of the site is a call with no pass: it spends the caller's address's
-// allowance, a 404 among them, as the link page does. And it is answered
+// A page of the site spends nothing of its caller's: however many a shared
+// address asks for, each is answered, a 404 among them. And it is answered
 // while the API is not ready.
-func TestASitePageIsACallWithNoPass(t *testing.T) {
-	l := relaxed()
-	l.PublicBurst, l.PublicRefill = 2, time.Hour
-	srv := siteServer(t, l, false)
+func TestASitePageIsNeverLimited(t *testing.T) {
+	srv := siteServer(t, DefaultLimits(), false)
 	if resp, _ := get(t, srv, http.MethodGet, "/v1/"+strings.Repeat("0", 64)); resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("the API before it is ready: %d, want 503", resp.StatusCode)
 	}
-	for i, path := range []string{"/", "/nope"} {
-		if resp, _ := get(t, srv, http.MethodGet, path); resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
-			t.Fatalf("page %d, before the API is ready: %d", i+1, resp.StatusCode)
+	for i := range 100 {
+		for path, want := range map[string]int{"/": http.StatusOK, "/llms.txt": http.StatusOK, "/nope": http.StatusNotFound} {
+			if resp, _ := get(t, srv, http.MethodGet, path); resp.StatusCode != want {
+				t.Fatalf("request %d of %s, with the default limits and the API not ready: %d, want %d", i+1, path, resp.StatusCode, want)
+			}
 		}
-	}
-	if resp, _ := get(t, srv, http.MethodGet, "/llms.txt"); resp.StatusCode != http.StatusTooManyRequests || resp.Header.Get("Retry-After") == "" {
-		t.Errorf("a third page past an allowance of two: %d, want 429 with Retry-After", resp.StatusCode)
 	}
 }
 
