@@ -256,7 +256,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
                              The one made with the prekey published last signs mail and passes; older ones are deleted when a newer prekey is published
   pass                       0600: the Authorization value last signed, sent on every call until it is about to run out (PROTOCOL §6.1b)
   serial                     the highest prekey serial this box published: a renewal refuses a served serial below it
-  prekey-lifetime            how long each new prekey is valid for, in seconds: 33 days unless its owner sets less, down to a day and an hour (PROTOCOL §6.4)
+  prekey-lifetime            how long each new prekey is valid for, in seconds: 33 days unless its owner sets less, down to a day and two hours (PROTOCOL §6.4)
   peers/<addr>/              the pinned identity document, the highest prekey serial and certificate serial seen, the last statement fetched.
                              Made on a send once the peer's prekey statement verified, and on a receive once a message from it passed every check
   seen                       ciphertext hash, sent_at, from, msg_id: 66 days and an hour from each sent_at (PROTOCOL §5 check 9)
