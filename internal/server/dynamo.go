@@ -181,7 +181,9 @@ const (
 	accountIndex       = "account"
 )
 
-var ttlMs = uint64(protocol.TTL / time.Millisecond)
+// ttlMs is how long a message is kept after it was received, in ms: the
+// TTL less the hour the maker of a time-limited thing leaves (protocol.Retention).
+var ttlMs = uint64(protocol.Retention / time.Millisecond)
 
 func ms(t time.Time) uint64     { return uint64(t.UnixMilli()) }          //nolint:gosec // times after 1970
 func fromMs(v uint64) time.Time { return time.UnixMilli(int64(v)).UTC() } //nolint:gosec // decoded from our own keys

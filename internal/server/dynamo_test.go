@@ -587,25 +587,31 @@ func TestExpiredHeadersAreNotListed(t *testing.T) {
 	}
 }
 
-// The dedupe record spans the TTL: the same bytes sent again inside it get
-// the original receipt. Past it they cannot come back at all, since they
-// name a prekey that lives at most the TTL: it has expired, or been renewed.
-func TestResendAfterExpiryIsRefused(t *testing.T) {
+// The dedupe record spans the message's life, the TTL less the hour
+// (protocol.Retention): the same bytes sent again inside it get the original
+// receipt. Past it, while the prekey they name lasts, they are new mail,
+// which only the sender's pass can post and its reader drops by its hash
+// (PROTOCOL.md §5 check 9), and that copy's dedupe record answers in its
+// turn. No client of this protocol posts the same bytes twice: a retry is
+// sealed afresh (§4.5).
+func TestTheDedupeRecordSpansTheMessagesLife(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	sent := capture(e, "/v1/"+b.Address().String())
 	first := send(t, a, b, "once, then again")
 	e.setMiddle(nil)
-	e.clock.Add(protocol.TTL - time.Second)
+	e.clock.Add(protocol.Retention - time.Second)
 	again := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a))
 	var r protocol.Receipt
 	_ = json.Unmarshal(again.body, &r)
 	if again.status != http.StatusOK || r.ReceivedAt != first.ReceivedAt {
-		t.Fatalf("inside the TTL: %d %s", again.status, again.body)
+		t.Fatalf("inside its life: %d %s", again.status, again.body)
 	}
 	e.clock.Add(time.Second)
-	if late := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a)); late.code() != protocol.CodePrekeyExpired {
-		t.Fatalf("past the TTL: %d %s", late.status, late.body)
+	renewed := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a))
+	_ = json.Unmarshal(renewed.body, &r)
+	if renewed.status != http.StatusCreated || r.ReceivedAt == first.ReceivedAt {
+		t.Fatalf("past its life, inside the prekey's: %d %s", renewed.status, renewed.body)
 	}
 }
 

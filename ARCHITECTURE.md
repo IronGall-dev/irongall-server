@@ -51,7 +51,7 @@ flowchart LR
    - a call naming a box just registered, if it lands on another process before a read there sees the record, is answered `404`, and that process remembers the miss until the stream brings the record.
 5. **Applying a change twice, or late, is harmless:**
    - Messages are a **set** keyed by id: add if absent, remove if present.
-   - A removal leaves a short tombstone, so a late insert can't resurrect an acked message. An id can't legitimately come back within the TTL, because the dedupe record answers any resend.
+   - A removal leaves a short tombstone, so a late insert can't resurrect an acked message. An id can't legitimately come back within the message's life, the TTL less the hour, because the dedupe record answers any resend; past it, while the prekey it names lasts, the same bytes are new mail, which only the sender's pass can post and its reader drops by its hash.
    - Box records carry a revision number (`rev`), and a process only applies a newer one.
    - A count is the size of the set, never an incremented number, so it can't drift.
 6. **A process that can't prove it's current stops answering** (fail closed while unsynced).
@@ -80,7 +80,7 @@ type mark struct { // layer 1
 	tag  uint64 // first 8 bytes of HMAC-SHA-256 of the whole id, under a key this process made at random: what the mark is known by
 	id   uint64 // first 8 bytes of the message id, for the list's order within a millisecond only
 	from uint64 // first 8 bytes of the sender's address, for the per-pair cap
-	exp  uint64 // expiry in unix ms: received_at + the TTL (33 days), so it also gives the header's key (PROTOCOL-SERVER.md §7)
+	exp  uint64 // expiry in unix ms: received_at + the TTL less an hour (protocol.Retention), so it also gives the header's key (PROTOCOL-SERVER.md §7)
 	n    uint8  // fetches of it this process has served: a second one is a repeat (PROTOCOL.md §5.7); 40 B in all
 }
 
@@ -259,7 +259,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
   prekey-lifetime            how long each new prekey is valid for, in seconds: 33 days unless its owner sets less, down to a day and an hour (PROTOCOL §6.4)
   peers/<addr>/              the pinned identity document, the highest prekey serial and certificate serial seen, the last statement fetched.
                              Made on a send once the peer's prekey statement verified, and on a receive once a message from it passed every check
-  seen                       ciphertext hash, sent_at, from, msg_id: 33 days and an hour from each sent_at (PROTOCOL §5 check 9)
+  seen                       ciphertext hash, sent_at, from, msg_id: 66 days and an hour from each sent_at (PROTOCOL §5 check 9)
   seen-floor                 the highest cutoff a prune of seen dropped a line at: mail sent before it is stale
   outbox/                    each signed envelope line awaiting a receipt, and nothing else: a seal is made for each post and never kept
   outbox/failed/             entries that can never be delivered: refused for good, or older than 33 days
@@ -295,7 +295,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
    - Sign the envelope's line with the working key, in the recipient's namespace; put the signature after it, pad the two for the prekey's type so that the ciphertext is a whole number of blocks, and encrypt that with age to the prekey (`PROTOCOL.md` §4.3a, §4.4). The outbox keeps the signed line, and the seal is made for the post alone.
    - POST it with the prekey's two serials, its own and its certificate's (`prekey_serial` and `certificate_serial`, both required: the server takes mail only for the current prekey), carrying the box's pass.
    - On a receipt, keep the envelope and the receipt in `sent/`, and only then delete the outbox entry: a crash in between posts it again, as a new ciphertext the recipient delivers once. The echo box deletes its own: its state is in memory.
-   - A retry seals the envelope afresh, to what the box holds then (`PROTOCOL.md` §4.5): a message that waited goes under the recipient's statement in use, and a post whose answer was lost costs one more send. A failed entry never blocks the others; one that can never be delivered moves to `outbox/failed/`, and one older than 33 days, the TTL, is never posted (the server would take it; the recipient refuses it).
+   - A retry dates and seals the envelope afresh, to what the box holds then (`PROTOCOL.md` §4.5): a message that waited goes under the recipient's statement in use, and a post whose answer was lost costs one more send. A failed entry never blocks the others; one that can never be delivered moves to `outbox/failed/`, and one older than 33 days, the TTL, is never posted (the server would take it; the recipient refuses it).
 3. **Receive.**
    - Take the lock, list, and drain every page.
    - Skip ids already acked. Fetch the rest, and treat a 404 as already gone. A fetch answers the ciphertext alone, of the size its list entry gave; the sender, on the server's word, and the times are the entry's.
