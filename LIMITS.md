@@ -17,7 +17,7 @@ Every limit `irongalld` enforces, what it protects, who pays for it, when it is 
 
 | Limit | Flags | Paid by | What it bounds | When it is taken | Refused with |
 |---|---|---|---|---|---|
-| Polls | `-poll-burst`, `-poll-refill` | the box | every list without a cursor, and one whose cursor has nothing after it; an empty poll is answered from memory and still moves bytes | before the list | `429 rate_limited` |
+| Polls | `-poll-burst`, `-poll-refill` | the box | every list without a cursor, one answered `304` among them, and one whose cursor has nothing after it; an empty poll is answered from memory and still moves bytes | before the list, and before `If-None-Match` is read | `429 rate_limited` |
 | List pages after the first | from `-box-cap` and `-poll-refill` | the box | continuations of a drain, sized so a full box always drains. A page is a continuation only with the cursor this process handed the box last; any other cursor (made up, replayed, a retried page) is charged as a poll and answered all the same | before the page | `429 rate_limited` |
 | Repeat fetches | the poll's two flags | the box | a fetch of a message the box has fetched before | before the read | `429 refetch_spent` |
 | New mail taken out | `-drain-burst`, `-drain-refill` | the box | its first fetch of each held message: the bodies' bandwidth, however many boxes send to it. Only the box's own calls spend it; a client stops its drain there and the rest waits | reserved before memory counts the fetch, given back if it was not a first one | `429 fetch_paced` |

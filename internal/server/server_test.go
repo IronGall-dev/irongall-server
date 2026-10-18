@@ -468,7 +468,7 @@ func TestOwnerCalls(t *testing.T) {
 
 	empty := e.do("GET", r.path("/messages"), nil, pass)
 	e.want(empty, 200, "")
-	if string(bytes.TrimSpace(empty.body)) != `{"count":0,"messages":[],"next_cursor":null,"poll_after":60}` {
+	if string(bytes.TrimSpace(empty.body)) != `{"count":0,"messages":[],"next_cursor":null}` || empty.header.Get("Retry-After") != "60" {
 		t.Fatalf("empty list %s", empty.body)
 	}
 	e.want(e.do("GET", r.path("/messages?cursor=zzz"), nil, pass), 400, protocol.CodeBadRequest)

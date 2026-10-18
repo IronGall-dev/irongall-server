@@ -107,7 +107,7 @@ A set keyed by message id absorbs all three. The penciled Redis count cache was 
 - A stream insert updates a cached listing. For an uncached box, it only touches the marks.
 - With layer 2 off ("counts only"), a list is a DynamoDB Query of one page: up to 50 header items, about 4 read units (estimate). It reads only the live key range (`received_at` > now − TTL), so a header past its expiry that the TTL has not yet deleted is never read.
 - **Request-path reads are eventually consistent.** A stale read costs a retry or one poll: a page read just after a write can miss it while memory counts it, and a client lists at every poll, so the next one has it. The conditional writes keep the data right. **Only a box's load into memory is strongly consistent** (§ Startup).
-  - The list has no `ETag` and no `304` (`PROTOCOL.md` §5.1), which would carry no `poll_after`, so a poll of a box that holds mail is a Query of one page, capped by the poll rate and the page size. An empty box's poll is memory's count alone, either way.
+  - A first page's `ETag` is the hash of the page itself (`PROTOCOL-SERVER.md` §5.1), so a poll of a box that holds mail is a Query of one page whether or not it is answered `304`, capped by the poll rate and the page size. An empty box's poll is memory's count alone, either way.
 
 **The rest of each process's memory:**
 - the standing of every box this process has used: its state, its identity's public key, the SHA-256 and the serial of its current certificate, the record's rev, and what its identity revoked (the address, and the serial its certificates are revoked through). It is what a pass is checked against with no read (`PROTOCOL-SERVER.md` §6.1b);
@@ -123,7 +123,7 @@ That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go map
 
 | Call | Touches | Notes |
 |---|---|---|
-| Poll / list `GET …/messages` | The pass, from memory. Layer 1 for the count; the page from one DynamoDB Query (from layer 2 once it is built) | Empty: the empty page, built from the count alone. Every list response is a page, with `count`, up to 50 messages and `poll_after`, and no `ETag` (the delivery contract, decided; `PROTOCOL.md` §5.1) |
+| Poll / list `GET …/messages` | The pass, from memory. Layer 1 for the count; the page from one DynamoDB Query (from layer 2 once it is built) | Empty: the empty page, built from the count alone, or `304` to its `ETag`. Every list answer carries `Retry-After`, the poll interval, and a first page its `ETag`; a `200` is a page, with `count` and up to 50 messages (the delivery contract, decided; `PROTOCOL.md` §5.1) |
 | Fetch `GET …/messages/<id>` | Memory first: an id the box does not hold is `404` with no storage call, and a fetch of a message this process has served before takes from the box's allowance (`PROTOCOL.md` §5.7). Then DynamoDB GetItem of the message item by `box, id`, S3 Express GET | The answer is the ciphertext's bytes, `application/octet-stream`, and nothing else: who sent it and when are the list's. Memory can say a message is absent, never that it is there: the read decides. A live item whose body is gone leaves the list and is answered as gone |
 | Ack `DELETE …/messages/<id>` | Memory first, as for a fetch (an id not held is `404`); then S3 DELETE, then a conditional UpdateItem that removes `live` (`PROTOCOL-SERVER.md` §7) | Both steps are safe to repeat. Applied to local memory at once; the stream tells the others |
 | Send `POST /v1/<addr>/messages?prekey_serial=…&certificate_serial=…` | The sender's pass, before the body is read; its record for its account (the LRU, or one GetItem); GetItem (the dedupe check), S3 PUT, then one conditional PutItem: the header and the dedupe record are one item (`PROTOCOL-SERVER.md` §7) | Cheapest check first (`PROTOCOL.md` §4.5): the address and the serials in the query before the body, which is the ciphertext's bytes, read to the sender's cap; the caps read layer 1. No signature on the message is checked: it is inside the ciphertext |
@@ -150,7 +150,7 @@ sequenceDiagram
   P1->>A: 201 id, received_at, expires_at, and Location
   D-->>P2: stream record (about 1 to 2 s)
   B->>P2: GET /v1/B/messages
-  P2->>B: 200 with count, a page and poll_after
+  P2->>B: 200 with count and a page, its ETag and Retry-After
 ```
 
 ### Following the stream

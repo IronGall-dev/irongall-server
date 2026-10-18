@@ -152,3 +152,15 @@ func writeBody(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_, _ = w.Write(b.Bytes())
 }
+
+// jsonBytes is v as writeBody writes it: compact JSON, no HTML escaping, and
+// a line feed after it. A list's ETag is the hash of these bytes.
+func jsonBytes(v any) ([]byte, error) {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
+}

@@ -1,11 +1,14 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,12 +19,15 @@ import (
 const pageSize = 50
 
 // list is GET /v1/<address>/messages (PROTOCOL.md §5.1): metadata only,
-// oldest first, pages of 50. Every answer is a page, with the count and
-// poll_after: there is no ETag and no 304, which would carry neither. The
-// poll rate applies to every poll, empty ones included. A page after the
-// first is a continuation, not a poll, with an allowance of its own
-// (Limits.continuations); a cursor with nothing after it continues nothing,
-// so it is a poll. Only a list with something to return reads storage.
+// oldest first, pages of 50. Every answer is a page with the count, and
+// carries the poll interval in Retry-After; a first page carries its ETag
+// too, and a poll that sends it back is 304 while the page is unchanged
+// (writeList). The poll rate applies to every poll, empty ones and 304s
+// included, and is taken before the condition is read: a box that polls too
+// often is told 429, never 304. A page after the first is a continuation,
+// not a poll, with an allowance of its own (Limits.continuations); a cursor
+// with nothing after it continues nothing, so it is a poll. Only a list with
+// something to return reads storage.
 func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 	box, err := s.owner(r, cursorParam)
 	if err != nil {
@@ -46,7 +52,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 	// (IronGall-dev/irongall-server#5).
 	if more == 0 || !continues {
 		if ok, wait := s.polls.take(box.String(), s.now()); !ok {
-			return rateLimited(wait, "poll at most once a minute (poll_after)")
+			return rateLimited(wait, "poll at most once a minute (Retry-After)")
 		}
 	} else if ok, wait := s.pages.take(box.String(), s.now()); !ok {
 		return rateLimited(wait, "too many list pages at once")
@@ -55,9 +61,9 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	resp := protocol.MessageList{Count: int64(n), Messages: []protocol.MessageInfo{}, PollAfter: int64(s.limits.PollAfter)}
+	resp := protocol.MessageList{Count: int64(n), Messages: []protocol.MessageInfo{}}
 	if n == 0 || (after != nil && more == 0) {
-		writeJSON(w, http.StatusOK, resp)
+		s.writeList(w, r, resp, !hasCursor)
 		return nil
 	}
 	page, err := s.store.List(r.Context(), box, after, pageSize+1)
@@ -79,8 +85,51 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 			ExpiresAt:  formatTime(h.ExpiresAt),
 		})
 	}
-	writeJSON(w, http.StatusOK, resp)
+	s.writeList(w, r, resp, !hasCursor)
 	return nil
+}
+
+// writeList writes a list answer with the poll interval in Retry-After, as
+// RFC 9773 §4.3 uses the field. A first page carries an ETag: the first 16
+// bytes of the SHA-256 of its body, in hex. It is a strong validator that
+// every process computes alike with no key, and it changes with any message
+// that enters or leaves the page or the count. A page that holds mail cannot
+// be made to share an empty box's tag, the one a client keeps: that is a
+// second preimage of 128 bits. An If-None-Match that names it, compared weakly (RFC 9110
+// §13.1.2), is answered 304 with no body: its ETag, its Retry-After and the
+// headers every answer carries (RFC 9110 §15.4.5).
+func (s *Server) writeList(w http.ResponseWriter, r *http.Request, l protocol.MessageList, first bool) {
+	body, err := jsonBytes(l)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	h := w.Header()
+	h.Set("Retry-After", strconv.Itoa(s.limits.PollAfter))
+	if first {
+		sum := sha256.Sum256(body)
+		tag := `"` + hex.EncodeToString(sum[:16]) + `"`
+		h.Set("ETag", tag)
+		if etagMatch(r.Header.Get("If-None-Match"), tag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+	h.Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// etagMatch is If-None-Match's weak comparison (RFC 9110 §13.1.2): a tag a
+// proxy on the way marked weak still matches, and * matches any page.
+func etagMatch(header, etag string) bool {
+	for _, t := range strings.Split(header, ",") {
+		t = strings.TrimPrefix(strings.TrimSpace(t), "W/")
+		if t == etag || t == "*" {
+			return true
+		}
+	}
+	return false
 }
 
 // drains remembers, for each box with a drain open, the one next_cursor this

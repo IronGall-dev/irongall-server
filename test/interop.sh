@@ -20,7 +20,7 @@
 # Needs: go, bash ≥ 4, age, age-keygen, ssh-keygen, curl, jq, sha256sum, base64, od. Run from anywhere:
 #   test/interop.sh            SCRIPT=<path> overrides the irongall.sh it sources.
 # With IRONGALL_TEST_BOXES_TABLE, IRONGALL_TEST_MSGS_TABLE, IRONGALL_TEST_ACCOUNTS_TABLE and IRONGALL_TEST_BUCKET set, the server runs on those tables and
-# that bucket instead of --dev, with a throwaway server key: tables and a bucket kept for tests, never the ones a running server uses.
+# that bucket instead of --dev: tables and a bucket kept for tests, never the ones a running server uses.
 # For post-quantum script boxes where the packaged age is older than 1.3, put age ≥ 1.3 first in PATH:
 #   GOBIN=<dir> go install filippo.io/age/cmd/...@v1.3.2   (never under ulimit -v)
 # The work dir is a LITERAL path, so no rm -rf ever runs on a variable. It is left in place after the run.

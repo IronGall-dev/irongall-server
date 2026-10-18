@@ -187,8 +187,8 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal("the envelope is HTML-escaped")
 	}
 
-	// Acked: the box is empty, and its poll is a page as any other is, 200
-	// with poll_after: never a 304, which would carry no poll_after.
+	// Acked: the box is empty, and the client keeps the empty page's ETag;
+	// its next poll sends it back and is 304, the interval in Retry-After.
 	if res := receive(t, b); len(res.Delivered) != 0 {
 		t.Fatal("delivered twice")
 	}
@@ -200,9 +200,11 @@ func TestEndToEnd(t *testing.T) {
 			polls = append(polls, sw.status)
 		}
 	})
-	receive(t, b)
-	if len(polls) != 1 || polls[0] != http.StatusOK {
-		t.Fatalf("an empty poll got %v, want [200]", polls)
+	if res := receive(t, b); res.PollAfter != int64(DefaultLimits().PollAfter) {
+		t.Fatalf("a 304's interval is %d, want the Retry-After, %d", res.PollAfter, DefaultLimits().PollAfter)
+	}
+	if len(polls) != 1 || polls[0] != http.StatusNotModified {
+		t.Fatalf("an empty poll after an empty one got %v, want [304]", polls)
 	}
 	e.setMiddle(nil)
 
