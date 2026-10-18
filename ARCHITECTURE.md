@@ -21,7 +21,7 @@
 | Echo boxes | 2 | `irongall` clients with their own keys, one post-quantum and one X25519-only (`PROTOCOL.md` §10, decided), never inside the server |
 | AWS, managed | — | Three DynamoDB tables, boxes, messages and accounts, each with its stream on; the S3 Express One Zone directory bucket |
 | Edge | — | For irongall.dev today, Cloudflare (TLS) and its tunnel to one host; later an NLB on AWS |
-| The site | — | The site's pages (a front page, `llms.txt`, docs) are not this server's. A web server in front serves them and passes `/v1/` and `/to/` here |
+| The site | — | A deployment's pages (a front page, `llms.txt`, docs) are not in this repo: with `-site`, `irongalld` serves a directory of them at every path outside `/v1/` and `/to/` (`internal/server/site.go`) |
 | Redis | 0 | Penciled in for later, not needed for a while (§ The in-process plan, item 7) |
 
 ```mermaid
@@ -99,7 +99,7 @@ type Listing struct { // layer 2: optional, LRU under a byte budget
 - messages expire with no event at all.
 
 A set keyed by message id absorbs all three. The penciled Redis count cache was the same shape: a sorted set of id → expiry.
-- **A mark is known by a keyed tag, not by its id's first eight bytes.** The id is the SHA-256 of a ciphertext its sender chose, so those bytes are the sender's to steer: an id that only shared a held message's prefix passed for it, so a forged ack wrote to storage (this repo's #10). The tag is HMAC-SHA-256 of the whole id under a key each process makes at random when it starts, which nobody outside the process can compute; no tag leaves it. The same issue found that a box's version, the XOR of the prefixes, could be steered to an empty box's, which mattered while the list's `ETag` was made of it: since 2026-10-17 the list has no `ETag` and no `304`, and memory keeps no version.
+- **A mark is known by a keyed tag, not by its id's first eight bytes.** The id is the SHA-256 of a ciphertext its sender chose, so those bytes are the sender's to steer: an id that only shared a held message's prefix passed for it, so a forged ack wrote to storage (this repo's #10). The tag is HMAC-SHA-256 of the whole id under a key each process makes at random when it starts, which nobody outside the process can compute; no tag leaves it. The same issue found that a box's version, the XOR of the prefixes, could be steered to an empty box's, which mattered while the list's `ETag` was made of it: memory keeps no version since 2026-10-17, and the `ETag` a first page carries since 2026-10-18 is the hash of the page itself.
 - The same marks give the per-pair cap (`from`), so the poll needs nothing else.
 
 **How the listing layer stays honest:**
@@ -129,7 +129,7 @@ That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go map
 | Send `POST /v1/<addr>/messages?prekey_serial=…&certificate_serial=…` | The sender's pass, before the body is read; its record for its account (the LRU, or one GetItem); GetItem (the dedupe check), S3 PUT, then one conditional PutItem: the header and the dedupe record are one item (`PROTOCOL-SERVER.md` §7) | Cheapest check first (`PROTOCOL.md` §4.5): the address and the serials in the query before the body, which is the ciphertext's bytes, read to the sender's cap; the caps read layer 1. No signature on the message is checked: it is inside the ciphertext |
 | Register `PUT /v1/<addr>` | Four signature checks (the certificate and the statement under it, then the pass under it and the certificate again), then DynamoDB PutItem | The box is in use from this one write |
 | New prekey `PUT …/prekey` | The record (the LRU, or one GetItem), the same four checks, DynamoDB UpdateItem | The authority is the statement's own certificate and a pass under it: no pass under the box's current certificate is needed |
-| Read a box `GET /v1/<addr>` | The LRU; DynamoDB on a miss. A revoked box is `410` with the record it keeps | Never cached in front of the server: every API answer says `no-store` (`PROTOCOL-SERVER.md` §6.3, §12) |
+| Read a box `GET /v1/<addr>` | The LRU; DynamoDB on a miss. A revoked box is `410` with the record it keeps | Never cached in front of the server: every API answer says `no-store` (`PROTOCOL-SERVER.md` §6.3, §12). The one API answer gzipped, to a request that takes it (below) |
 | ACL `PUT …/acl` | The pass, the record (the LRU, or one GetItem), one conditional UpdateItem; then, only if memory shows the box holding mail and the deny list is not empty, one Query of the live index and the deletes of what it denies | Replaced whole, only by a higher version (`PROTOCOL-SERVER.md` §6.2) |
 | ACL `GET …/acl` | The pass, the record (the LRU, or one GetItem) | The record's ACL, or the open one of a box with none |
 
@@ -152,6 +152,17 @@ sequenceDiagram
   B->>P2: GET /v1/B/messages
   P2->>B: 200 with count and a page, its ETag and Retry-After
 ```
+
+**Compression: gzip, where it saves bytes for little CPU, and nowhere else** (`internal/server/compress.go`, `PROTOCOL.md` §4.1). A request that does not take gzip (RFC 9110 §12.5.3) gets none, and an answer that may be compressed says `Vary: Accept-Encoding` either way.
+
+| Answer | Compressed | Why |
+|---|---|---|
+| A box's read, `GET /v1/<addr>` `200` | Per answer, by Huffman coding alone, with a writer from a pool | Base64 in JSON, read before every post and for each sender in a drain. On reads of 1.6 KB and 4.1 KB (an X25519 and a post-quantum prekey) it saves 24% and 27% in about 9 and 13 µs; levels 1 to 6 save at most 2% of the read more in 1.5 to 1.7 times the time, since base64 holds almost no repeats, and a new writer per answer costs more than the coding (2026-10-18) |
+| A site's text: HTML, plain text, Markdown, SVG | Once at start, at the best level, when that is smaller | No CPU per answer. Each gzip has its own `ETag`, and a range is of its bytes, which is how `http.ServeContent` asks for compression to be done; it then leaves a whole answer's `Content-Length` to `net/http` |
+| A list or a poll | Never | A `304` has no body and an empty page is 45 bytes; a page puts what senders chose beside the box's own values, the shape of BREACH (RFC 7457 §2.6) |
+| A fetch | Never | Age ciphertext does not compress (§ Storage) |
+| Errors, an owner's reads, the link page, a site's images | Never | A few hundred bytes, or compressed already, or seldom asked for |
+
 
 ### Following the stream
 - **Nothing is kept across restarts.** A restart starts with empty memory, loads each box on its first use (§ Startup), and follows the streams from then on. A follower that loses its place (more than the stream's 24 hours behind, an iterator that expired before it read anything, the stream gone) exits the process, and the restart rebuilds.
@@ -218,7 +229,7 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
 - a stream on each, with `NEW_IMAGE`;
 - a `rev` on box items.
 
-**No compression.** Bodies are age ciphertext, which doesn't compress. Measured with age 1.3.2, best of gzip -9, zstd -19 and xz -9, on messages as they were before padding and the signature inside (2026-10-10; the sizes have changed since, what compresses has not):
+**Bodies are not compressed.** They are age ciphertext, which doesn't compress. Measured with age 1.3.2, best of gzip -9, zstd -19 and xz -9, on messages as they were before padding and the signature inside (2026-10-10; the sizes have changed since, what compresses has not):
 
 | Message | Stored | Best compressed |
 |---|---|---|

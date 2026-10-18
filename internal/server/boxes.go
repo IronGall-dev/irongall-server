@@ -384,7 +384,8 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 // address is 410 with its record, which proves itself: a client takes
 // "revoked" on nothing less, and needs no second call for it. A deleted box,
 // and an address with no box whose identity revoked certificates, are 404.
-// Like every lookup it takes a pass or none (spendLookup).
+// Like every lookup it takes a pass or none (spendLookup). It is the one
+// answer of the API that is gzipped, to a request that takes it.
 func (s *Server) getBox(w http.ResponseWriter, r *http.Request) error {
 	if err := s.spendLookup(r); err != nil {
 		return err
@@ -402,7 +403,7 @@ func (s *Server) getBox(w http.ResponseWriter, r *http.Request) error {
 	case !b.open():
 		return noSuchMailbox
 	}
-	writeJSON(w, http.StatusOK, protocol.BoxResponse{
+	writeJSONCompressed(w, r, protocol.BoxResponse{
 		Identity: b.Identity, Prekey: b.Statement, PrekeySignature: b.Signature, SenderKeyTypes: b.SenderKeyTypes,
 		RevokedCertificates: b.RevokedCerts, RevokedCertificatesSignature: b.RevokedCertsSig,
 	})
