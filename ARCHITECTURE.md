@@ -251,11 +251,12 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
 ~/.config/irongall/<name>/   0700, never the working directory; a .gitignore of * makes it ignore itself
   identity, identity.pub     an OpenSSH key file, which ssh-keygen reads directly: Ed25519, unless the box was made on another type
   identity.doc, address      the identity document and its hex SHA-256
-  prekeys/<serial>.agekey    age identities, each with its signed statement (.txt, .txt.sig); the current one and the newest retired one are kept, older retired ones deleted after an emptying drain an hour on (Go client), or at not_after + 33 days at the latest (PROTOCOL Terms, §6.4)
+  prekeys/<serial>.agekey    age identities, each with its signed statement (.txt, .txt.sig) and when it was signed (.made, which renewals and deletions are timed by); the current one and the newest retired one are kept, older retired ones deleted after an emptying drain an hour on (Go client), or at not_after + 33 days at the latest (PROTOCOL Terms, §6.4)
   work/<serial>              the working key made with that prekey, its .pub and its certificate -cert.pub, as ssh-keygen names them (PROTOCOL §2b).
                              The one made with the prekey published last signs mail and passes; older ones are deleted when a newer prekey is published
   pass                       0600: the Authorization value last signed, sent on every call until it is about to run out (PROTOCOL §6.1b)
   serial                     the highest prekey serial this box published: a renewal refuses a served serial below it
+  prekey-lifetime            how long each new prekey is valid for, in seconds: 33 days unless its owner sets less, down to a day and an hour (PROTOCOL §6.4)
   peers/<addr>/              the pinned identity document, the highest prekey serial and certificate serial seen, the last statement fetched.
                              Made on a send once the peer's prekey statement verified, and on a receive once a message from it passed every check
   seen                       ciphertext hash, sent_at, from, msg_id: 33 days (PROTOCOL §5)
