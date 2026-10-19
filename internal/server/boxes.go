@@ -204,21 +204,36 @@ func (s *Server) take(b *Box, statement, sig []byte, p *protocol.Prekey, cert *p
 }
 
 // checkPrekey verifies a prekey statement: signed by a working key under a
-// certificate of the identity that is valid now, and one that could be
-// published now, not expired and ending at most protocol.MaxPrekeyLifetime
-// from now, which is an hour past what a client asks for. It returns the
-// certificate too.
+// certificate of the identity that is valid now and began at least
+// protocol.PassLifetime before now, and one that could be published now, not
+// expired and ending at most protocol.MaxPrekeyLifetime from now, which is an
+// hour past what a client asks for. It returns the certificate too.
+//
+// A certificate is taken only once it has begun by the clock of every box
+// this server takes, and so of every reader of the mail signed under it: a
+// box whose clock is less than PassLifetime behind this one (PROTOCOL.md §0).
+// A client dates a certificate from MaxSkew before it makes it, so one made
+// by a clock this server takes a pass from has always begun that long.
 //
 // A refusal for a time states what this clock reads: a client makes its
 // certificate and its statement with an hour of room (PROTOCOL.md §0), so
 // one of these is nearly always the caller's clock, and a new statement
 // signed by the same clock would be refused the same way.
 func (s *Server) checkPrekey(id *protocol.Identity, statement, sig []byte) (*protocol.Prekey, *protocol.Certificate, error) {
-	const ahead = "this machine's clock reads more than an hour ahead of the server's: check it, then irongall init for a new box, irongall prekey renew for one in use"
+	const (
+		check   = ": check it, then irongall init for a new box, irongall prekey renew for one in use"
+		early   = "a certificate starts an hour before it is made, and a server takes one once it has begun for every box it takes, 10 minutes before its own clock, so this machine's clock reads more than 50 minutes ahead of the server's" + check
+		tooLong = "a client signs a prekey for 33 days, so this machine's clock reads more than an hour ahead of the server's" + check
+	)
 	p, cert, err := protocol.VerifyPrekey(id, statement, sig, s.now())
+	if err == nil {
+		if began, berr := protocol.CertificateBegan(sig); berr != nil || began.After(s.now().Add(-protocol.PassLifetime)) {
+			err = protocol.ErrCertificateNotBegun
+		}
+	}
 	switch {
 	case errors.Is(err, protocol.ErrCertificateNotBegun):
-		return nil, nil, failErr(protocol.CodePrekeyTime, "a certificate starts an hour before it is made, so "+ahead, err)
+		return nil, nil, failErr(protocol.CodePrekeyTime, early, err)
 	case errors.Is(err, protocol.ErrCertificateTime):
 		return nil, nil, failErr(protocol.CodePrekeyTime, "sign a new prekey statement: irongall prekey renew", err)
 	case err != nil:
@@ -228,7 +243,7 @@ func (s *Server) checkPrekey(id *protocol.Identity, statement, sig []byte) (*pro
 		if p.Expired(s.now()) {
 			return nil, nil, failErr(protocol.CodePrekeyTime, "sign a new prekey statement: irongall prekey renew", err)
 		}
-		return nil, nil, failErr(protocol.CodePrekeyTime, "a client signs a prekey for 33 days, so "+ahead, err)
+		return nil, nil, failErr(protocol.CodePrekeyTime, tooLong, err)
 	}
 	return p, cert, nil
 }

@@ -33,7 +33,7 @@ func (e *env) skewed(off *time.Duration) client.Options {
 // it and is delivered, its own mail is delivered, and it renews.
 func TestABoxWhoseClockIsOffByLessThanThePassAllows(t *testing.T) {
 	ctx := context.Background()
-	for _, off := range []time.Duration{-9 * time.Minute, -2 * time.Minute, -time.Second, time.Second, 2 * time.Second, 30 * time.Second, 3 * time.Minute, 49 * time.Minute} {
+	for _, off := range []time.Duration{-9 * time.Minute, -2 * time.Minute, -time.Second, time.Second, 2 * time.Second, 30 * time.Second, 3 * time.Minute, 49 * time.Minute, 50 * time.Minute} {
 		e := newEnv(t, relaxed())
 		b, err := client.Init(ctx, t.TempDir(), e.skewed(&off), protocol.Classic)
 		if err != nil {
@@ -85,8 +85,11 @@ func TestTheTwoClocksFurthestApart(t *testing.T) {
 	}
 }
 
-// Further off, the box is refused, and the client says in its own words what
-// the server dates its answer, beside its own clock: the server's words are
+// Further off, the box is refused: more than 50 minutes ahead, for its
+// certificate, before its pass is read, since that certificate would not have
+// begun for a reader 10 minutes slow, a clock this server takes. The client
+// says in its own words what the server dates its answer, beside its own
+// clock: the server's words are
 // not shown (PROTOCOL.md §13), and the date on every answer is how the server
 // says what its clock reads.
 // A box that cannot register leaves nothing in the way of registering once
@@ -99,8 +102,8 @@ func TestABoxWhoseClockIsTooFarOffIsRefusedAndTold(t *testing.T) {
 		says []string
 	}{
 		{-11 * time.Minute, protocol.CodePassExpired, []string{"as not valid at its clock", "11m0s behind that", "10 minutes or more behind its own"}},
-		{51 * time.Minute, protocol.CodePassExpired, []string{"as not valid at its clock", "51m0s ahead of that", "more than 50 ahead"}},
-		{61 * time.Minute, protocol.CodePrekeyTime, []string{"not valid at its clock", "1h1m0s ahead of that", "more than an hour ahead of it"}},
+		{51 * time.Minute, protocol.CodePrekeyTime, []string{"not valid at its clock", "51m0s ahead of that", "made by a clock more than 50 ahead"}},
+		{61 * time.Minute, protocol.CodePrekeyTime, []string{"not valid at its clock", "1h1m0s ahead of that", "made by a clock more than 50 ahead"}},
 	} {
 		e := newEnv(t, relaxed())
 		off, dir := c.off, t.TempDir()

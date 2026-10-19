@@ -187,9 +187,10 @@ func TestARememberedPassEndsWithItsCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 	unix := uint64(now.Unix()) //nolint:gosec // a test clock
-	// A certificate with five minutes left, and a prekey that ends with it.
+	// A certificate with five minutes left, begun the ten minutes a server
+	// asks of one, and a prekey that ends with it.
 	c := &ssh.Certificate{Key: work.PublicKey(), Serial: 1, CertType: ssh.UserCert, KeyId: protocol.CertificateKeyID,
-		ValidPrincipals: []string{r.id.Address().String()}, ValidAfter: unix - 60, ValidBefore: unix + 300}
+		ValidPrincipals: []string{r.id.Address().String()}, ValidAfter: unix - uint64(protocol.PassLifetime/time.Second), ValidBefore: unix + 300}
 	if err := c.SignCert(rand.Reader, r.signer); err != nil {
 		t.Fatal(err)
 	}
