@@ -268,19 +268,17 @@ func TestTheIdentitysActsAreCountedApart(t *testing.T) {
 	l := relaxed()
 	l.CertificatesPerDay, l.CertificateRevocationsPerDay = 1, 1
 	e := newEnv(t, l)
-	now := e.clock.Now()
-	e.clock.Add(now.Truncate(24 * time.Hour).Add(25 * time.Hour).Sub(now)) // 01:00 UTC, far from a day's end
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
 	until := e.clock.Now().Add(protocol.PrekeyLifetime)
 	r.prekey(5, until, nil)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(5), r.pass(5)), http.StatusOK, "") // the day's one certificate
 	r.prekey(6, until, nil)
-	e.want(e.do("PUT", r.path("/prekey"), r.upload(6), r.pass(6)), http.StatusTooManyRequests, protocol.CodeCertificatesSpent)
+	e.limited(e.do("PUT", r.path("/prekey"), r.upload(6), r.pass(6)), protocol.QuotaCertificates)
 	e.want(e.do("PUT", r.path("/revocations"), r.certs(5), ""), http.StatusOK, "") // the day's one raise, which no certificate spent
-	e.want(e.do("PUT", r.path("/revocations"), r.certs(7), ""), http.StatusTooManyRequests, protocol.CodeCertificateRevocationsSpent)
+	e.limited(e.do("PUT", r.path("/revocations"), r.certs(7), ""), protocol.QuotaCertificateRevocations)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(6), r.pass(6)), http.StatusOK, "") // replaces certificate 5, which is revoked
 	r.prekey(8, until, nil)
-	e.want(e.do("PUT", r.path("/prekey"), r.upload(8), r.pass(8)), http.StatusTooManyRequests, protocol.CodeCertificatesSpent) // 6 is not revoked
+	e.limited(e.do("PUT", r.path("/prekey"), r.upload(8), r.pass(8)), protocol.QuotaCertificates) // 6 is not revoked
 	rev, err := protocol.SignRevocation(r.signer, r.id.Address())
 	if err != nil {
 		t.Fatal(err)
@@ -300,8 +298,6 @@ func TestATakerCannotHoldTheRemedyBack(t *testing.T) {
 	l.CallBurst, l.CallRefill = DefaultLimits().CallBurst, DefaultLimits().CallRefill
 	l.CertificatesPerDay, l.CertificateRevocationsPerDay = 1, 1
 	e := newEnv(t, l)
-	now := e.clock.Now()
-	e.clock.Add(now.Truncate(24 * time.Hour).Add(25 * time.Hour).Sub(now)) // 01:00 UTC, far from a day's end
 	r, other := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
 	until := e.clock.Now().Add(protocol.PrekeyLifetime)
 	r.prekey(1000, until, nil)
@@ -346,7 +342,7 @@ func TestFailedPassesAreCountedPerCaller(t *testing.T) {
 func TestAReservationWaitsForOthersInFlight(t *testing.T) {
 	now := time.Now()
 	clock := func() time.Time { return now }
-	bs := newBuckets(1, time.Hour)
+	bs := newBuckets("test", 1, time.Hour)
 	first, ok, _ := bs.reserve(context.Background(), "k", clock)
 	if !ok {
 		t.Fatal("the first reservation was refused")

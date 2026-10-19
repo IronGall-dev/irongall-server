@@ -64,10 +64,10 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	if cur, ok := s.store.Known(h); ok && settled(cur) {
 		return s.registered(w, r, id, cur, &req)
 	}
-	if ok, wait := s.regs.take(ipKey(s.clientIP(r)), s.now()); !ok {
-		return rateLimited(wait, "too many registrations from this address")
+	if err := s.spendRegistration(r, ""); err != nil {
+		return err
 	}
-	// The count just taken bounds what follows: no count of misses is needed.
+	// The counts just taken bound what follows: no count of misses is needed.
 	p, cert, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
 	if err != nil {
 		return err
@@ -349,33 +349,44 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	if err := s.checkPass(r, h, key, under, nil); err != nil {
 		return err
 	}
-	if err := s.spendOwner(r.Context(), h); err != nil {
-		return err
-	}
 	// A renewal under the box's current certificate counts against the
 	// box's renewals; one under a later certificate is its identity's act,
 	// counted apart, so whoever holds the current working key and spends the
-	// day's renewals does not hold back the identity's. One while the box's
-	// current certificate is revoked is not counted: it replaces what the
-	// identity revoked, each raise of which is counted (revoke). Let's
-	// Encrypt's exemption is broader: PRECEDENTS.md in the client repo.
-	now := s.now()
-	count, limit, code, what := &s.renewals, s.limits.RenewalsPerDay, protocol.CodeRenewalsSpent, "this box has renewed its prekey %d times today"
-	if cert.Serial() > b.CertSerial {
-		count, limit, code, what = &s.certs, s.limits.CertificatesPerDay, protocol.CodeCertificatesSpent, "this box's identity has certified %d new working keys today"
+	// renewals does not hold back the identity's. One while the box's current
+	// certificate is revoked is not counted: it replaces what the identity
+	// revoked, each raise of which is counted (revoke). Let's Encrypt's
+	// exemption is broader: PRECEDENTS.md in the client repo. The count is
+	// read with the box's calls, so a refusal of either gives the longer wait
+	// (longest).
+	var count []perDay
+	switch {
+	case cert.Serial() == b.CertSerial:
+		count = []perDay{s.renewalsADay()}
+	default:
 		if replaces, err := b.listed(b.CertSerial); err != nil {
 			return err
-		} else if replaces {
-			limit = 0 // never limits, and nothing is taken to give back
+		} else if !replaces {
+			count = []perDay{s.certificatesADay()}
 		}
 	}
-	if ok, wait := count.take(h, now, limit); !ok {
-		return spent(code, wait, what, limitValue(limit))
+	if err := s.spendOwner(r.Context(), h, count...); err != nil {
+		return err
+	}
+	now := s.now()
+	var counted *reservation // nil, so kept and given back as nothing, when the renewal is not counted
+	if len(count) > 0 {
+		var ok bool
+		var wait time.Duration
+		if counted, ok, wait = count[0].bs.reserve(r.Context(), h.String(), s.now); !ok {
+			return count[0].refusal(wait)
+		}
 	}
 	stored := false
 	defer func() {
-		if !stored {
-			count.give(h, now, limit)
+		if stored {
+			counted.keep()
+		} else {
+			counted.release(s.now())
 		}
 	}()
 	if err := s.take(b, req.Prekey, req.PrekeySignature, p, cert, req.SenderKeyTypes, now); err != nil {
@@ -432,6 +443,9 @@ func (s *Server) getBox(w http.ResponseWriter, r *http.Request) error {
 // a client that lists this server as one of its revocation servers. It takes
 // no pass, as the PUT beside it takes none.
 func (s *Server) getRevocations(w http.ResponseWriter, r *http.Request) error {
+	if p := s.spendRequest(r); p != nil {
+		return p
+	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -490,6 +504,9 @@ const (
 // Everything else in the body is checked before anything is changed, and a
 // check that fails counts against the caller's address (s.miss).
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
+	if p := s.spendRequest(r); p != nil {
+		return p
+	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -550,8 +567,8 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	if b == nil {
-		if ok, wait := s.regs.take(ipKey(s.clientIP(r)), s.now()); !ok {
-			return rateLimited(wait, "too many registrations from this address: keeping a revocation of an address this server holds nothing of is counted as one")
+		if err := s.spendRegistration(r, ": keeping a revocation of an address this server holds nothing of is counted as one"); err != nil {
+			return err
 		}
 	}
 	m, err := s.miss(r)
@@ -572,29 +589,30 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	m.release(s.now())
-	now := s.now()
 	rv := &Revocations{Identity: req.Identity}
 	status, raised := http.StatusOK, false
 	if certs != nil && (held == nil || certs.Through > held.Through) {
 		rv.Certs, rv.CertsSig, rv.Through, raised = req.RevokedCertificates, req.RevokedCertificatesSignature, certs.Through, true
 	}
+	var raise *reservation // nil, so kept and given back as nothing, unless a raise alone is counted
 	if req.Revocation != nil {
 		rv.Address, status = req.Revocation, http.StatusCreated
 	} else if raised {
-		if ok, wait := s.raises.take(h, now, s.limits.CertificateRevocationsPerDay); !ok {
-			return spent(protocol.CodeCertificateRevocationsSpent, wait, "this box's identity has raised its revocation of certificates %d times today", limitValue(s.limits.CertificateRevocationsPerDay))
+		var ok bool
+		var wait time.Duration
+		if raise, ok, wait = s.raises.reserve(r.Context(), h.String(), s.now); !ok {
+			return s.raisesADay().refusal(wait)
 		}
 	}
 	if raised || req.Revocation != nil {
 		if err := s.store.Revoke(r.Context(), h, rv); err != nil {
-			if raised && req.Revocation == nil {
-				s.raises.give(h, now, s.limits.CertificateRevocationsPerDay)
-			}
+			raise.release(s.now())
 			if errors.Is(err, ErrStale) {
 				return fail(protocol.CodeBoxChanged, "retry", "the box changed during the request")
 			}
 			return err
 		}
+		raise.keep()
 	}
 	// Once the address is revoked: mail that arrived around the write is
 	// never served, this deletes it sooner than its expiry would, and then

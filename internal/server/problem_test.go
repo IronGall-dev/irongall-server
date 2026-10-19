@@ -34,13 +34,20 @@ func TestAnErrorsValuesAreMembers(t *testing.T) {
 			t.Errorf("%s: %+v, want %s with limit %d, which its detail names", what, p, code, want)
 		}
 	}
+	quotaIs := func(what string, p protocol.Problem, q protocol.Quota) {
+		t.Helper()
+		if p.Code != protocol.CodeRateLimited || p.QuotaID != q || p.Subject != q.Subject() {
+			t.Errorf("%s: %+v, want rate_limited naming %s, counted against %s", what, p, q, q.Subject())
+		}
+	}
 
 	_, err := a.Send(ctx, b.Address(), strings.Repeat("x", l.MaxSize+1))
 	limitIs("a send over the cap", problem(err), protocol.CodeTooLarge, l.MaxSize)
 
 	send(t, a, b, "1")
 	_, err = a.Send(ctx, b.Address(), "2")
-	limitIs("a send past the day's", problem(err), protocol.CodeSendsSpent, l.SendsPerDay)
+	limitIs("a send past the day's", problem(err), protocol.CodeRateLimited, l.SendsPerDay)
+	quotaIs("a send past the day's", problem(err), protocol.QuotaSends)
 
 	r := e.raw()
 	r.prekey(1, e.clock.Now().Add(protocol.PrekeyLifetime), nil)

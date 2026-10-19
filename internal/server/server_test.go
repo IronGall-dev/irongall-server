@@ -43,6 +43,30 @@ func (r reply) code() protocol.Code {
 	return p.Code
 }
 
+// quota is the limit a rate_limited answer names, and whom it says that
+// limit counted the call against.
+func (r reply) quota() (protocol.Quota, protocol.Subject) {
+	var p protocol.Problem
+	_ = json.Unmarshal(r.body, &p)
+	return p.QuotaID, p.Subject
+}
+
+// limited checks that r is a 429 rate_limited naming the limit q, counted
+// against q's subject.
+func (e *env) limited(r reply, q protocol.Quota) {
+	e.t.Helper()
+	e.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
+	if got, by := r.quota(); got != q || by != q.Subject() {
+		e.t.Fatalf("got the limit %q counted against %q, want %q: %s", got, by, q, r.body)
+	}
+}
+
+// limitedBy reports whether err is a rate_limited naming the limit q.
+func limitedBy(err error, q protocol.Quota) bool {
+	var ae *client.APIError
+	return errors.As(err, &ae) && ae.Problem.Code == protocol.CodeRateLimited && ae.Problem.QuotaID == q
+}
+
 // sealed is a send as the server reads one (PROTOCOL.md §4.5): the
 // ciphertext, which is the body, and the serials of the prekey it is sealed
 // to, which are the query.
@@ -1090,8 +1114,8 @@ func TestSendNamesTheCurrentPrekey(t *testing.T) {
 	}
 }
 
-// A box renews its prekey at most RenewalsPerDay times a UTC day, then is
-// told to wait for the next one; an identical retry of the current statement
+// A box renews its prekey RenewalsPerDay times at once, then is told to wait
+// for the next, which comes back a day divided by that number later; an identical retry of the current statement
 // is not a renewal. Its record keeps only the RetiredKept newest retired
 // prekeys, so a box that renews often cannot grow it.
 func TestRenewalLimits(t *testing.T) {
@@ -1103,8 +1127,6 @@ func TestRenewalLimits(t *testing.T) {
 	l.RenewalsPerDay, l.CertificatesPerDay, l.RetiredKept = 3, 3, 2
 	e := newEnv(t, l)
 	ctx := context.Background()
-	now := e.clock.Now()
-	e.clock.Add(now.Truncate(24 * time.Hour).Add(25 * time.Hour).Sub(now)) // 01:00 UTC, far from a day's end
 	b := e.box(protocol.Classic)
 	var renewed []uint64
 	for i := range 3 {
@@ -1116,8 +1138,8 @@ func TestRenewalLimits(t *testing.T) {
 	}
 	_, err := b.Rekey(ctx, "")
 	var ae *client.APIError
-	if !errors.As(err, &ae) || ae.Problem.Code != protocol.CodeCertificatesSpent || ae.RetryAfter != 23*time.Hour {
-		t.Fatalf("a fourth renewal in a day: %v", err)
+	if !limitedBy(err, protocol.QuotaCertificates) || !errors.As(err, &ae) || ae.RetryAfter != 8*time.Hour || ae.Problem.Limit == nil || *ae.Problem.Limit != 3 {
+		t.Fatalf("a fourth renewal at once, of three a day: %v", err)
 	}
 	cur, _ := e.store.Box(ctx, b.Address())
 	e.want(e.do("PUT", "/v1/"+b.Address().String()+"/prekey", protocol.PrekeyRequest{Prekey: cur.Statement, PrekeySignature: cur.Signature}, e.pass(b)), 200, "")
@@ -1135,9 +1157,13 @@ func TestRenewalLimits(t *testing.T) {
 			t.Fatalf("retired[%d] is not prekey %s: the newest are not the ones kept", i, serial)
 		}
 	}
-	e.clock.Add(23 * time.Hour)
+	e.clock.Add(8*time.Hour - time.Second)
+	if _, err := b.Rekey(ctx, ""); !limitedBy(err, protocol.QuotaCertificates) {
+		t.Fatalf("a renewal a second before the next comes back: %v", err)
+	}
+	e.clock.Add(time.Second)
 	if _, err := b.Rekey(ctx, ""); err != nil {
-		t.Fatalf("a renewal the next day: %v", err)
+		t.Fatalf("a renewal once the next came back: %v", err)
 	}
 }
 

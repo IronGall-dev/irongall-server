@@ -447,8 +447,6 @@ func TestTheRemedyRenewsWhenATakerSpentTheDaysRenewals(t *testing.T) {
 	l.RenewalsPerDay = DefaultLimits().RenewalsPerDay
 	l.CertificatesPerDay = DefaultLimits().CertificatesPerDay
 	e := newEnv(t, l)
-	now := e.clock.Now()
-	e.clock.Add(now.Truncate(24 * time.Hour).Add(25 * time.Hour).Sub(now)) // 01:00 UTC, far from a day's end
 	a := e.box(protocol.Classic)
 	taken := worker(t, a)
 	_, inUse := e.numbers(a.Address())
@@ -467,7 +465,7 @@ func TestTheRemedyRenewsWhenATakerSpentTheDaysRenewals(t *testing.T) {
 	for i := range l.RenewalsPerDay {
 		e.want(thief(inUse+uint64(i)+1), 200, "")
 	}
-	e.want(thief(inUse+uint64(l.RenewalsPerDay)+1), 429, protocol.CodeRenewalsSpent) // the taker is out of renewals
+	e.limited(thief(inUse+uint64(l.RenewalsPerDay)+1), protocol.QuotaRenewals) // the taker is out of renewals
 	r, err := a.RenewAndRevoke(ctx, protocol.Classic)
 	if err != nil || r == nil || r.NotRenewed != nil || r.Prekey == nil || r.Revoked == nil || !r.Revoked.Revokes(inUse) || r.Revoked.Revokes(r.Below) {
 		t.Fatalf("the owner's remedy after the taker's renewals: %+v, %v", r, err)

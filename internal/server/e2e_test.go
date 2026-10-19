@@ -55,6 +55,7 @@ func relaxed() Limits {
 	l := DefaultLimits()
 	l.SendsPerDay, l.PollBurst, l.RegistrationsPerHour, l.RenewalsPerDay, l.MissesPerMinute = 0, 0, 0, 0, 0
 	l.ReceiveBurst, l.DrainBurst, l.CallBurst, l.CertificatesPerDay, l.CertificateRevocationsPerDay = 0, 0, 0, 0, 0
+	l.RangeRegistrationsPerHour, l.RequestBurst = 0, 0
 	return l
 }
 
@@ -439,7 +440,7 @@ func TestLimits(t *testing.T) {
 		a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 		send(t, a, b, "1")
 		send(t, a, b, "2")
-		if _, err := a.Send(ctx, b.Address(), "3"); client.Code(err) != protocol.CodeSendsSpent {
+		if _, err := a.Send(ctx, b.Address(), "3"); !limitedBy(err, protocol.QuotaSends) {
 			t.Fatalf("third send: %v", err)
 		}
 	})

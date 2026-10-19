@@ -1,8 +1,13 @@
 package server
 
 import (
+	"cmp"
+	"maps"
 	"net"
 	"net/http"
+	"slices"
+	"strconv"
+	"strings"
 )
 
 // The operator's interface: commands for whoever runs this server, never
@@ -11,33 +16,85 @@ import (
 // listener, so nothing that reaches the API reaches it.
 
 // ClearAddress forgets what the limits keyed by a caller's address hold of
-// ip: its misses, its registrations and its sends before their pass, each bucket full again as if the address had never been
-// seen. ip is an IPv4 address or any IPv6 address of a /64, which is how the
-// limits key a caller (ipKey). It returns that key and the names of the
-// limits that held anything of it, and false if ip is no address.
+// ip: its misses, its registrations, by its IPv4 address or IPv6 /64 and by
+// its IPv6 /48, its sends before their pass and its calls with no pass, each
+// bucket full again as if the address had never been seen. ip is an IPv4
+// address or any IPv6 address of a /64, which is how the limits key a caller
+// (ipKey). It returns that key and the names of the limits that held
+// anything of it, and false if ip is no address.
 func (s *Server) ClearAddress(ip string) (key string, cleared []string, ok bool) {
 	if net.ParseIP(ip) == nil {
 		return "", nil, false
 	}
 	key, now := ipKey(ip), s.now()
 	for _, l := range []struct {
-		name string
-		bs   *buckets
+		bs  *buckets
+		key string
 	}{
-		{"misses", s.misses},
-		{"registrations", s.regs},
-		{"sends", s.sendIPs},
+		{s.misses, key},
+		{s.regs, key},
+		{s.rangeRegs, rangeKey(ip)},
+		{s.sendIPs, key},
+		{s.requests, key},
 	} {
-		if l.bs.clear(key, now) {
-			cleared = append(cleared, l.name)
+		if l.key != "" && l.bs.clear(l.key, now) {
+			cleared = append(cleared, l.bs.name)
 		}
 	}
 	return key, cleared, true
 }
 
-// AdminHandler is the operator's interface: POST /limits/clear?ip=<address>
-// answers {"address":"<the key cleared>","cleared":[<the limits that held
-// anything of it>]} (ClearAddress).
+// limitsByName are the server's limits, each by its name: the quota a
+// rate_limited names, or the code its refusal has of its own.
+func (s *Server) limitsByName() map[string]*buckets {
+	m := map[string]*buckets{}
+	for _, bs := range []*buckets{s.polls, s.pages, s.repeats, s.regs, s.rangeRegs, s.sendIPs, s.misses, s.requests, s.calls, s.receives, s.drained, s.sends, s.renewals, s.certs, s.raises} {
+		m[bs.name] = bs
+	}
+	return m
+}
+
+// Indebted is a key a limit holds, and how long until its bucket is full
+// again: the deeper in debt, the longer.
+type Indebted struct {
+	Key    string `json:"key"`
+	FullIn int64  `json:"full_in"` // seconds, rounded up
+}
+
+// Top returns, for the limit named name, the n keys it holds deepest in debt
+// now, deepest first: which boxes or addresses spend it most. It reads memory
+// and keeps nothing (IronGall-dev/irongall-server#59). ok is false for a
+// name that is no limit's.
+func (s *Server) Top(name string, n int) (top []Indebted, ok bool) {
+	bs, ok := s.limitsByName()[name]
+	if !ok {
+		return nil, false
+	}
+	now := s.now()
+	bs.mu.Lock()
+	for k, full := range bs.full {
+		if full.After(now) {
+			top = append(top, Indebted{k, int64(retrySeconds(full.Sub(now)))})
+		}
+	}
+	bs.mu.Unlock()
+	slices.SortFunc(top, func(a, b Indebted) int { return cmp.Or(cmp.Compare(b.FullIn, a.FullIn), cmp.Compare(a.Key, b.Key)) })
+	if len(top) > n {
+		top = top[:n]
+	}
+	return top, true
+}
+
+// topDefault and topMost bound how many keys limits top lists.
+const topDefault, topMost = 20, 1000
+
+// AdminHandler is the operator's interface:
+//   - POST /limits/clear?ip=<address> answers {"address":"<the key
+//     cleared>","cleared":[<the limits that held anything of it>]}
+//     (ClearAddress);
+//   - GET /limits/top?limit=<name>&n=<count> answers {"limit":"<name>",
+//     "keys":[{"key":"<a box or an address>","full_in":<seconds>}]}, deepest
+//     in debt first (Top).
 func (s *Server) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /limits/clear", func(w http.ResponseWriter, r *http.Request) {
@@ -56,6 +113,34 @@ func (s *Server) AdminHandler() http.Handler {
 			Address string   `json:"address"`
 			Cleared []string `json:"cleared"`
 		}{key, cleared})
+	})
+	mux.HandleFunc("GET /limits/top", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		n := topDefault
+		if v := q.Get("n"); v != "" {
+			var err error
+			if n, err = strconv.Atoi(v); err != nil || n < 1 || n > topMost {
+				http.Error(w, "n: a count from 1 to "+strconv.Itoa(topMost), http.StatusBadRequest)
+				return
+			}
+		}
+		name := q.Get("limit")
+		top, ok := s.Top(name, n)
+		if !ok {
+			names := slices.Sorted(maps.Keys(s.limitsByName()))
+			http.Error(w, "limit: one of "+strings.Join(names, ", "), http.StatusBadRequest)
+			return
+		}
+		if top == nil {
+			top = []Indebted{}
+		}
+		if s.log != nil {
+			s.log.Printf("the operator listed the top of the limit %s", name) // never a key: the answer is the operator's alone
+		}
+		writeJSON(w, http.StatusOK, struct {
+			Limit string     `json:"limit"`
+			Keys  []Indebted `json:"keys"`
+		}{name, top})
 	})
 	return mux
 }

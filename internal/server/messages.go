@@ -52,10 +52,10 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 	// (IronGall-dev/irongall-server#5).
 	if more == 0 || !continues {
 		if ok, wait := s.polls.take(box.String(), s.now()); !ok {
-			return rateLimited(wait, "poll at most once a minute (Retry-After)")
+			return rateLimited(protocol.QuotaPolls, wait, "poll at most once a minute (Retry-After)")
 		}
 	} else if ok, wait := s.pages.take(box.String(), s.now()); !ok {
-		return rateLimited(wait, "too many list pages at once")
+		return rateLimited(protocol.QuotaPages, wait, "too many list pages at once")
 	}
 	n, err := s.store.Count(r.Context(), box)
 	if err != nil {

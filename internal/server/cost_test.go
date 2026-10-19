@@ -123,21 +123,21 @@ func TestCostMemoryPerBox(t *testing.T) {
 	// The poll bucket: one map entry per box that has polled, until its
 	// bucket is full again.
 	before := heapNow()
-	bs := newBuckets(10, 50*time.Second)
+	bs := newBuckets("test", 10, 50*time.Second)
 	for _, a := range addrs {
 		bs.take(a.String(), now)
 	}
 	t.Logf("poll bucket: %6.0f B per box that has polled", float64(heapNow()-before)/n)
 	runtime.KeepAlive(bs)
 
-	// The daily send counter: one entry per sender per UTC day.
+	// The sends a day: one bucket per sender that sent within a day.
 	before = heapNow()
-	var d daily
+	d := perPeriod("sends", 20, day)
 	for _, a := range addrs {
-		d.take(a, now, 20)
+		d.take(a.String(), now)
 	}
-	t.Logf("daily send count: %6.0f B per sender that sent today", float64(heapNow()-before)/n)
-	runtime.KeepAlive(&d)
+	t.Logf("sends a day: %6.0f B per sender that sent within a day", float64(heapNow()-before)/n)
+	runtime.KeepAlive(d)
 
 	// The passes remembered: one entry per box that showed a pass which has
 	// not run out.

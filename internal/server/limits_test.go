@@ -20,7 +20,7 @@ import (
 // A key whose bucket is full again is dropped; one still in use is kept.
 func TestBucketsDropKeysFullAgain(t *testing.T) {
 	t0 := time.Unix(1_700_000_000, 0)
-	bs := newBuckets(2, time.Minute)
+	bs := newBuckets("test", 2, time.Minute)
 	for _, k := range []string{"a", "b", "c"} {
 		bs.take(k, t0)
 	}

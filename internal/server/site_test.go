@@ -132,21 +132,28 @@ func TestASitePageAnswersConditionally(t *testing.T) {
 	}
 }
 
-// A page of the site spends nothing of its caller's: however many a shared
-// address asks for, each is answered, a 404 among them. And it is answered
-// while the API is not ready.
-func TestASitePageIsNeverLimited(t *testing.T) {
+// A page of the site spends its caller's flood budget, which is for floods
+// alone (IronGall-dev/irongall-server#58): thirty views of three pages each,
+// a 404 among them, from one address at once, are each answered under the
+// default limits, while the API is not ready; a flood is refused.
+func TestASitePageSpendsOnlyAFloodBudget(t *testing.T) {
 	srv := siteServer(t, DefaultLimits(), false)
 	if resp, _ := get(t, srv, http.MethodGet, "/v1/"+strings.Repeat("0", 64)); resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("the API before it is ready: %d, want 503", resp.StatusCode)
 	}
-	for i := range 100 {
+	for i := range 30 {
 		for path, want := range map[string]int{"/": http.StatusOK, "/llms.txt": http.StatusOK, "/nope": http.StatusNotFound} {
 			if resp, _ := get(t, srv, http.MethodGet, path); resp.StatusCode != want {
 				t.Fatalf("request %d of %s, with the default limits and the API not ready: %d, want %d", i+1, path, resp.StatusCode, want)
 			}
 		}
 	}
+	for range 1000 {
+		if resp, _ := get(t, srv, http.MethodGet, "/llms.txt"); resp.StatusCode == http.StatusTooManyRequests {
+			return
+		}
+	}
+	t.Fatal("a thousand pages at once from one address are all answered")
 }
 
 // With no site, every path outside /v1/ and the link page is 404.

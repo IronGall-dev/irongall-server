@@ -67,19 +67,21 @@ type Server struct {
 	identityTypes []string
 	site          *Site
 
-	polls    *buckets // per box
-	pages    *buckets // per box: list pages after the first
-	repeats  *buckets // per box: fetches of a message already fetched
-	regs     *buckets // per IP
-	sendIPs  *buckets // per IP
-	misses   *buckets // per IP: reads of the boxes table that found no box, and checks that failed
-	calls    *buckets // per box: its calls with its pass that no other budget counts
-	receives *buckets // per box: new messages it takes
-	drained  *buckets // per box: its first fetches of held messages
-	sends    daily    // per sender
-	renewals daily    // per box: renewals under its current certificate
-	certs    daily    // per box: renewals under a later certificate, which only its identity can make
-	raises   daily    // per box: raises of its revocation of certificates, which only its identity can make
+	polls     *buckets // per box
+	pages     *buckets // per box: list pages after the first
+	repeats   *buckets // per box: fetches of a message already fetched
+	regs      *buckets // per IP
+	rangeRegs *buckets // per IPv6 /48: registrations, beside regs
+	sendIPs   *buckets // per IP
+	misses    *buckets // per IP: reads of the boxes table that found no box, and checks that failed
+	requests  *buckets // per IP: every call with no pass, and every request no route matches
+	calls     *buckets // per box: its calls with its pass that no other budget counts
+	receives  *buckets // per box: new messages it takes
+	drained   *buckets // per box: its first fetches of held messages
+	sends     *buckets // per sender, a number a day
+	renewals  *buckets // per box, a number a day: renewals under its current certificate
+	certs     *buckets // per box, a number a day: renewals under a later certificate, which only its identity can make
+	raises    *buckets // per box, a number a day: raises of its revocation of certificates, which only its identity can make
 	// inFlight counts the sends let past the pair and box caps and not yet
 	// stored, by the recipient's first byte (reserveCaps).
 	inFlight [256]inFlight
@@ -108,15 +110,21 @@ func New(c Config) *Server {
 		names:         c.Names,
 		identityTypes: c.IdentityTypes,
 		site:          c.Site,
-		polls:         newBuckets(c.Limits.PollBurst, c.Limits.PollRefill),
+		polls:         newBuckets(string(protocol.QuotaPolls), c.Limits.PollBurst, c.Limits.PollRefill),
 		pages:         c.Limits.continuations(),
-		repeats:       newBuckets(c.Limits.PollBurst, c.Limits.PollRefill),
-		regs:          perPeriod(c.Limits.RegistrationsPerHour, time.Hour),
-		sendIPs:       perPeriod(c.Limits.SendsPerMinutePerIP, time.Minute),
-		misses:        perPeriod(c.Limits.MissesPerMinute, time.Minute),
-		calls:         newBuckets(c.Limits.CallBurst, c.Limits.CallRefill),
-		receives:      newBuckets(c.Limits.ReceiveBurst, c.Limits.ReceiveRefill),
-		drained:       newBuckets(c.Limits.DrainBurst, c.Limits.DrainRefill),
+		repeats:       newBuckets(string(protocol.CodeRefetchSpent), c.Limits.PollBurst, c.Limits.PollRefill),
+		regs:          perPeriod(string(protocol.QuotaRegistrations), c.Limits.RegistrationsPerHour, time.Hour),
+		rangeRegs:     perPeriod(string(protocol.QuotaRegistrationsRange), c.Limits.RangeRegistrationsPerHour, time.Hour),
+		sendIPs:       perPeriod(string(protocol.QuotaSendsBeforePass), c.Limits.SendsPerMinutePerIP, time.Minute),
+		misses:        perPeriod(string(protocol.QuotaMisses), c.Limits.MissesPerMinute, time.Minute),
+		requests:      newBuckets(string(protocol.QuotaRequests), c.Limits.RequestBurst, c.Limits.RequestRefill),
+		calls:         newBuckets(string(protocol.QuotaCalls), c.Limits.CallBurst, c.Limits.CallRefill),
+		receives:      newBuckets(string(protocol.CodeMailboxBusy), c.Limits.ReceiveBurst, c.Limits.ReceiveRefill),
+		drained:       newBuckets(string(protocol.CodeFetchPaced), c.Limits.DrainBurst, c.Limits.DrainRefill),
+		sends:         perPeriod(string(protocol.QuotaSends), c.Limits.SendsPerDay, day),
+		renewals:      perPeriod(string(protocol.QuotaRenewals), c.Limits.RenewalsPerDay, day),
+		certs:         perPeriod(string(protocol.QuotaCertificates), c.Limits.CertificatesPerDay, day),
+		raises:        perPeriod(string(protocol.QuotaCertificateRevocations), c.Limits.CertificateRevocationsPerDay, day),
 		largeRead:     make(chan struct{}, 1),
 		passes:        newPasses(),
 	}
@@ -161,21 +169,47 @@ func (s *Server) routes() []route {
 const linkRoute = "GET " + protocol.LinkPath + "{addr}"
 
 // Handler returns the API's routes, the page a box's link opens, and the
-// site, if there is one. Neither page is limited: each is answered from
-// memory, and a flood of pages is for whatever stands in front. Both are
-// answered before the API is ready, since neither reads a store.
+// site, if there is one. Both pages, like every call with no pass and every
+// request no route matches, spend the caller's address's flood budget
+// (spendRequest). Both are answered before the API is ready, since neither
+// reads a store.
 func (s *Server) Handler() http.Handler {
 	api := http.NewServeMux()
 	for _, r := range s.routes() {
 		api.HandleFunc(r.pattern, s.handle(r.h))
 	}
 	mux := http.NewServeMux()
-	mux.Handle(linkRoute, s.linkPage())
-	mux.Handle("/v1/", notStored(s.whenReady(api)))
+	mux.Handle(linkRoute, s.flooding(s.linkPage()))
+	mux.Handle("/v1/", notStored(s.whenReady(s.unrouted(api))))
 	if s.site != nil {
-		mux.Handle("/", s.site)
+		mux.Handle("/", s.flooding(s.site))
 	}
-	return s.accessLog(s.dated(mux))
+	return s.accessLog(s.dated(s.unrouted(mux)))
+}
+
+// flooding spends the caller's flood budget before h answers (spendRequest).
+func (s *Server) flooding(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if p := s.spendRequest(r); p != nil {
+			writeProblem(w, p)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// unrouted spends the caller's flood budget for a request no route of mux
+// matches, before mux answers it 404 or 405 (spendRequest).
+func (s *Server) unrouted(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, pattern := mux.Handler(r); pattern == "" {
+			if p := s.spendRequest(r); p != nil {
+				writeProblem(w, p)
+				return
+			}
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // notStored marks every answer of the API as one no cache may keep. What a
@@ -524,20 +558,111 @@ func (f *read) wait(ctx context.Context) (*Box, error) {
 func (s *Server) miss(r *http.Request) (*reservation, error) {
 	m, ok, wait := s.misses.reserve(r.Context(), ipKey(s.clientIP(r)), s.now)
 	if !ok {
-		return nil, rateLimited(wait, "too many calls from this address that named no box or carried nothing that verified")
+		return nil, rateLimited(protocol.QuotaMisses, wait, "too many calls from this address that named no box or carried nothing that verified")
 	}
 	return m, nil
 }
 
+// spendRequest spends one of the flood budget of the caller's address
+// (Limits.RequestBurst): every call with no pass, and every request no route
+// matches, as Let's Encrypt limits every endpoint per address
+// (IronGall-dev/irongall-server#58). It is sized far above what an honest
+// crowd behind one address makes, the site's pages included: for floods
+// alone. A refusal is the problem to answer with.
+func (s *Server) spendRequest(r *http.Request) *problem {
+	if ok, wait := s.requests.take(ipKey(s.clientIP(r)), s.now()); !ok {
+		return rateLimited(protocol.QuotaRequests, wait, "too many calls with no pass from this address")
+	}
+	return nil
+}
+
+// spendRegistration spends a registration of the caller's address: of its
+// IPv4 address or IPv6 /64, and of its IPv6 /48, as Let's Encrypt counts new
+// accounts (IronGall-dev/irongall-server#57). Each is reserved before the
+// other is kept, so a refusal by one spends neither; a refusal gives the
+// longer wait of the two (longest). why is said after the refusal's words.
+func (s *Server) spendRegistration(r *http.Request, why string) error {
+	host := s.clientIP(r)
+	ip, block := ipKey(host), rangeKey(host)
+	byIP, ok, wait := s.regs.reserve(r.Context(), ip, s.now)
+	if !ok {
+		p := rateLimited(protocol.QuotaRegistrations, wait, "too many registrations from this address"+why)
+		if block != "" {
+			if ok, w := s.rangeRegs.ready(block, s.now()); !ok && w > wait {
+				p = rateLimited(protocol.QuotaRegistrationsRange, w, "too many registrations from this address's IPv6 /48"+why)
+			}
+		}
+		return p
+	}
+	if block != "" {
+		byRange, ok, wait := s.rangeRegs.reserve(r.Context(), block, s.now)
+		if !ok {
+			byIP.release(s.now())
+			return rateLimited(protocol.QuotaRegistrationsRange, wait, "too many registrations from this address's IPv6 /48"+why)
+		}
+		byRange.keep()
+	}
+	byIP.keep()
+	return nil
+}
+
+// perDay is one of a box's numbers a day: its buckets, the number, and the
+// words of a refusal, with a %d for the number.
+type perDay struct {
+	bs    *buckets
+	n     int
+	words string
+}
+
+// refusal is the answer to a call past d, waiting wait.
+func (d perDay) refusal(wait time.Duration) *problem {
+	return rateLimited(protocol.Quota(d.bs.name), wait, d.words, limitValue(d.n))
+}
+
+// The box's numbers a day, as a refusal names them.
+func (s *Server) sendsADay(n int) perDay {
+	return perDay{s.sends, n, "this box has sent as many messages as %d a day allows"}
+}
+
+func (s *Server) renewalsADay() perDay {
+	return perDay{s.renewals, s.limits.RenewalsPerDay, "this box has renewed its prekey as often as %d a day allows"}
+}
+
+func (s *Server) certificatesADay() perDay {
+	return perDay{s.certs, s.limits.CertificatesPerDay, "this box's identity has certified as many new working keys as %d a day allows"}
+}
+
+func (s *Server) raisesADay() perDay {
+	return perDay{s.raises, s.limits.CertificateRevocationsPerDay, "this box's identity has raised its revocation of certificates as often as %d a day allows"}
+}
+
+// longest is p, the refusal of one of box a's counts, or the refusal of one
+// of also, the box's other counts in memory that the same call would spend,
+// read without taking from them: whichever waits longest, under its own name.
+// RFC 8555 §6.6 asks that Retry-After be when every limit lets the same
+// request through (IronGall-dev/irongall-server#56). Counts behind work, a
+// read of storage or a signature check, are not read ahead of it: the order
+// of checks puts them last because they cost.
+func (s *Server) longest(p *problem, a protocol.Address, also ...perDay) *problem {
+	now := s.now()
+	for _, d := range also {
+		if ok, wait := d.bs.ready(a.String(), now); !ok && wait > p.retryAfter {
+			p = d.refusal(wait)
+		}
+	}
+	return p
+}
+
 // spendCall spends one of box a's calls (Limits.CallBurst), the budget of
 // every call with its pass that no other budget counts. An account that lifts
-// it comes with lim.CallBurst zero.
-func (s *Server) spendCall(a protocol.Address, lim Limits) error {
+// it comes with lim.CallBurst zero. also are the box's other counts the same
+// call would spend, which a refusal reads (longest).
+func (s *Server) spendCall(a protocol.Address, lim Limits, also ...perDay) error {
 	if lim.CallBurst == 0 {
 		return nil
 	}
 	if ok, wait := s.calls.take(a.String(), s.now()); !ok {
-		return rateLimited(wait, "this box has made as many calls as it may for now")
+		return s.longest(rateLimited(protocol.QuotaCalls, wait, "this box has made as many calls as it may for now"), a, also...)
 	}
 	return nil
 }
@@ -560,21 +685,25 @@ func (s *Server) limitsOf(ctx context.Context, a protocol.Address) (Limits, erro
 }
 
 // spendOwner spends a call by box a, which showed its pass, from its budget,
-// with whatever its account lifts.
-func (s *Server) spendOwner(ctx context.Context, a protocol.Address) error {
+// with whatever its account lifts. also are as spendCall's.
+func (s *Server) spendOwner(ctx context.Context, a protocol.Address, also ...perDay) error {
 	lim, err := s.limitsOf(ctx, a)
 	if err != nil {
 		return err
 	}
-	return s.spendCall(a, lim)
+	return s.spendCall(a, lim, also...)
 }
 
 // spendLookup spends a call that may carry its caller's pass, a GET of what
 // is public about a box (PROTOCOL.md §4.1): with a pass it is the calling
-// box's, once the pass is checked. With none it spends nothing: memory
-// answers it, and a read that finds no box counts as a miss (lookup).
+// box's, once the pass is checked. With none it spends its address's flood
+// budget (spendRequest), and a read that finds no box counts as a miss
+// (lookup).
 func (s *Server) spendLookup(r *http.Request) error {
 	if auth, one := authorization(r); one && auth == "" {
+		if p := s.spendRequest(r); p != nil {
+			return p
+		}
 		return nil
 	}
 	from, err := s.sender(r)
@@ -607,15 +736,20 @@ func fetchedAlready(wait time.Duration) *problem {
 	return p
 }
 
-// rateLimited is a 429 for calls beyond a limit, with how long to wait in
+// rateLimited is a 429 for a call past limit q, which it names with whom q
+// counted the call against (PROTOCOL.md §13), and how long to wait in
 // Retry-After.
-func rateLimited(wait time.Duration, detail string) *problem {
-	return spent(protocol.CodeRateLimited, wait, detail)
+func rateLimited(q protocol.Quota, wait time.Duration, format string, values ...value) *problem {
+	p := spent(protocol.CodeRateLimited, wait, format, values...)
+	p.quota = q
+	return p
 }
 
-// spent is a 429 of code, with how long to wait in Retry-After: a limit a
-// client meets otherwise than calls beyond one (a day's sends, renewals,
-// certificates or raises of a revocation of certificates; a paced drain).
+// day is the period of a number a day.
+const day = 24 * time.Hour
+
+// spent is a 429 of code, with how long to wait in Retry-After: a limit with
+// a code of its own (a paced drain, a repeat fetch).
 func spent(code protocol.Code, wait time.Duration, format string, values ...value) *problem {
 	p := fail(code, "wait for Retry-After, then retry", format, values...)
 	p.retryAfter = wait

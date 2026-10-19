@@ -15,17 +15,24 @@ type Limits struct {
 	MaxSize        int           // the cap on a ciphertext, in bytes, and what a send reads of its body; nothing may depend on its value
 	PairCap        int           // unacked per (sender → box) [tunable]
 	BoxCap         int           // total per box, a storage ceiling [tunable]
-	SendsPerDay    int           // per sender, per UTC day (decided: 20)
+	SendsPerDay    int           // per sender, a number a day: that many at once, one back each day divided by it (decided: 20)
 	PollBurst      int           // polls a box may make at once (decided: 10); also the fetches of messages already fetched
 	PollRefill     time.Duration // one more poll each (decided: 50 s; once a minute is stated); also one more such fetch
 	PollAfter      int           // seconds, told to clients (decided: 60)
 	AccountMaxSize int           // the most an account lifts MaxSize to, so what a send reads first; up to MaxSize, nothing
-	RenewalsPerDay int           // prekey renewals per box, per UTC day (decided: 10), so no box can spend the boxes table's write capacity
+	RenewalsPerDay int           // prekey renewals per box, a number a day as SendsPerDay (decided: 10), so no box can spend the boxes table's write capacity
 	RetiredKept    int           // retired prekeys a box record keeps for the new-key rule, newest first (decided: 10), so a record stays small
 
-	RegistrationsPerHour int // per IPv4 address or IPv6 /64 [tunable]
-	SendsPerMinutePerIP  int // the pre-auth send rate per IP [tunable]
-	MissesPerMinute      int // per IP: reads of the boxes table that find no box, and checks that fail (decided: 10 for now)
+	RegistrationsPerHour      int // per IPv4 address or IPv6 /64 [tunable]
+	RangeRegistrationsPerHour int // per IPv6 /48, beside the /64's (decided 2026-10-19: 500, Let's Encrypt's ratio of the two, until measured)
+	SendsPerMinutePerIP       int // the pre-auth send rate per IP [tunable]
+	MissesPerMinute           int // per IP: reads of the boxes table that find no box, and checks that fail (decided: 10 for now)
+
+	// Requests is the flood budget of an IPv4 address or IPv6 /64: every call
+	// with no pass and every request no route matches (decided 2026-10-19:
+	// 100 at once, 50 a second).
+	RequestBurst  int
+	RequestRefill time.Duration
 
 	// Budgets: a burst at once and one more each refill (LIMITS.md).
 	ReceiveBurst                 int           // per box: new messages it takes, from all senders together (decided: 50, on); an account lifts it
@@ -34,8 +41,8 @@ type Limits struct {
 	DrainRefill                  time.Duration // (decided: 6 s, ten a minute)
 	CallBurst                    int           // per box: its calls with its pass that no other budget counts [tunable]; an account lifts it
 	CallRefill                   time.Duration // [tunable]
-	CertificatesPerDay           int           // per box, per UTC day: renewals under a later certificate, but for one that replaces a revoked certificate (decided: 10, as renewals)
-	CertificateRevocationsPerDay int           // per box, per UTC day: raises of its revocation of certificates (decided 2026-10-16 to be counted apart; 10, as the count it was split from) [tunable]
+	CertificatesPerDay           int           // per box, a number a day: renewals under a later certificate, but for one that replaces a revoked certificate (decided: 10, as renewals)
+	CertificateRevocationsPerDay int           // per box, a number a day: raises of its revocation of certificates (decided 2026-10-16 to be counted apart; 10, as the count it was split from) [tunable]
 
 	// ACLEntries is the most entries a box's ACL holds, its two lists
 	// together [tunable]: a box's record, with its ACL, is held in the box
@@ -65,7 +72,10 @@ func DefaultLimits() Limits {
 		RenewalsPerDay:               10,
 		RetiredKept:                  10,
 		RegistrationsPerHour:         10,
+		RangeRegistrationsPerHour:    500,
 		MissesPerMinute:              10,
+		RequestBurst:                 100,
+		RequestRefill:                20 * time.Millisecond,
 		ReceiveBurst:                 50,
 		ReceiveRefill:                6 * time.Second,
 		DrainBurst:                   50,
@@ -95,13 +105,13 @@ const uncappedPages = 1000
 // poll limit there is none.
 func (l Limits) continuations() *buckets {
 	if l.PollBurst == 0 || l.PollRefill <= 0 {
-		return newBuckets(0, 0)
+		return newBuckets(string(protocol.QuotaPages), 0, 0)
 	}
 	pages := (l.BoxCap + pageSize - 1) / pageSize
 	if l.BoxCap == 0 {
 		pages = uncappedPages
 	}
-	return newBuckets(2*pages, l.PollRefill/time.Duration(pages))
+	return newBuckets(string(protocol.QuotaPages), 2*pages, l.PollRefill/time.Duration(pages))
 }
 
 // buckets is a set of token buckets by key: n tokens, one back each
@@ -111,6 +121,9 @@ func (l Limits) continuations() *buckets {
 // due. A key whose bucket is full again is the same as no key, and is
 // dropped (prune).
 type buckets struct {
+	// name is the limit's: the quota a rate_limited names, or the code its
+	// refusal has of its own.
+	name  string
 	mu    sync.Mutex
 	n     int
 	every time.Duration
@@ -122,9 +135,11 @@ type buckets struct {
 	settled chan struct{}
 }
 
-// newBuckets is buckets of n, refilled one every interval.
-func newBuckets(n int, every time.Duration) *buckets {
-	return &buckets{n: n, every: every, full: map[string]time.Time{}, held: map[string]int{}, settled: make(chan struct{})}
+// newBuckets is buckets of n, refilled one every interval, for the limit
+// named name: the quota a rate_limited names, or the code its refusal has of
+// its own.
+func newBuckets(name string, n int, every time.Duration) *buckets {
+	return &buckets{name: name, n: n, every: every, full: map[string]time.Time{}, held: map[string]int{}, settled: make(chan struct{})}
 }
 
 // reserveWait bounds how long a reservation waits for others of its key to
@@ -205,12 +220,14 @@ func (r *reservation) settle(back bool, now time.Time) {
 	bs.mu.Unlock()
 }
 
-// perPeriod is buckets of n, refilled n per period.
-func perPeriod(n int, period time.Duration) *buckets {
+// perPeriod is buckets of n, refilled n per period: a number a day is one
+// back each day divided by it (Let's Encrypt's token bucket, and never a
+// window that empties at midnight: IronGall-dev/irongall-server#54).
+func perPeriod(name string, n int, period time.Duration) *buckets {
 	if n == 0 {
-		return newBuckets(0, 0)
+		return newBuckets(name, 0, 0)
 	}
-	return newBuckets(n, period/time.Duration(n))
+	return newBuckets(name, n, period/time.Duration(n))
 }
 
 // take takes one token for key at now. When none is left it returns how
@@ -299,49 +316,6 @@ func (bs *buckets) prune(now time.Time) {
 	bs.sweep = now.Add(time.Duration(bs.n) * bs.every)
 }
 
-// daily counts an action per box per UTC day: sends per sender, prekey
-// renewals per box.
-type daily struct {
-	mu  sync.Mutex
-	day string
-	n   map[protocol.Address]int
-}
-
-// take counts one for a at now if a is under limit, and otherwise returns how
-// long until the next UTC day. A count is taken before the work it guards
-// and given back if that work does not happen (give), so calls in flight at
-// once cannot all pass on one count. limit == 0 never limits.
-func (d *daily) take(a protocol.Address, now time.Time, limit int) (ok bool, wait time.Duration) {
-	if limit == 0 {
-		return true, 0
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	day := now.UTC().Format(time.DateOnly)
-	if d.day != day {
-		d.day, d.n = day, map[protocol.Address]int{}
-	}
-	if d.n[a] >= limit {
-		next := now.UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
-		return false, next.Sub(now)
-	}
-	d.n[a]++
-	return true, 0
-}
-
-// give takes back a count take took at now under limit, for work that did
-// not happen. A count from a day already past is gone with its day.
-func (d *daily) give(a protocol.Address, now time.Time, limit int) {
-	if limit == 0 {
-		return
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.day == now.UTC().Format(time.DateOnly) && d.n[a] > 0 {
-		d.n[a]--
-	}
-}
-
 // ipKey keys a per-IP limit on a client address: the IPv4 address, or the
 // IPv6 /64, since every IPv6 end site holds at least a /64.
 func ipKey(host string) string {
@@ -353,4 +327,15 @@ func ipKey(host string) string {
 		return v4.String()
 	}
 	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
+// rangeKey keys a limit on a client's IPv6 /48, "the range a single
+// subscriber is typically given" (Let's Encrypt's Boulder), and is "" for an
+// IPv4 address or anything that is no address: those have no /48 count.
+func rangeKey(host string) string {
+	ip := net.ParseIP(host)
+	if ip == nil || ip.To4() != nil {
+		return ""
+	}
+	return ip.Mask(net.CIDRMask(48, 128)).String() + "/48"
 }

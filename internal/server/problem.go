@@ -29,6 +29,7 @@ type problem struct {
 	retryAfter time.Duration // 429 and 503
 	values     []value
 	record     *protocol.Revocations // revoked, on the read of a box
+	quota      protocol.Quota        // rate_limited: the limit, and from it whom it was counted against
 }
 
 func (p *problem) Error() string { return string(p.code) + ": " + p.detail }
@@ -124,6 +125,9 @@ func writeProblem(w http.ResponseWriter, p *problem) {
 		v.set(&body)
 	}
 	body.Record = p.record
+	if p.quota != "" {
+		body.QuotaID, body.Subject = p.quota, p.quota.Subject()
+	}
 	h := w.Header()
 	h.Set("Content-Type", protocol.ProblemContentType)
 	if status == http.StatusUnauthorized {

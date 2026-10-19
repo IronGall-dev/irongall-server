@@ -174,7 +174,7 @@ func TestAccounts(t *testing.T) {
 			t.Fatalf("over the cap: %v", err)
 		}
 		send(t, c, b, "2")
-		if _, err := c.Send(ctx, b.Address(), "3"); client.Code(err) != protocol.CodeSendsSpent {
+		if _, err := c.Send(ctx, b.Address(), "3"); !limitedBy(err, protocol.QuotaSends) {
 			t.Fatalf("third send: %v", err)
 		}
 		// The key's one use is spent.
@@ -194,7 +194,7 @@ func TestAccounts(t *testing.T) {
 		}
 		send(t, a, b, "4")
 		send(t, a, b, "5")
-		if _, err := a.Send(ctx, b.Address(), "6"); client.Code(err) != protocol.CodeSendsSpent {
+		if _, err := a.Send(ctx, b.Address(), "6"); !limitedBy(err, protocol.QuotaSends) {
 			t.Fatalf("after leaving, a third send: %v", err)
 		}
 	})
@@ -206,7 +206,7 @@ func TestAccounts(t *testing.T) {
 		adopt(t, a, key)
 		send(t, a, b, "1")
 		send(t, a, b, "2")
-		if _, err := a.Send(ctx, b.Address(), "3"); client.Code(err) != protocol.CodeSendsSpent {
+		if _, err := a.Send(ctx, b.Address(), "3"); !limitedBy(err, protocol.QuotaSends) {
 			t.Fatalf("third send: %v", err)
 		}
 	})
@@ -392,7 +392,7 @@ func TestAccountChangesReachMemory(t *testing.T) {
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	adopt(t, a, key)
 	send(t, a, b, "1")
-	if _, err := a.Send(ctx, b.Address(), "2"); client.Code(err) != protocol.CodeSendsSpent {
+	if _, err := a.Send(ctx, b.Address(), "2"); !limitedBy(err, protocol.QuotaSends) {
 		t.Fatalf("second send: %v", err)
 	}
 	if _, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
@@ -412,7 +412,7 @@ func TestAccountChangesReachMemory(t *testing.T) {
 	}
 	until(t, func(i int) bool {
 		_, err := a.Send(ctx, b.Address(), fmt.Sprintf("gone %d", i))
-		return client.Code(err) == protocol.CodeSendsSpent
+		return limitedBy(err, protocol.QuotaSends)
 	})
 }
 

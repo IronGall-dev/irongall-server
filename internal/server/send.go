@@ -27,13 +27,17 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	// included: it bounds everything after it, the dedupe's read among them.
 	// The pre-auth rate is per IP, and comes before anything is checked.
 	if ok, wait := s.sendIPs.take(ipKey(s.clientIP(r)), now); !ok {
-		return rateLimited(wait, "too many sends from this address")
+		return rateLimited(protocol.QuotaSendsBeforePass, wait, "too many sends from this address")
 	}
 	from, err := s.sender(r)
 	if err != nil {
 		return err
 	}
-	if err := s.spendOwner(ctx, from); err != nil {
+	// A refusal of the calls gives the longer wait of the calls and the
+	// sends a day, which a new message would spend too (longest).
+	if lim, err := s.limitsOf(ctx, from); err != nil {
+		return err
+	} else if err := s.spendCall(from, lim, s.sendsOf(lim)...); err != nil {
 		return err
 	}
 	// The pass showed the box exists, so reading its record is no guess at
@@ -181,14 +185,19 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	// each taken before the write and given back unless the send is stored:
 	// sends in flight at once cannot all pass on one count.
 	stored := false
-	if ok, wait := s.sends.take(from, now, lim.SendsPerDay); !ok {
-		return spent(protocol.CodeSendsSpent, wait, "this box has sent its %d messages for the day", limitValue(lim.SendsPerDay))
-	}
-	defer func() {
-		if !stored {
-			s.sends.give(from, now, lim.SendsPerDay)
+	for _, d := range s.sendsOf(lim) {
+		sent, ok, wait := d.bs.reserve(ctx, from.String(), s.now)
+		if !ok {
+			return d.refusal(wait)
 		}
-	}()
+		defer func() {
+			if stored {
+				sent.keep()
+			} else {
+				sent.release(s.now())
+			}
+		}()
+	}
 	release, p, err := s.reserveCaps(ctx, to, from)
 	if err != nil {
 		return err
@@ -306,6 +315,15 @@ func (s *Server) reserveCaps(ctx context.Context, to, from protocol.Address) (re
 			delete(f.pair, pair)
 		}
 	}, nil, nil
+}
+
+// sendsOf is the sends a day of a sender with limits lim: none when its
+// account lifts them.
+func (s *Server) sendsOf(lim Limits) []perDay {
+	if lim.SendsPerDay == 0 {
+		return nil
+	}
+	return []perDay{s.sendsADay(lim.SendsPerDay)}
 }
 
 func receipt(h *Header) protocol.Receipt {

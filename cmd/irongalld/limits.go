@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -53,15 +54,25 @@ func limits(cmd string, args []string) error {
 		if *socket == "" || *ip == "" || fs.NArg() != 0 {
 			return errors.New("name -socket and -ip")
 		}
-		return adminCall(*socket, "/limits/clear?ip="+url.QueryEscape(*ip), os.Stdout)
+		return adminCall(*socket, http.MethodPost, "/limits/clear?ip="+url.QueryEscape(*ip), os.Stdout)
+	case "top":
+		limit := fs.String("limit", "", "the limit, by the name a refusal gives it: a rate_limited's quota_id, or the code of its own (mailbox_busy, fetch_paced, refetch_spent)")
+		n := fs.Int("n", 20, "how many keys, deepest in debt first")
+		if err := fs.Parse(args); err != nil {
+			return err
+		}
+		if *socket == "" || *limit == "" || fs.NArg() != 0 {
+			return errors.New("name -socket and -limit")
+		}
+		return adminCall(*socket, http.MethodGet, "/limits/top?limit="+url.QueryEscape(*limit)+"&n="+strconv.Itoa(*n), os.Stdout)
 	default:
-		return fmt.Errorf("limits %s: the command is clear", cmd)
+		return fmt.Errorf("limits %s: the commands are clear and top", cmd)
 	}
 }
 
-// adminCall POSTs to path on the server listening at socket, and copies a
-// 200's body to out.
-func adminCall(socket, path string, out io.Writer) error {
+// adminCall calls method on path on the server listening at socket, and
+// copies a 200's body to out.
+func adminCall(socket, method, path string, out io.Writer) error {
 	c := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -69,7 +80,12 @@ func adminCall(socket, path string, out io.Writer) error {
 			return d.DialContext(ctx, "unix", socket)
 		}},
 	}
-	resp, err := c.Post("http://irongalld"+path, "", nil) //nolint:gosec // the host is fixed, and the dial goes to the operator's own socket alone
+	// The host is fixed, and the dial goes to the operator's own socket alone.
+	req, err := http.NewRequest(method, "http://irongalld"+path, http.NoBody) //nolint:gosec // as above
+	if err != nil {
+		return err
+	}
+	resp, err := c.Do(req) //nolint:gosec // as above
 	if err != nil {
 		return err
 	}
