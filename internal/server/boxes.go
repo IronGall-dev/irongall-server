@@ -357,8 +357,8 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	// counted apart, so whoever holds the current working key and spends the
 	// day's renewals does not hold back the identity's. One while the box's
 	// current certificate is revoked is not counted: it replaces what the
-	// identity revoked, each raise of which is counted (revoke), as Let's
-	// Encrypt exempts a renewal that names the certificate it replaces.
+	// identity revoked, each raise of which is counted (revoke). Let's
+	// Encrypt's exemption is broader: PRECEDENTS.md in the client repo.
 	now := s.now()
 	count, limit, code, what := &s.renewals, s.limits.RenewalsPerDay, protocol.CodeRenewalsSpent, "this box has renewed its prekey %d times today"
 	if cert.Serial() > b.CertSerial {
