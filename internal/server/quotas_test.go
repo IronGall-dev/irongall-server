@@ -20,7 +20,11 @@ import (
 // every test server is (apitest): a request comes from the address ip, as
 // its peer, and is answered whatever it is, a router's plain 404 among them.
 func (e *env) caller() func(ip, method, path string, body any, pass string) reply {
-	h := apitest.Handler(e.t, e.server.Handler())
+	return e.callerOf(apitest.Handler(e.t, e.server.Handler()))
+}
+
+// callerOf is caller, through h.
+func (e *env) callerOf(h http.Handler) func(ip, method, path string, body any, pass string) reply {
 	return func(ip, method, path string, body any, pass string) reply {
 		e.t.Helper()
 		var rd io.Reader = http.NoBody
@@ -197,6 +201,42 @@ func TestTheFloodBudget(t *testing.T) {
 	e.want(call(ip, "GET", b.path(""), nil, ""), http.StatusOK, "")
 	if _, cleared, _ := e.server.ClearAddress(ip); strings.Join(cleared, ",") != "requests" {
 		t.Fatalf("clearing a flooding address cleared %v", cleared)
+	}
+}
+
+// A request no route answers spends the flood budget whatever the router
+// answers it with: a 405 for a method no route takes, the redirect of a path
+// not in its canonical form or of a subtree named without its slash. A route
+// that takes HEAD as GET answers it as itself.
+func TestWhatNoRouteAnswersIsCounted(t *testing.T) {
+	l := relaxed()
+	l.RequestBurst, l.RequestRefill = 1, time.Hour
+	e := newEnv(t, l)
+	b := e.raw().register(protocol.MaxPrekeyLifetime)
+	call := e.caller()
+	direct := e.callerOf(e.server.Handler()) // the router's redirects, which no description holds, and a HEAD
+	for i, c := range []struct {
+		method, path string
+		status       int
+		call         func(ip, method, path string, body any, pass string) reply
+	}{
+		{"POST", protocol.LinkPath + b.id.Address().String(), http.StatusMethodNotAllowed, call},
+		{"DELETE", b.path("/revocations"), http.StatusMethodNotAllowed, call},
+		{"GET", "/v1", http.StatusTemporaryRedirect, direct},
+		{"GET", b.path("/messages/../acl"), http.StatusTemporaryRedirect, direct},
+		{"HEAD", b.path(""), http.StatusOK, direct}, // the read of a box with no pass, which spends it as a route; a recorder keeps the body a server drops
+	} {
+		ip := "198.51.100." + strconv.Itoa(i+1)
+		if got := c.call(ip, c.method, c.path, nil, ""); got.status != c.status {
+			t.Fatalf("%s %s: %d, want %d", c.method, c.path, got.status, c.status)
+		}
+		e.limited(call(ip, "GET", "/nothing", nil, ""), protocol.QuotaRequests)
+	}
+	// A route a call with its pass reaches spends nothing of it.
+	const ip = "198.51.100.99"
+	e.want(call(ip, "GET", b.path("/acl"), nil, b.pass(1)), http.StatusOK, "")
+	if got := call(ip, "GET", "/nothing", nil, ""); got.status != http.StatusNotFound {
+		t.Fatalf("after a call with its pass, a request no route answers: %d", got.status)
 	}
 }
 

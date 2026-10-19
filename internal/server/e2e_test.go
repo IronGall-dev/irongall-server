@@ -59,12 +59,18 @@ func relaxed() Limits {
 	return l
 }
 
-func newEnv(t *testing.T, l Limits) *env {
+// newEnv is a test server with limits l, on the test store; each of with
+// changes its Config first.
+func newEnv(t *testing.T, l Limits, with ...func(*Config)) *env {
 	t.Helper()
 	e := &env{t: t, clock: &clock{t: time.Now().UTC().Truncate(time.Second)}}
 	var ready func() bool
 	e.store, ready = newTestStore(t, e.clock.Now)
-	e.server = New(Config{Store: e.store, Limits: l, Now: e.clock.Now, Ready: ready})
+	c := Config{Store: e.store, Limits: l, Now: e.clock.Now, Ready: ready}
+	for _, f := range with {
+		f(&c)
+	}
+	e.server = New(c)
 	h := apitest.Handler(t, e.server.Handler())
 	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e.mu.Lock()

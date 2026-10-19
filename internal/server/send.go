@@ -99,12 +99,15 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		}
 		select {
 		case s.largeRead <- struct{}{}:
+			s.metrics.large("taken")
 			defer func() { <-s.largeRead }()
 		case <-wait:
+			s.metrics.large("timed_out")
 			p := fail(protocol.CodeUnavailable, "retry later", "another large send is being read")
 			p.retryAfter = retryLater
 			return p
 		case <-ctx.Done():
+			s.metrics.large("gone")
 			p := fail(protocol.CodeUnavailable, "retry later", "another large send is being read")
 			p.retryAfter = retryLater
 			return p

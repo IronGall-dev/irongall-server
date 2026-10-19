@@ -128,6 +128,7 @@ func writeProblem(w http.ResponseWriter, p *problem) {
 	if p.quota != "" {
 		body.QuotaID, body.Subject = p.quota, p.quota.Subject()
 	}
+	noteCode(w, p.code)
 	h := w.Header()
 	h.Set("Content-Type", protocol.ProblemContentType)
 	if status == http.StatusUnauthorized {

@@ -171,8 +171,10 @@ func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert
 	now := s.now()
 	sum := sha256.Sum256([]byte(auth))
 	if s.passes.has(a, sum, cert, now) {
+		s.metrics.pass(true, nil)
 		return nil
 	}
+	defer func() { s.metrics.pass(false, err) }()
 	if count {
 		var m *reservation
 		if m, err = s.miss(r); err != nil {

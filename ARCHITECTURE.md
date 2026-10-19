@@ -209,6 +209,28 @@ What changes:
 - **Every limit is a bucket, the numbers a day among them, since 2026-10-19:** a number a day is that many at once and one back each day divided by it, so no window empties at midnight and every refusal's wait is its key's own (Let's Encrypt's token bucket; the client repo's `PRECEDENTS.md`).
 - **A bucket is one time per key, when it is full again (the GCRA form of a token bucket),** so a token comes back by arithmetic at the next call and nothing runs in the background (`buckets` in `internal/server/limits.go`). `prune` drops the keys whose buckets are full, inside a call, at most once in the time an empty bucket takes to fill, and only calls on that bucket set wait for it: over 100,000 keys it took 0.93 ms when it kept them all and 14 ms when it deleted them all (2026-10-18, one AWS Graviton4 core).
 
+### Metrics
+
+**What the server does and refuses is counted, for its operator, on a listener of its own** (`-metrics-listen`, off unless set; `internal/server/metrics.go`). It is how a limit is tuned and an attack on a box is seen without reading logs, which carry no caller's address by design. Prometheus' advice is "The short answer is to instrument everything.", and of a service that answers requests, "The key metrics in such a system are the number of performed queries, errors, and latency"; "Every time there is a failure, a counter should be incremented" beside the attempts (`prometheus/docs`, `docs/practices/instrumentation.md` at `410443d27b`, read 2026-10-19). Let's Encrypt's Boulder serves each service's metrics the same way, Prometheus' `client_golang` with the Go and process collectors on a listener apart from its API, and none when it is unset (`cmd/shell.go`, `newStatsRegistry`, at `cf6406dd86`).
+
+| Metric | Labels | Counts |
+|---|---|---|
+| `irongalld_requests_total`, `irongalld_request_duration_seconds` | `route` (the router's pattern, `unmatched` for none), `status`, `code` (the problem's, empty for none) | every request answered, and how long it took |
+| `irongalld_limit_requests_total` | `limit` (a `rate_limited`'s quota, or the code of its own), `subject` (`box`, `ip`), `decision` (`allowed`, `denied`) | each take of each limit, as Boulder's limiter counts each spend |
+| `irongalld_limit_keys` | `limit` | the keys each limit holds now |
+| `irongalld_passes_total` | `outcome` (`remembered`, `checked`, `refused`), `code` | passes taken from memory, verified, and refused |
+| `irongalld_lists_total`, `irongalld_fetches_total` | `kind` (`poll`, `page`; `first`, `repeat`) | lists and messages served; a send stored, a duplicate, an ack and a renewal are each a route and status of the first |
+| `irongalld_store_calls_total`, `irongalld_store_call_duration_seconds` | `service`, `operation`, `outcome` (`ok`, `conditional`, `not_found`, `throttled`, `error`) | every call to DynamoDB, its streams and S3, with its retries |
+| `irongalld_cache_events_total` | `cache` (`boxes`, `accounts`, `missing`), `event` (`hit`, `miss`, `eviction`) | the record caches |
+| `irongalld_stream_record_age_seconds` | `table` (`boxes`, `messages`, `accounts`) | how old the last record applied from each stream was: how far behind memory follows |
+| `irongalld_large_reads_total`, `irongalld_bodies_cut_total`, `irongalld_connections_open` | `outcome` (`taken`, `timed_out`, `gone`) | the one large read's waits, bodies cut off at their deadline, connections open |
+| the Go runtime's and the process's | | `client_golang`'s collectors |
+
+- 🛑 **No label is a value a caller chose:** no address, IP, box, message id, cursor or path as sent. Each would be a series per caller, and each is what the logs leave out: "Do not use labels to store dimensions with high cardinality (many different label values), such as user IDs, email addresses, or other unbounded sets of values." (`docs/practices/naming.md`, the same commit). `TestMetricsCarryNoCallerValue` holds it.
+- **Which box or address spends a limit is no metric:** `irongalld limits top` lists them, over the admin socket (`LIMITS.md`).
+- **Per process,** as the limits are: with several, the scraper sums them.
+- **Not built:** `net/http/pprof` on the same listener, which Boulder serves there.
+
 ### Background jobs
 **Not built.** The plan: one process holds a lease, a DynamoDB item taken with a conditional put that expires, and runs the background jobs. None is planned now: DynamoDB's TTL deletes a box's record once nothing valid for it is left (`PROTOCOL-SERVER.md` §7), so there is no reaper of our own and no `last_seen`. A deleted box is not in memory unless something used it, since memory loads per box (§ Startup).
 

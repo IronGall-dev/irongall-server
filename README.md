@@ -42,6 +42,8 @@ go run ./cmd/irongalld serve --dev
 
 The other store is three DynamoDB tables and an S3 Express One Zone directory bucket. `irongalld serve -h` lists every flag, and `PROTOCOL-SERVER.md` §7 has the layout. That mode also needs `-names`, the names clients call the server by: a box's pass is made for one server by name, and the server takes one only on a request that calls it by a name of its own (`PROTOCOL-SERVER.md` §6.1b).
 
+`-metrics-listen <address>` serves the operator's metrics at `/metrics` in Prometheus' text format, on a listener of its own: what they count is `ARCHITECTURE.md` § Metrics. Keep it off the internet: it is for the operator.
+
 ## Contributing
 
 Every commit is signed off under the Developer Certificate of Origin: [`CONTRIBUTING.md`](CONTRIBUTING.md).

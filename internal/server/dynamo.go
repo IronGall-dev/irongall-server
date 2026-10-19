@@ -91,6 +91,10 @@ type DynamoConfig struct {
 	// Memory can no longer be shown current; the process must restart, which
 	// rebuilds it from the tables.
 	Fatal func(error)
+	// Metrics, if set, count the caches' hits, misses and evictions and how
+	// far behind each stream memory follows. Calls to AWS are counted by
+	// Metrics.InstrumentAWS on the AWS config.
+	Metrics *Metrics
 }
 
 // NewDynamoStore returns a store that is not ready until Start returns.
@@ -117,11 +121,22 @@ func NewDynamoStore(c DynamoConfig) *DynamoStore {
 	if c.StreamInterval <= 0 {
 		c.StreamInterval = time.Second
 	}
-	streams := dynamodbstreams.NewFromConfig(c.AWS)
-	newFeed := func(apply func(stypes.Record)) *feed {
-		return &feed{streams: streams, interval: c.StreamInterval, apply: apply, logf: s.logf, shards: map[string]*shard{}}
+	if m := c.Metrics; m != nil {
+		s.cache.note = func(e string) { m.cacheEvent("boxes", e) }
+		s.misses.note = func(e string) { m.cacheEvent("missing", e) }
+		s.accCache.note = func(e string) { m.cacheEvent("accounts", e) }
 	}
-	s.boxFeed, s.msgFeed, s.accFeed = newFeed(s.applyBoxRecord), newFeed(s.applyMsgRecord), newFeed(s.applyAccountRecord)
+	streams := dynamodbstreams.NewFromConfig(c.AWS)
+	newFeed := func(table string, apply func(stypes.Record)) *feed {
+		applied := func(r stypes.Record) {
+			apply(r)
+			if r.Dynamodb != nil && r.Dynamodb.ApproximateCreationDateTime != nil {
+				c.Metrics.applied(table, *r.Dynamodb.ApproximateCreationDateTime, s.now())
+			}
+		}
+		return &feed{streams: streams, interval: c.StreamInterval, apply: applied, logf: s.logf, shards: map[string]*shard{}}
+	}
+	s.boxFeed, s.msgFeed, s.accFeed = newFeed("boxes", s.applyBoxRecord), newFeed("messages", s.applyMsgRecord), newFeed("accounts", s.applyAccountRecord)
 	return s
 }
 

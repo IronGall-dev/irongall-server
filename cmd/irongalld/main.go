@@ -29,6 +29,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -41,6 +42,9 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 	"github.com/IronGall-dev/irongall-server/internal/server"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -108,6 +112,7 @@ func serve(args []string) error {
 	fs.IntVar(&l.BodyMinRate, "body-min-rate", l.BodyMinRate, "bytes a second a body must keep up, as Apache's RequestReadTimeout MinRate (0: off)")
 	adminSocket := fs.String("admin-socket", "", "a Unix socket for the operator's commands (irongalld limits): made 0600 by this process, never on the API's listener (empty: none)")
 	idle := fs.Duration("idle-timeout", 75*time.Second, "how long an idle keep-alive connection stays open (nginx's default as a server): above the idle timeout of a proxy in front, which may otherwise reuse a connection this one has just closed")
+	metricsListen := fs.String("metrics-listen", "", "address to serve the operator's metrics on, at /metrics in Prometheus' text format: a listener of its own, never the API's (empty: none)")
 	siteDir := fs.String("site", "", "a directory of pages to serve at every path outside /v1/ and /to/, each at its own path and an index at its directory's, read once at start (empty: none; those paths are 404)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -117,6 +122,12 @@ func serve(args []string) error {
 	defer stop()
 
 	cfg := server.Config{Limits: l, Log: logger}
+	var reg *prometheus.Registry
+	if *metricsListen != "" {
+		reg = prometheus.NewRegistry()
+		reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+		cfg.Metrics = server.NewMetrics(reg)
+	}
 	for _, n := range strings.Split(*names, ",") {
 		if n = strings.TrimSpace(n); n == "" {
 			continue
@@ -170,6 +181,7 @@ func serve(args []string) error {
 		if err != nil {
 			return err
 		}
+		cfg.Metrics.InstrumentAWS(&awsCfg)
 		fatal := make(chan error, 1)
 		store := server.NewDynamoStore(server.DynamoConfig{
 			AWS:            awsCfg,
@@ -181,6 +193,7 @@ func serve(args []string) error {
 			StreamInterval: *streamEvery,
 			Log:            logger,
 			Fatal:          func(err error) { fatal <- err },
+			Metrics:        cfg.Metrics,
 		})
 		cfg.Store, cfg.Ready = store, store.Ready
 		start = func() error {
@@ -211,11 +224,24 @@ func serve(args []string) error {
 		defer admin.Close() //nolint:errcheck // the process is ending
 		logger.Printf("operator commands on %s", *adminSocket)
 	}
+	if reg != nil {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+		metrics := &http.Server{Addr: *metricsListen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		l, err := net.Listen("tcp", *metricsListen)
+		if err != nil {
+			return fmt.Errorf("-metrics-listen: %w", err)
+		}
+		go func() { _ = metrics.Serve(l) }()
+		defer metrics.Close() //nolint:errcheck // the process is ending
+		logger.Printf("metrics on %s", *metricsListen)
+	}
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           api.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       *idle,
+		ConnState:         cfg.Metrics.ConnState,
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()

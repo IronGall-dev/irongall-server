@@ -13,6 +13,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -52,6 +54,9 @@ type Config struct {
 	// Site, when set, is served at every path outside /v1/ and the link
 	// page (LoadSite). None: those paths are 404.
 	Site *Site
+	// Metrics, when set, count what the server does and refuses
+	// (NewMetrics). None: nothing is counted.
+	Metrics *Metrics
 }
 
 // Server is the API.
@@ -66,6 +71,7 @@ type Server struct {
 	// identityTypes are the identity key types a box may register with.
 	identityTypes []string
 	site          *Site
+	metrics       *Metrics
 
 	polls     *buckets // per box
 	pages     *buckets // per box: list pages after the first
@@ -110,6 +116,7 @@ func New(c Config) *Server {
 		names:         c.Names,
 		identityTypes: c.IdentityTypes,
 		site:          c.Site,
+		metrics:       c.Metrics,
 		polls:         newBuckets(string(protocol.QuotaPolls), c.Limits.PollBurst, c.Limits.PollRefill),
 		pages:         c.Limits.continuations(),
 		repeats:       newBuckets(string(protocol.CodeRefetchSpent), c.Limits.PollBurst, c.Limits.PollRefill),
@@ -134,6 +141,7 @@ func New(c Config) *Server {
 	if len(s.identityTypes) == 0 {
 		s.identityTypes = protocol.IdentityTypes()
 	}
+	s.metrics.watch(s)
 	return s
 }
 
@@ -184,7 +192,7 @@ func (s *Server) Handler() http.Handler {
 	if s.site != nil {
 		mux.Handle("/", s.flooding(s.site))
 	}
-	return s.accessLog(s.dated(s.unrouted(mux)))
+	return s.observed(s.dated(s.unrouted(mux)))
 }
 
 // flooding spends the caller's flood budget before h answers (spendRequest).
@@ -199,10 +207,11 @@ func (s *Server) flooding(h http.Handler) http.Handler {
 }
 
 // unrouted spends the caller's flood budget for a request no route of mux
-// matches, before mux answers it 404 or 405 (spendRequest).
+// answers, before mux answers it itself: 404, 405, or a redirect
+// (spendRequest).
 func (s *Server) unrouted(mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, pattern := mux.Handler(r); pattern == "" {
+		if !routed(mux, r) {
 			if p := s.spendRequest(r); p != nil {
 				writeProblem(w, p)
 				return
@@ -210,6 +219,33 @@ func (s *Server) unrouted(mux *http.ServeMux) http.Handler {
 		}
 		mux.ServeHTTP(w, r)
 	})
+}
+
+// routed reports whether one of mux's routes answers r. ServeMux.Handler
+// gives no pattern where none matches, and where the router redirects it
+// gives the pattern the redirect leads to: it redirects a path that is not
+// in its canonical form, and one that names a subtree without its trailing
+// slash (/v1 to /v1/). Both are the router's answers, not a route's.
+func routed(mux *http.ServeMux, r *http.Request) bool {
+	_, pattern := mux.Handler(r)
+	if pattern == "" || !canonical(r.URL.Path) {
+		return false
+	}
+	at := pattern[strings.Index(pattern, "/"):] // the pattern's path: none here names a host
+	return !strings.HasSuffix(at, "/") || strings.HasPrefix(r.URL.Path, at)
+}
+
+// canonical reports whether p is a path as ServeMux keeps it: rooted, with
+// no empty, . or .. element, and a trailing slash only where p had one.
+func canonical(p string) bool {
+	if p == "" || p[0] != '/' {
+		return false
+	}
+	c := path.Clean(p)
+	if strings.HasSuffix(p, "/") && c != "/" {
+		c += "/"
+	}
+	return c == p
 }
 
 // notStored marks every answer of the API as one no cache may keep. What a
@@ -321,7 +357,7 @@ func (s *Server) paced(w http.ResponseWriter, r *http.Request) (http.ResponseWri
 	start := time.Now()
 	if r.Body != nil && r.Body != http.NoBody {
 		_ = rc.SetReadDeadline(start.Add(s.limits.BodyTimeout))
-		r.Body = &pacedBody{ReadCloser: r.Body, rc: rc, start: start, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate)}
+		r.Body = &pacedBody{ReadCloser: r.Body, rc: rc, start: start, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate), m: s.metrics}
 	}
 	return &pacedWriter{ResponseWriter: w, rc: rc, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate)}, r
 }
@@ -334,6 +370,7 @@ type pacedBody struct {
 	got     int64
 	timeout time.Duration
 	rate    int64
+	m       *Metrics
 }
 
 func (p *pacedBody) Read(b []byte) (int, error) {
@@ -341,6 +378,9 @@ func (p *pacedBody) Read(b []byte) (int, error) {
 	if n > 0 {
 		p.got += int64(n)
 		_ = p.rc.SetReadDeadline(p.start.Add(p.timeout + time.Duration(p.got/p.rate)*time.Second))
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		p.m.bodyCut()
 	}
 	return n, err
 }
@@ -790,6 +830,23 @@ func redact(path string) string {
 type statusWriter struct {
 	http.ResponseWriter
 	status int
+	code   protocol.Code // the problem's, when the answer is one (noteCode)
+}
+
+// noteCode tells the statusWriter beneath w, if there is one, that the answer
+// is a problem of code c.
+func noteCode(w http.ResponseWriter, c protocol.Code) {
+	for {
+		switch x := w.(type) {
+		case *statusWriter:
+			x.code = c
+			return
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = x.Unwrap()
+		default:
+			return
+		}
+	}
 }
 
 func (w *statusWriter) WriteHeader(status int) {
@@ -800,17 +857,23 @@ func (w *statusWriter) WriteHeader(status int) {
 // Unwrap lets http.ResponseController reach the connection through the log.
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// accessLog logs method, redacted path, status and duration. Never a pass,
-// never a body.
-func (s *Server) accessLog(h http.Handler) http.Handler {
-	if s.log == nil {
+// observed logs each request (method, redacted path, status and duration;
+// never a pass, never a body) and counts it by route, status and code
+// (Metrics). The route is the pattern the routers matched, which each sets on
+// the request as it routes it: never the path as sent.
+func (s *Server) observed(h http.Handler) http.Handler {
+	if s.log == nil && s.metrics == nil {
 		return h
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		h.ServeHTTP(sw, r)
-		s.log.Printf("%s %s %d %s", r.Method, redact(r.URL.Path), sw.status, time.Since(start).Round(time.Microsecond))
+		took := time.Since(start)
+		if s.log != nil {
+			s.log.Printf("%s %s %d %s", r.Method, redact(r.URL.Path), sw.status, took.Round(time.Microsecond))
+		}
+		s.metrics.answered(r.Pattern, sw.status, sw.code, took)
 	})
 }
 

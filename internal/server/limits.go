@@ -133,6 +133,8 @@ type buckets struct {
 	// settled is closed and replaced each time one is (reserve).
 	held    map[string]int
 	settled chan struct{}
+	// m counts each take (Metrics.limit); nil counts nothing.
+	m *Metrics
 }
 
 // newBuckets is buckets of n, refilled one every interval, for the limit
@@ -175,11 +177,13 @@ func (bs *buckets) reserve(ctx context.Context, key string, now func() time.Time
 			bs.full[key] = next
 			bs.held[key]++
 			bs.mu.Unlock()
+			bs.m.limit(bs.name, true)
 			return &reservation{bs: bs, key: key}, true, 0
 		}
 		inFlight, settled := bs.held[key] > 0, bs.settled
 		bs.mu.Unlock()
 		if !inFlight {
+			bs.m.limit(bs.name, false)
 			return nil, false, over
 		}
 		if give == nil {
@@ -189,8 +193,10 @@ func (bs *buckets) reserve(ctx context.Context, key string, now func() time.Time
 		select {
 		case <-settled:
 		case <-give.C:
+			bs.m.limit(bs.name, false)
 			return nil, false, over
 		case <-ctx.Done():
+			bs.m.limit(bs.name, false)
 			return nil, false, over
 		}
 	}
@@ -242,9 +248,11 @@ func (bs *buckets) take(key string, now time.Time) (ok bool, wait time.Duration)
 	bs.prune(now)
 	next, over := bs.next(key, now)
 	if over > 0 {
+		bs.m.limit(bs.name, false)
 		return false, over
 	}
 	bs.full[key] = next
+	bs.m.limit(bs.name, true)
 	return true, 0
 }
 

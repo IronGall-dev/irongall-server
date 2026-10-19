@@ -54,8 +54,11 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 		if ok, wait := s.polls.take(box.String(), s.now()); !ok {
 			return rateLimited(protocol.QuotaPolls, wait, "poll at most once a minute (Retry-After)")
 		}
+		s.metrics.list(false)
 	} else if ok, wait := s.pages.take(box.String(), s.now()); !ok {
 		return rateLimited(protocol.QuotaPages, wait, "too many list pages at once")
+	} else {
+		s.metrics.list(true)
 	}
 	n, err := s.store.Count(r.Context(), box)
 	if err != nil {
@@ -270,6 +273,7 @@ func (s *Server) fetch(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	s.metrics.fetch(again)
 	h := w.Header()
 	h.Set("Content-Type", protocol.CiphertextContentType)
 	h.Set("Content-Length", strconv.Itoa(len(body)))

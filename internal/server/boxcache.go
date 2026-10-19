@@ -25,6 +25,8 @@ type recCache[K comparable, V any] struct {
 	// merge, if set, is what two copies of an entry hold together, old the
 	// cached one: put and refresh keep it in place of the newer copy alone.
 	merge func(old, cur V) V
+	// note, if set, is told of each hit, miss and eviction (Metrics).
+	note func(event string)
 }
 
 type boxCache = recCache[protocol.Address, *Box]
@@ -50,11 +52,19 @@ func (c *recCache[K, V]) get(k K) (V, bool) {
 	defer c.mu.Unlock()
 	e, ok := c.m[k]
 	if !ok {
+		c.noted("miss")
 		var zero V
 		return zero, false
 	}
+	c.noted("hit")
 	c.ll.MoveToFront(e)
 	return c.clone(e.Value.(V)), true
+}
+
+func (c *recCache[K, V]) noted(event string) {
+	if c.note != nil {
+		c.note(event)
+	}
 }
 
 // put caches v, unless the cache holds a newer rev of it.
@@ -80,6 +90,7 @@ func (c *recCache[K, V]) put(v V) {
 		old := c.ll.Back()
 		c.ll.Remove(old)
 		delete(c.m, c.key(old.Value.(V)))
+		c.noted("eviction")
 	}
 }
 
@@ -145,6 +156,8 @@ type missCache struct {
 	// seq counts the writes seen to the boxes of each shard (the address's
 	// first byte): a miss read before a write is not recorded after it.
 	seq [256]uint64
+	// note, if set, is told of each hit, miss and eviction (Metrics).
+	note func(event string)
 }
 
 func newMissCache(size int) *missCache {
@@ -158,11 +171,19 @@ func (c *missCache) has(a protocol.Address, now time.Time) (missing bool, seq ui
 	defer c.mu.Unlock()
 	if t, ok := c.until[a]; ok {
 		if now.Before(t) {
+			c.noted("hit")
 			return true, 0
 		}
 		delete(c.until, a)
 	}
+	c.noted("miss")
 	return false, c.seq[a[0]]
+}
+
+func (c *missCache) noted(event string) {
+	if c.note != nil {
+		c.note(event)
+	}
 }
 
 // missed records that a read begun at seq found no box a.
@@ -182,6 +203,9 @@ func (c *missCache) missed(a protocol.Address, seq uint64, now time.Time) {
 			}
 		}
 		if len(c.until) >= c.max {
+			for range c.until {
+				c.noted("eviction")
+			}
 			clear(c.until)
 		}
 	}

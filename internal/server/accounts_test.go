@@ -22,6 +22,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // An adopt key names its account, and is known by its SHA-256.
@@ -481,12 +483,14 @@ func TestLargeReadsTakeTurns(t *testing.T) {
 
 // A large body that stops coming is cut off by its deadline, and gives the
 // one large read back (IronGall-dev/irongall-server#7): a large send after it
-// is read at once, not after the stalled one's peer gives up.
+// is read at once, not after the stalled one's peer gives up. The metrics
+// count the cut and both reads.
 func TestAStalledBodyGivesTheLargeReadBack(t *testing.T) {
 	l := relaxed()
 	l.MaxSize, l.AccountMaxSize = 16<<10, 64<<10 // bodies read at once up to 16 KiB, at most 64 KiB
 	l.BodyTimeout, l.BodyMinRate = 300*time.Millisecond, 1<<20
-	e := newEnv(t, l)
+	m := NewMetrics(prometheus.NewRegistry())
+	e := newEnv(t, l, func(c *Config) { c.Metrics = m })
 	_, key := accountEnv(t, e, true, 1)
 	lifted, to := e.box(protocol.Classic), e.box(protocol.Classic)
 	adopt(t, lifted, key)
@@ -513,15 +517,20 @@ func TestAStalledBodyGivesTheLargeReadBack(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest || time.Since(start) > 2*time.Second { // read, then not_age
 		t.Fatalf("a large send behind a stalled one: %d after %s, want 400 at once", resp.StatusCode, time.Since(start))
 	}
+	if cut, taken := testutil.ToFloat64(m.cut), testutil.ToFloat64(m.largeRead.WithLabelValues("taken")); cut != 1 || taken != 2 {
+		t.Fatalf("the metrics: %v bodies cut, %v large reads taken, want 1 and 2", cut, taken)
+	}
 }
 
 // A send waiting for the one large read gives up after the body timeout, with
-// 503 and Retry-After, and does not wait on its own client.
+// 503 and Retry-After, and does not wait on its own client. The metrics count
+// the wait that timed out.
 func TestAWaitForTheLargeReadIsBounded(t *testing.T) {
 	l := relaxed()
 	l.MaxSize, l.AccountMaxSize = 16<<10, 64<<10
 	l.BodyTimeout = 200 * time.Millisecond
-	e := newEnv(t, l)
+	m := NewMetrics(prometheus.NewRegistry())
+	e := newEnv(t, l, func(c *Config) { c.Metrics = m })
 	_, key := accountEnv(t, e, true, 1)
 	lifted, to := e.box(protocol.Classic), e.box(protocol.Classic)
 	adopt(t, lifted, key)
@@ -539,5 +548,8 @@ func TestAWaitForTheLargeReadIsBounded(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable || time.Since(start) > 2*time.Second || resp.Header.Get("Retry-After") == "" {
 		t.Fatalf("the wait for the large read: %d after %s, Retry-After %q", resp.StatusCode, time.Since(start), resp.Header.Get("Retry-After"))
+	}
+	if got := testutil.ToFloat64(m.largeRead.WithLabelValues("timed_out")); got != 1 {
+		t.Fatalf("the metrics count %v waits that timed out, want 1", got)
 	}
 }
