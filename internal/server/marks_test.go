@@ -2,14 +2,20 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,7 +66,10 @@ func TestAFirstPageIsNotModifiedWhileUnchanged(t *testing.T) {
 			t.Errorf("an empty box, If-None-Match %q: %d %q, ETag %q, want 304 with no body", tag, resp.StatusCode, body, resp.Header.Get("ETag"))
 		}
 	}
-	for _, tag := range []string{`"0-0000000000000000"`, `"` + strings.Repeat("0", 32) + `"`, emptyTag[1 : len(emptyTag)-1]} {
+	// A comma and a "*" are a tag's own characters (RFC 9110 §8.8.3): a tag
+	// that holds them is one tag, and so is "*" among tags no page's.
+	planted := []string{`",*,"`, `"x,*,y"`, `W/"a,W/*,b"`, emptyTag[:len(emptyTag)-1] + `,x"`, emptyTag + `, *`, emptyTag + ` junk`}
+	for _, tag := range append([]string{`"0-0000000000000000"`, `"` + strings.Repeat("0", 32) + `"`, emptyTag[1 : len(emptyTag)-1]}, planted...) {
 		if resp, _ := poll("", tag); resp.StatusCode != http.StatusOK {
 			t.Errorf("an empty box, If-None-Match %q: %d, want 200", tag, resp.StatusCode)
 		}
@@ -159,5 +168,88 @@ func TestAnIDThatSharesAPrefixIsNotHeld(t *testing.T) {
 	}
 	if res := receive(t, b); len(res.Delivered) != 1 {
 		t.Fatalf("the held message: delivered %d", len(res.Delivered))
+	}
+}
+
+// tagFront stands between a box and the server. While plant is set, it gives a
+// 200 to a first-page poll the tag plant in place of the page's own; after,
+// it records each first-page poll's status.
+type tagFront struct {
+	mu     sync.Mutex
+	plant  string
+	status []int
+}
+
+func (f *tagFront) serve(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/messages") || r.URL.RawQuery != "" {
+		next.ServeHTTP(w, r)
+		return
+	}
+	rec := httptest.NewRecorder()
+	next.ServeHTTP(rec, r)
+	maps.Copy(w.Header(), rec.Header())
+	f.mu.Lock()
+	if f.plant != "" && rec.Code == http.StatusOK {
+		w.Header().Set("ETag", f.plant)
+	} else {
+		f.status = append(f.status, rec.Code)
+	}
+	f.mu.Unlock()
+	w.WriteHeader(rec.Code)
+	_, _ = w.Write(rec.Body.Bytes())
+}
+
+func (f *tagFront) honest() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.plant = ""
+}
+
+// A tag a hostile server hands an empty box once is one tag to this server,
+// whatever commas and "*" it holds: the box's polls are answered in full while
+// it keeps that tag, and the mail sent after is delivered
+// (IronGall-dev/irongall-client#149).
+func TestAPlantedTagHidesNoMailAtAnHonestServer(t *testing.T) {
+	for _, plant := range []string{`",*,"`, `"x,*,y"`, `W/"a,W/*,b"`} {
+		e := newEnv(t, relaxed())
+		a, b := e.box(protocol.Classic), e.box(protocol.Classic)
+		f := &tagFront{plant: plant}
+		e.setMiddle(f.serve)
+		receive(t, b) // the one hostile answer: the box is empty, and only the tag is the front's
+		f.honest()
+		if kept, _ := os.ReadFile(filepath.Join(b.Dir(), "etag")); string(kept) != plant {
+			t.Fatalf("the box keeps %q, want the planted %s", kept, plant)
+		}
+		send(t, a, b, "one")
+		send(t, a, b, "two")
+		got := 0
+		for range 4 {
+			e.clock.Add(2 * time.Minute)
+			got += len(receive(t, b).Delivered)
+		}
+		n, _ := e.store.Count(context.Background(), b.Address())
+		if got != 2 || f.status[0] != http.StatusOK || n != 0 {
+			t.Errorf("with %s kept: polls answered %v, delivered %d of 2, the server holds %d", plant, f.status, got, n)
+		}
+	}
+}
+
+// Nor is that mail lost to the renewals the box makes meanwhile, which retire
+// the prekey it was sealed to.
+func TestAMailHiddenByAPlantedTagIsNotLost(t *testing.T) {
+	e := newEnv(t, relaxed())
+	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
+	f := &tagFront{plant: `",*,"`}
+	e.setMiddle(f.serve)
+	receive(t, b)
+	f.honest()
+	send(t, a, b, "sealed to the prekey current now")
+	got := 0
+	for range 3 { // a day apart: each drain renews, and drops retired prekeys
+		e.clock.Add(25 * time.Hour)
+		got += len(receive(t, b).Delivered)
+	}
+	if got != 1 {
+		t.Errorf("polls answered %v, delivered %d of 1", f.status, got)
 	}
 }

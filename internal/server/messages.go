@@ -8,7 +8,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -98,8 +97,10 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 // every process computes alike with no key, and it changes with any message
 // that enters or leaves the page or the count. A page that holds mail cannot
 // be made to share an empty box's tag, the one a client keeps: that is a
-// second preimage of 128 bits. An If-None-Match that names it, compared weakly (RFC 9110
-// §13.1.2), is answered 304 with no body: its ETag, its Retry-After and the
+// second preimage of 128 bits. An If-None-Match that names it, read as RFC
+// 9110 §13.1.2 has a server evaluate one (protocol.IfNoneMatch: "*" only as
+// the whole value, each listed tag through its closing quote, compared
+// weakly), is answered 304 with no body: its ETag, its Retry-After and the
 // headers every answer carries (RFC 9110 §15.4.5).
 func (s *Server) writeList(w http.ResponseWriter, r *http.Request, l protocol.MessageList, first bool) {
 	body, err := jsonBytes(l)
@@ -113,7 +114,7 @@ func (s *Server) writeList(w http.ResponseWriter, r *http.Request, l protocol.Me
 		sum := sha256.Sum256(body)
 		tag := `"` + hex.EncodeToString(sum[:16]) + `"`
 		h.Set("ETag", tag)
-		if etagMatch(r.Header.Get("If-None-Match"), tag) {
+		if protocol.IfNoneMatch(r.Header.Values("If-None-Match"), tag) {
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
@@ -121,18 +122,6 @@ func (s *Server) writeList(w http.ResponseWriter, r *http.Request, l protocol.Me
 	h.Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
-}
-
-// etagMatch is If-None-Match's weak comparison (RFC 9110 §13.1.2): a tag a
-// proxy on the way marked weak still matches, and * matches any page.
-func etagMatch(header, etag string) bool {
-	for _, t := range strings.Split(header, ",") {
-		t = strings.TrimPrefix(strings.TrimSpace(t), "W/")
-		if t == etag || t == "*" {
-			return true
-		}
-	}
-	return false
 }
 
 // drains remembers, for each box with a drain open, the one next_cursor this
