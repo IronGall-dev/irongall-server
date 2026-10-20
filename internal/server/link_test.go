@@ -78,6 +78,10 @@ func TestLinkPage(t *testing.T) {
 	if resp, body := get(http.MethodHead, "/to/"+a); resp.StatusCode != http.StatusOK || body != "" {
 		t.Errorf("HEAD: %d %q", resp.StatusCode, body)
 	}
+	// A shared link picks up a query, and the page is the same page.
+	if resp, got := get(http.MethodGet, "/to/"+a+"?utm_source=chat&x=1"); resp.StatusCode != http.StatusOK || got != body {
+		t.Errorf("GET /to/<address> with a query: %d, the same page %v", resp.StatusCode, got == body)
+	}
 	if resp, _ := get(http.MethodPost, "/to/"+a); resp.StatusCode == http.StatusOK {
 		t.Error("POST: 200")
 	}

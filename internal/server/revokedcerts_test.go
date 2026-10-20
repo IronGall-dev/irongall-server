@@ -51,6 +51,38 @@ func (e *env) sendTo(to *raw, serial, under uint64, from *raw, fromUnder uint64)
 	return e.do("POST", to.path("/messages"), sealedTo(serial, under, ct.Bytes()), from.pass(fromUnder))
 }
 
+// A stored revocation of certificates that does not parse is an error
+// wherever it is read, never "nothing revoked": nothing this server writes
+// is one, so one in the store is a fault, and a fault must not take back
+// what the identity revoked. A pass under the box's certificate, a send to
+// the box and a revocation of its certificates each fail and take nothing,
+// and Box.revocations, which a store reads when it adds revocations to what
+// it holds, is an error too.
+func TestAStoredListThatDoesNotParseIsAnError(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, relaxed())
+	r, other := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+	bad := []byte("not a revocation of certificates\n")
+	if err := e.store.Revoke(ctx, r.id.Address(), &Revocations{Identity: r.id.Document(), Certs: bad, CertsSig: []byte("x"), Through: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for name, got := range map[string]reply{
+		"a list under the box's certificate": e.do("GET", r.path("/messages"), nil, r.pass(1)),
+		"a send to the box":                  e.sendTo(r, 1, 1, other, 1),
+		"a revocation of its certificates":   e.do("PUT", r.path("/revocations"), r.certs(1), ""),
+	} {
+		if got.status != 503 {
+			t.Errorf("%s, with a stored list that does not parse: %d %s", name, got.status, got.body)
+		}
+	}
+	if n, _ := e.store.Count(ctx, r.id.Address()); n != 0 {
+		t.Errorf("the box holds %d messages", n)
+	}
+	if _, err := (&Box{Identity: r.id.Document(), RevokedCerts: bad}).revocations(); err == nil {
+		t.Error("a box whose list does not parse gives its revocations")
+	}
+}
+
 func TestRevokedCertificates(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t, relaxed())
