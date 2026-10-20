@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,7 +29,14 @@ func TestTheAdminSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = first.Close() // a socket file left by a process that is gone
+	// A socket file left by a process that is gone: net.Listen's listener
+	// unlinks its file as it closes, so this one is told not to
+	// (IronGall-dev/irongall-server#49).
+	first.(*net.UnixListener).SetUnlinkOnClose(false)
+	_ = first.Close()
+	if fi, err := os.Lstat(path); err != nil || fi.Mode().Type() != fs.ModeSocket {
+		t.Fatalf("no stale socket to replace: %v", err)
+	}
 	if err := os.WriteFile(path+".x", nil, 0o600); err != nil {
 		t.Fatal(err)
 	}

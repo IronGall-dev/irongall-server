@@ -110,7 +110,7 @@ func serve(args []string) error {
 	fs.IntVar(&l.ACLEntries, "acl-entries", l.ACLEntries, "the most entries a box's ACL holds, its two lists together (0: off)")
 	fs.DurationVar(&l.BodyTimeout, "body-timeout", l.BodyTimeout, "how long a request body, or a response, may take before one more second for each -body-min-rate bytes moved; also the longest wait for the one large read (0: off)")
 	fs.IntVar(&l.BodyMinRate, "body-min-rate", l.BodyMinRate, "bytes a second a body must keep up, as Apache's RequestReadTimeout MinRate (0: off)")
-	adminSocket := fs.String("admin-socket", "", "a Unix socket for the operator's commands (irongalld limits): made 0600 by this process, never on the API's listener (empty: none)")
+	adminSocket := fs.String("admin-socket", "", "a Unix socket for the operator's commands (irongalld limits): 0600 from the moment this process makes it, never on the API's listener (empty: none)")
 	idle := fs.Duration("idle-timeout", 75*time.Second, "how long an idle keep-alive connection stays open (nginx's default as a server): above the idle timeout of a proxy in front, which may otherwise reuse a connection this one has just closed")
 	metricsListen := fs.String("metrics-listen", "", "address to serve the operator's metrics on, at /metrics in Prometheus' text format: a listener of its own, never the API's (empty: none)")
 	siteDir := fs.String("site", "", "a directory of pages to serve at every path outside /v1/ and /to/, each at its own path and an index at its directory's, read once at start (empty: none; those paths are 404)")

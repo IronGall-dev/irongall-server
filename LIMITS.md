@@ -76,7 +76,7 @@ Every `429 rate_limited` names its limit in `quota_id`, the name in the last col
 
 `irongalld limits top -socket PATH -limit NAME [-n COUNT]` lists the keys one limit holds deepest in debt now, deepest first: which box takes the most new mail (`mailbox_busy`), which address registers the most (`registrations`). A limit is named as a refusal names it: a `rate_limited`'s quota, or the code of its own (`mailbox_busy`, `fetch_paced`, `refetch_spent`). It answers `{"limit": NAME, "keys": [{"key": <a box's address or a caller's>, "full_in": <seconds until its bucket is full>}]}`, reads memory and keeps nothing. How often each limit refuses is the metrics' (`ARCHITECTURE.md` § Metrics); which key it refuses is no metric, since an address or a box is no label.
 
-Both go through the running server's `-admin-socket`, because the counts are in that process's memory and a process of its own could not reach them; so each sees one process's (weakness 1). The socket is a Unix socket the server makes 0600, never on the API's listener, and the server logs that a command ran and which limits it touched, never an address or a box.
+Both go through the running server's `-admin-socket`, because the counts are in that process's memory and a process of its own could not reach them; so each sees one process's (weakness 1). The socket is a Unix socket the server makes 0600 from its bind on, never on the API's listener; put it in a directory no other user can write, since one who can may replace it. The server logs that a command ran and which limits it touched, never an address or a box.
 
 ## Tested
 
