@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -209,13 +208,13 @@ const linkRoute = "GET " + protocol.LinkPath + "{addr}"
 func (s *Server) Handler() http.Handler {
 	api := http.NewServeMux()
 	for _, r := range s.routes() {
-		api.HandleFunc(r.pattern, s.handle(r.h))
+		api.Handle(r.pattern, registered{s.handle(r.h)})
 	}
 	mux := http.NewServeMux()
-	mux.Handle(linkRoute, s.flooding(s.linkPage()))
-	mux.Handle("/v1/", notStored(s.whenReady(s.unrouted(api))))
+	mux.Handle(linkRoute, registered{s.flooding(s.linkPage())})
+	mux.Handle("/v1/", registered{notStored(s.whenReady(s.unrouted(api)))})
 	if s.site != nil {
-		mux.Handle("/", s.flooding(s.site))
+		mux.Handle("/", registered{s.flooding(s.site)})
 	}
 	return s.observed(s.dated(s.unrouted(mux)))
 }
@@ -246,32 +245,18 @@ func (s *Server) unrouted(mux *http.ServeMux) http.Handler {
 	})
 }
 
-// routed reports whether one of mux's routes answers r. ServeMux.Handler
-// gives no pattern where none matches, and where the router redirects it
-// gives the pattern the redirect leads to: it redirects a path that is not
-// in its canonical form, and one that names a subtree without its trailing
-// slash (/v1 to /v1/). Both are the router's answers, not a route's.
+// routed reports whether one of mux's routes answers r: whether the handler
+// ServeMux.Handler finds for it, the one ServeHTTP calls, is one the server
+// registered, not one the router makes itself (a redirect, a 404 or a 405).
+// So nothing here copies how ServeMux matches, cleans or redirects a path.
 func routed(mux *http.ServeMux, r *http.Request) bool {
-	_, pattern := mux.Handler(r)
-	if pattern == "" || !canonical(r.URL.Path) {
-		return false
-	}
-	at := pattern[strings.Index(pattern, "/"):] // the pattern's path: none here names a host
-	return !strings.HasSuffix(at, "/") || strings.HasPrefix(r.URL.Path, at)
+	h, _ := mux.Handler(r)
+	_, ok := h.(registered)
+	return ok
 }
 
-// canonical reports whether p is a path as ServeMux keeps it: rooted, with
-// no empty, . or .. element, and a trailing slash only where p had one.
-func canonical(p string) bool {
-	if p == "" || p[0] != '/' {
-		return false
-	}
-	c := path.Clean(p)
-	if strings.HasSuffix(p, "/") && c != "/" {
-		c += "/"
-	}
-	return c == p
-}
+// registered marks each handler the server puts on one of its routers.
+type registered struct{ http.Handler }
 
 // notStored marks every answer of the API as one no cache may keep. What a
 // box's identity, prekey or revocation is can change at any moment, and an

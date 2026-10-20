@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -336,6 +337,59 @@ func TestFailedPassesAreCountedPerCaller(t *testing.T) {
 	e.want(e.do(http.MethodGet, list, nil, good), http.StatusOK, "")
 	e.clock.Add(31 * time.Second)
 	e.want(e.do(http.MethodGet, list, nil, e.pass(b)), http.StatusOK, "")
+}
+
+// forgedFromPublic is a pass for box a made from what GET /v1/<a> serves
+// anyone: the box's prekey signature, which carries its current
+// certificate, where the pass's signature goes. It passes every check but
+// the working key's signature.
+func forgedFromPublic(t *testing.T, e *env, a protocol.Address) (protocol.RegisterRequest, string) {
+	t.Helper()
+	var br protocol.BoxResponse
+	if err := json.Unmarshal(e.do("GET", "/v1/"+a.String(), nil, "").body, &br); err != nil {
+		t.Fatal(err)
+	}
+	na := e.clock.Now().UTC().Truncate(time.Second).Add(4 * time.Minute)
+	pass := protocol.PassScheme + ` address="` + a.String() + `", not_after="` + na.Format(protocol.TimeLayout) +
+		`", signature="` + base64.StdEncoding.EncodeToString(br.PrekeySignature) + `"`
+	return protocol.RegisterRequest{Identity: br.Identity, Prekey: br.Prekey, PrekeySignature: br.PrekeySignature}, pass
+}
+
+// A registration of a box this process holds is answered from its record,
+// before the registrations count, so its pass is checked as any call's is:
+// one the process has not seen reserves a miss of its caller's address,
+// kept when it fails (IronGall-dev/irongall-server#40). Past the misses it
+// is refused before it is checked, as on any other route.
+func TestAnIdenticalRetrysPassIsCounted(t *testing.T) {
+	l := relaxed()
+	l.MissesPerMinute = 2
+	e := newEnv(t, l)
+	r := e.raw().register(protocol.MaxPrekeyLifetime)
+	reg, forged := forgedFromPublic(t, e, r.id.Address())
+	for range 2 {
+		e.want(e.do("PUT", r.path(""), reg, forged), http.StatusUnauthorized, protocol.CodeUnauthorized)
+	}
+	e.limited(e.do("PUT", r.path(""), reg, forged), protocol.QuotaMisses)
+	e.limited(e.do("GET", r.path("/acl"), nil, forged), protocol.QuotaMisses)
+}
+
+// An identical retry of a registration, once its pass is checked, spends one
+// of the box's calls, as a renewal's identical retry does: so passes in turn,
+// each checked in full, are bounded by the box's budget
+// (IronGall-dev/irongall-server#40). An honest retry, with the same pass or a
+// new one, is taken.
+func TestAnIdenticalRetrySpendsTheBoxsCalls(t *testing.T) {
+	l := relaxed()
+	l.CallBurst, l.CallRefill = 2, time.Hour
+	e := newEnv(t, l)
+	r := e.raw().register(protocol.MaxPrekeyLifetime)
+	reg, p1 := r.registration(1), r.pass(1)
+	e.clock.Add(time.Second)
+	p2 := r.pass(1)
+	e.want(e.do("PUT", r.path(""), reg, p1), http.StatusOK, "")
+	e.want(e.do("PUT", r.path(""), reg, p2), http.StatusOK, "")
+	e.limited(e.do("PUT", r.path(""), reg, p1), protocol.QuotaCalls)
+	e.limited(e.do("GET", r.path("/acl"), nil, p2), protocol.QuotaCalls)
 }
 
 // A reservation that would be refused only because others of its key are in

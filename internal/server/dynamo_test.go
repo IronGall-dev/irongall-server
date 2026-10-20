@@ -407,6 +407,28 @@ func TestRestartLoadsLazily(t *testing.T) {
 	}
 }
 
+// A revocation sent again to a process that has not loaded the address
+// carries no pass, and loads nothing there (ARCHITECTURE.md § Startup;
+// IronGall-dev/irongall-server#42).
+func TestAResentRevocationLoadsNothingElsewhere(t *testing.T) {
+	e, _ := dynamoEnv(t)
+	a := e.box(protocol.Classic)
+	rec := record(t, a)
+	e.want(e.do("PUT", revocationPath(a.Address()), rec, ""), 201, "")
+
+	fresh := startDynamo(t, e.clock.Now)
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: fresh, Limits: relaxed(), Now: e.clock.Now, Ready: fresh.Ready}).Handler()))
+	t.Cleanup(srv.Close)
+	e2 := &env{t: t, clock: e.clock, store: fresh, srv: srv}
+	e2.want(e2.do("PUT", revocationPath(a.Address()), rec, ""), 410, protocol.CodeRevoked)
+	if n := fresh.loads.Load(); n != 0 {
+		t.Errorf("a revocation sent again loaded %d addresses", n)
+	}
+	if _, ok := fresh.Held(a.Address()); ok {
+		t.Error("a revocation sent again left its address in memory")
+	}
+}
+
 // Polls read a box once per process, on its first use: every later poll,
 // empty or not, is answered from memory, kept current by the stream.
 func TestPollsReadOncePerProcess(t *testing.T) {

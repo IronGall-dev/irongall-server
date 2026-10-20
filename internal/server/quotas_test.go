@@ -160,11 +160,13 @@ func TestRegistrationsAreCountedByTheRange(t *testing.T) {
 // Every call with no pass, and every request no route matches, the link page
 // and a site's pages among them, spends one flood budget of its caller's
 // address (IronGall-dev/irongall-server#58), refused rate_limited naming
-// requests. A call with a pass spends its box's budgets, never this one, and
-// another address's budget is its own.
+// requests. So do a registration and a renewal, whose bodies are read before
+// any pass, and they are refused before their bodies are read
+// (IronGall-dev/irongall-server#34). A call whose pass comes first spends its
+// box's budgets, never this one, and another address's budget is its own.
 func TestTheFloodBudget(t *testing.T) {
 	l := relaxed()
-	l.RequestBurst, l.RequestRefill = 6, time.Second
+	l.RequestBurst, l.RequestRefill = 8, time.Second
 	e := newEnv(t, l)
 	b := e.raw().register(protocol.MaxPrekeyLifetime)
 	call := e.caller()
@@ -176,6 +178,8 @@ func TestTheFloodBudget(t *testing.T) {
 		{"GET", b.path(""), http.StatusOK},
 		{"GET", b.path("/revocations"), http.StatusNotFound},
 		{"PUT", b.path("/revocations"), http.StatusBadRequest},
+		{"PUT", b.path(""), http.StatusBadRequest},
+		{"PUT", b.path("/prekey"), http.StatusBadRequest},
 		{"GET", protocol.LinkPath + b.id.Address().String(), http.StatusOK},
 		{"GET", "/v1/" + b.id.Address().String() + "/nothing/here", http.StatusNotFound},
 		{"GET", "/nothing", http.StatusNotFound},
@@ -191,6 +195,25 @@ func TestTheFloodBudget(t *testing.T) {
 	}
 	e.limited(call(ip, "GET", "/nothing", nil, ""), protocol.QuotaRequests)
 	e.limited(call(ip, "GET", protocol.LinkPath+b.id.Address().String(), nil, ""), protocol.QuotaRequests)
+	// Each of these is answered from what its body holds, from an address
+	// with its budget, and refused before its body is read from one without.
+	b.prekeyUnder(b.work[1], 2, e.clock.Now().Add(protocol.PrekeyLifetime), nil)
+	e.want(e.do("PUT", b.path("/prekey"), b.upload(2), b.pass(1)), http.StatusOK, "")
+	for _, c := range []struct {
+		path   string
+		body   any
+		pass   string
+		status int
+	}{
+		{b.path(""), b.registration(2), "", http.StatusUnauthorized},                       // sent again with no pass
+		{b.path("/prekey"), b.upload(1), "", http.StatusConflict},                          // the box's previous statement
+		{b.path("/prekey"), strings.Repeat("A", 60<<10), b.pass(1), http.StatusBadRequest}, // not an object
+	} {
+		if got := call("198.51.100.6", "PUT", c.path, c.body, c.pass); got.status != c.status {
+			t.Fatalf("PUT %s: %d, want %d: %s", c.path, got.status, c.status, got.body)
+		}
+		e.limited(call(ip, "PUT", c.path, c.body, c.pass), protocol.QuotaRequests)
+	}
 	if got := call(ip, "GET", b.path("/messages"), nil, b.pass(1)); got.status != http.StatusOK {
 		t.Fatalf("a call with a pass from a flooding address: %d %s", got.status, got.body)
 	}
@@ -237,6 +260,43 @@ func TestWhatNoRouteAnswersIsCounted(t *testing.T) {
 	e.want(call(ip, "GET", b.path("/acl"), nil, b.pass(1)), http.StatusOK, "")
 	if got := call(ip, "GET", "/nothing", nil, ""); got.status != http.StatusNotFound {
 		t.Fatalf("after a call with its pass, a request no route answers: %d", got.status)
+	}
+}
+
+// A request is counted once, by the router or by the route it reaches, never
+// by both, whatever its path escapes and whatever its method: the router
+// matches the path as sent, where an escaped dot or slash is no separator,
+// and leaves a CONNECT's path as sent (IronGall-dev/irongall-server#60). A
+// route that takes a pass spends none of the flood budget.
+func TestARequestIsCountedOnceWhateverItsPathEscapes(t *testing.T) {
+	l := relaxed()
+	l.RequestBurst, l.RequestRefill = 3, time.Hour
+	e := newEnv(t, l)
+	b := e.raw().register(protocol.MaxPrekeyLifetime)
+	direct := e.callerOf(e.server.Handler()) // a router's answers, which no description holds
+	for i, c := range []struct {
+		method, path, pass string
+		status, spends     int
+	}{
+		{"GET", "/v1/%2e%2e/x", "", http.StatusNotFound, 1},                         // the router's 404, under /v1/
+		{"CONNECT", "/v1/x/../y", "", http.StatusNotFound, 1},                       // the one method whose path the router leaves as sent
+		{"GET", "/v1/%2e", "", http.StatusBadRequest, 1},                            // the read of a box, with no pass: a route
+		{"GET", "/to/%2e", "", http.StatusNotFound, 1},                              // the link page: a route
+		{"GET", b.path("/messages/%2e%2e"), b.pass(1), http.StatusNotFound, 0},      // a route that takes a pass
+		{"GET", b.path("/messages/.."), b.pass(1), http.StatusTemporaryRedirect, 1}, // the router's redirect
+		{"GET", "*", "", http.StatusBadRequest, 1},                                  // the router's 400, given before it looks
+	} {
+		ip := "198.51.100." + strconv.Itoa(i+1)
+		if got := direct(ip, c.method, c.path, nil, c.pass); got.status != c.status {
+			t.Fatalf("%s %s: %d, want %d: %s", c.method, c.path, got.status, c.status, got.body)
+		}
+		left := 0
+		for left < l.RequestBurst && direct(ip, "GET", "/nothing", nil, "").status == http.StatusNotFound {
+			left++
+		}
+		if spent := l.RequestBurst - left; spent != c.spends {
+			t.Errorf("%s %s spent %d of the flood budget, want %d", c.method, c.path, spent, c.spends)
+		}
 	}
 }
 

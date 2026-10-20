@@ -479,13 +479,33 @@ func TestARevocationOutlivesTheProcess(t *testing.T) {
 }
 
 // countingDeletes wraps a Store and counts DeleteMessages, the read of the
-// messages table a revocation draws. Its next fail calls fail before the
-// store is asked, as a store that is down for a moment does.
+// messages table a revocation draws, and Count. Its next fail calls fail
+// before the store is asked, as a store that is down for a moment does.
+// While cold, Held knows no address, as in a process that has loaded none.
 type countingDeletes struct {
 	Store
-	mu   sync.Mutex
-	n    int
-	fail int
+	mu     sync.Mutex
+	n      int
+	counts int
+	fail   int
+	cold   bool
+}
+
+func (s *countingDeletes) Held(a protocol.Address) (Standing, bool) {
+	s.mu.Lock()
+	cold := s.cold
+	s.mu.Unlock()
+	if cold {
+		return Standing{}, false
+	}
+	return s.Store.Held(a)
+}
+
+func (s *countingDeletes) Count(ctx context.Context, a protocol.Address) (int, error) {
+	s.mu.Lock()
+	s.counts++
+	s.mu.Unlock()
+	return s.Store.Count(ctx, a)
 }
 
 func (s *countingDeletes) DeleteMessages(ctx context.Context, a protocol.Address) error {
@@ -584,6 +604,57 @@ func TestARevocationRetriedAfterAFailedDeleteDeletes(t *testing.T) {
 	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
 	if n := cs.deletes(); n != 2 {
 		t.Errorf("a revocation, its retry and one more read the messages table %d times, want 2", n)
+	}
+}
+
+// A revocation sent again carries no pass, so where memory does not hold the
+// address it loads nothing and changes nothing: what a failed delete left,
+// the mail and the box's record, waits for its expiry there, served to
+// nobody. A process whose memory holds the address deletes both
+// (IronGall-dev/irongall-server#42).
+func TestAResentRevocationLoadsNothing(t *testing.T) {
+	ctx := context.Background()
+	e, cs := countingEnv(t)
+	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
+	send(t, b, a, "waiting in A's box when it is revoked")
+	rec := record(t, a)
+	path := revocationPath(a.Address())
+	left := func() (int, bool) {
+		t.Helper()
+		n, err := cs.Store.Count(ctx, a.Address())
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, err := cs.Store.Box(ctx, a.Address())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n, stored.hasRecord()
+	}
+
+	cs.mu.Lock()
+	cs.fail = 1
+	cs.mu.Unlock()
+	if r := e.do("PUT", path, rec, ""); r.status < 500 {
+		t.Fatalf("a revocation whose delete failed was answered %d: %s", r.status, r.body)
+	}
+	cs.mu.Lock()
+	cs.cold, cs.counts = true, 0
+	cs.mu.Unlock()
+	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
+	cs.mu.Lock()
+	counts := cs.counts
+	cs.cold = false
+	cs.mu.Unlock()
+	if n := cs.deletes(); counts != 0 || n != 1 {
+		t.Errorf("a revocation sent again where memory holds nothing counted the mail %d times and deleted it %d times, want neither", counts, n-1)
+	}
+	if n, record := left(); n != 1 || !record {
+		t.Fatalf("where memory holds nothing, a revocation sent again left %d messages and a record %v, want the 1 and the record", n, record)
+	}
+	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
+	if n, record := left(); n != 0 || record {
+		t.Errorf("where memory holds the address, a revocation sent again left %d messages and a record %v, want neither", n, record)
 	}
 }
 

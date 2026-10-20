@@ -22,15 +22,20 @@ const registerLimit = 64 << 10
 const hintDocument = "the identity document is \"irongall-v1\", LF, one SSH public key with no comment, LF: look for a comment, CRLF or a missing final newline"
 
 // register is PUT /v1/<address> (PROTOCOL.md §3). It is a call of a box that
-// does not exist yet, so its address pays for it: the statement and the pass
-// it carries are checked only for a box this process does not already hold,
-// after the address's count of registrations.
+// does not exist yet, so its address pays for it: its body is read only once
+// the call has spent one of its address's flood budget, as a revocation's is
+// (spendRequest), and the statement and the pass it carries are checked only
+// for a box this process does not already hold, after the address's count of
+// registrations.
 //
 // A registration is held to what is kept of the address, box or none: 410
 // while the address is revoked, nothing under a certificate its identity
 // revoked, and, while a deleted box's record is kept, a later certificate
 // than its last and a key it never published, which undoes the delete.
 func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
+	if p := s.spendRequest(r); p != nil {
+		return p
+	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -59,10 +64,10 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 		return failErr(protocol.CodeBadKey, "make a new identity: irongall init in a new box", err)
 	}
 	// Registration never changes a box, so a box this process holds is
-	// answered from its record, before anything that costs is checked; so is
-	// an address its identity revoked.
+	// answered from its record, before the registrations count and the
+	// statement's signatures; so is an address its identity revoked.
 	if cur, ok := s.store.Known(h); ok && settled(cur) {
-		return s.registered(w, r, id, cur, &req)
+		return s.registered(w, r, id, cur, &req, false)
 	}
 	if err := s.spendRegistration(r, ""); err != nil {
 		return err
@@ -77,7 +82,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	case err != nil:
 		return err
 	case settled(cur):
-		return s.registered(w, r, id, cur, &req)
+		return s.registered(w, r, id, cur, &req, true)
 	case cur != nil:
 		if listed, err := cur.listed(cert.Serial()); err != nil {
 			return err
@@ -131,7 +136,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 		p.retryAfter = time.Second
 		return p
 	}
-	return s.registered(w, r, id, cur, &req)
+	return s.registered(w, r, id, cur, &req, true)
 }
 
 // statementRevoked is the answer to a prekey statement signed under a
@@ -147,13 +152,17 @@ func settled(b *Box) bool { return b.open() || b != nil && b.State == Revoked }
 // registered answers a registration of a box that is registered, or of an
 // address that is revoked, from its record: registration never changes it.
 // An identical retry is answered 200 once its pass, under the box's current
-// certificate, is checked; nothing else is. A pass the server remembers costs
-// no check, and one that does not verify counts against the caller's address
-// (checkPassBounded). A certificate the identity revoked signs nothing this
-// server takes, the box's current statement sent again included, so it is
-// refused before the pass, as a prekey upload's identical retry is
-// (PROTOCOL.md §6.3a).
-func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol.Identity, cur *Box, req *protocol.RegisterRequest) error {
+// certificate, is checked; nothing else is. A certificate the identity
+// revoked signs nothing this server takes, the box's current statement sent
+// again included, so it is refused before the pass, as a prekey upload's
+// identical retry is (PROTOCOL.md §6.3a).
+//
+// bounded is true where the registrations count was taken first, and bounds
+// the pass's check (checkPassBounded). Where it was not, a box this process
+// holds, the retry is a renewal's identical retry in all but its route: a
+// miss is reserved before its pass (checkPass), and the box's calls are spent
+// once it passes.
+func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol.Identity, cur *Box, req *protocol.RegisterRequest, bounded bool) error {
 	switch {
 	case cur.State == Revoked:
 		return revoked()
@@ -165,8 +174,18 @@ func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol
 	} else if listed {
 		return statementRevoked()
 	}
-	if err := s.checkPassBounded(r, cur.Addr, string(id.PublicKey().Marshal()), cur.Cert); err != nil {
-		return err
+	key := string(id.PublicKey().Marshal())
+	if bounded {
+		if err := s.checkPassBounded(r, cur.Addr, key, cur.Cert); err != nil {
+			return err
+		}
+	} else {
+		if err := s.checkPass(r, cur.Addr, key, cur.Cert, nil); err != nil {
+			return err
+		}
+		if err := s.spendOwner(r.Context(), cur.Addr); err != nil {
+			return err
+		}
 	}
 	writeJSON(w, http.StatusOK, struct{}{}) // an identical retry
 	return nil
@@ -277,7 +296,15 @@ func (s *Server) checkPrekey(id *protocol.Identity, statement, sig []byte) (*pro
 // signature is checked: the statement's place in that order is read from it
 // unverified (protocol.PrekeyOrder), and a statement the box holds already is
 // answered from its record.
+//
+// The pass is read only after the body, so until then the call is its
+// address's: it spends the address's flood budget first, as a registration
+// and a revocation do (spendRequest), and none of the box's budgets until
+// its pass is checked.
 func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
+	if p := s.spendRequest(r); p != nil {
+		return p
+	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -646,10 +673,18 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// deleteHeld deletes what is left of revoked address b's box: its mail
-// while memory shows the box holding any, and a record left beside the
-// revocation, by a delete that failed or a registration that raced it.
+// deleteHeld deletes what is left of revoked address b's box where memory
+// holds the address (Store.Held): its mail while memory shows the box holding
+// any, and a record left beside the revocation, by a delete that failed or a
+// registration that raced it. Its caller carries no pass, so elsewhere it
+// loads nothing and changes nothing, and what is left waits for its expiry,
+// served to nobody (ARCHITECTURE.md § Startup). The record stays there too:
+// a load reads an address's mail only while its record is left, so deleting
+// it would leave the mail where no process looks for it.
 func (s *Server) deleteHeld(ctx context.Context, b *Box) error {
+	if _, held := s.store.Held(b.Addr); !held {
+		return nil
+	}
 	if n, err := s.store.Count(ctx, b.Addr); err != nil {
 		return err
 	} else if n > 0 {
