@@ -3,7 +3,6 @@ package server
 import (
 	"cmp"
 	"maps"
-	"net"
 	"net/http"
 	"slices"
 	"strconv"
@@ -19,11 +18,11 @@ import (
 // ip: its misses, its registrations, by its IPv4 address or IPv6 /64 and by
 // its IPv6 /48, its sends before their pass and its calls with no pass, each
 // bucket full again as if the address had never been seen. ip is an IPv4
-// address or any IPv6 address of a /64, which is how the limits key a caller
-// (ipKey). It returns that key and the names of the limits that held
-// anything of it, and false if ip is no address.
+// address or any IPv6 address of a /64, with or without a zone, which is how
+// the limits key a caller (ipKey). It returns that key and the names of the
+// limits that held anything of it, and false if ip is no address.
 func (s *Server) ClearAddress(ip string) (key string, cleared []string, ok bool) {
-	if net.ParseIP(ip) == nil {
+	if _, ok := hostAddr(ip); !ok {
 		return "", nil, false
 	}
 	key, now := ipKey(ip), s.now()

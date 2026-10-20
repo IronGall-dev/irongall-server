@@ -107,7 +107,7 @@ func NewDynamoStore(c DynamoConfig) *DynamoStore {
 		accts:      c.AccountsTable,
 		bucket:     c.Bucket,
 		now:        c.Now,
-		log:        c.Log,
+		log:        redacting(c.Log),
 		consistent: c.ConsistentReads,
 		idx:        newIndex(),
 		cache:      newBoxCache(c.BoxCache),
@@ -651,8 +651,9 @@ func IsThrottle(err error) bool {
 	return false
 }
 
-// loadTimeout bounds a box's load into memory, which callers share: it runs
-// apart from the request that started it.
+// loadTimeout bounds a read that callers share, which runs apart from the
+// request that started it: a box's load into memory (ensure), and a lookup's
+// read of a box's record (Server.lead).
 const loadTimeout = 10 * time.Second
 
 // ensure loads box a into memory on its first use by this process.

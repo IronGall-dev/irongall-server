@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -206,6 +206,10 @@ func (bs *buckets) reserve(ctx context.Context, key string, now func() time.Time
 func (r *reservation) keep() { r.settle(false, time.Time{}) }
 
 // release settles the reservation as not counted: its token goes back.
+// Either does nothing to a reservation already settled. So each is settled
+// where its outcome is known, and also released by a defer made where it is
+// taken: it is settled on every path, a panic included
+// (IronGall-dev/irongall-server#36).
 func (r *reservation) release(now time.Time) { r.settle(true, now) }
 
 func (r *reservation) settle(back bool, now time.Time) {
@@ -327,23 +331,37 @@ func (bs *buckets) prune(now time.Time) {
 // ipKey keys a per-IP limit on a client address: the IPv4 address, or the
 // IPv6 /64, since every IPv6 end site holds at least a /64.
 func ipKey(host string) string {
-	ip := net.ParseIP(host)
-	if ip == nil {
+	ip, ok := hostAddr(host)
+	if !ok {
 		return host
 	}
-	if v4 := ip.To4(); v4 != nil {
-		return v4.String()
+	if ip.Is4() {
+		return ip.String()
 	}
-	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+	p, _ := ip.Prefix(64)
+	return p.String()
 }
 
 // rangeKey keys a limit on a client's IPv6 /48, "the range a single
 // subscriber is typically given" (Let's Encrypt's Boulder), and is "" for an
 // IPv4 address or anything that is no address: those have no /48 count.
 func rangeKey(host string) string {
-	ip := net.ParseIP(host)
-	if ip == nil || ip.To4() != nil {
+	ip, ok := hostAddr(host)
+	if !ok || ip.Is4() {
 		return ""
 	}
-	return ip.Mask(net.CIDRMask(48, 128)).String() + "/48"
+	p, _ := ip.Prefix(48)
+	return p.String()
+}
+
+// hostAddr reads a client's address as the limits key it: an IPv4 address
+// written as IPv6 is the IPv4 address, and an IPv6 zone, which names an
+// interface of this host and is no part of the address, is dropped
+// (IronGall-dev/irongall-server#48).
+func hostAddr(host string) (netip.Addr, bool) {
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return ip.Unmap().WithZone(""), true
 }

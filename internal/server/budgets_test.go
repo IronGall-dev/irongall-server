@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -505,6 +507,160 @@ func TestLookupsOfOneAddressShareARead(t *testing.T) {
 	}
 	if got := n.Load(); got != 1 {
 		t.Fatalf("%d reads for twenty lookups of one address at once", got)
+	}
+}
+
+// ctxBox is the test store, but its record cache always misses, so that
+// every lookup reads, and each read of a box's record waits d or until its
+// context ends, as DynamoStore's GetItem does.
+type ctxBox struct {
+	Store
+	reads atomic.Int64
+	d     time.Duration
+}
+
+func (s *ctxBox) Box(ctx context.Context, a protocol.Address) (*Box, error) {
+	s.reads.Add(1)
+	select {
+	case <-time.After(s.d):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.Store.Box(ctx, a)
+}
+
+func (s *ctxBox) Known(protocol.Address) (*Box, bool) { return nil, false }
+
+// A lookup's shared read runs apart from the request that leads it
+// (IronGall-dev/irongall-server#32): a leader whose caller hangs up during
+// the read fails none of the lookups waiting on it, each answered from that
+// one read.
+func TestALeaderWhoHangsUpFailsNoLookup(t *testing.T) {
+	l := relaxed()
+	e := newEnv(t, l)
+	b := e.raw().register(protocol.MaxPrekeyLifetime)
+	st := &ctxBox{Store: e.store, d: 300 * time.Millisecond}
+	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: st, Limits: l, Now: e.clock.Now}).Handler()))
+	t.Cleanup(srv.Close)
+	u := srv.URL + b.path("")
+	led := make(chan struct{})
+	go func() { // the leader: a caller that hangs up 50 ms into the read
+		defer close(led)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	for st.reads.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	resp, err := http.Get(u) // waits on the leader's read
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	<-led
+	if resp.StatusCode != http.StatusOK || st.reads.Load() != 1 {
+		t.Fatalf("a lookup waiting on a read whose caller hung up: %d (Retry-After %q), from %d reads; want 200 from 1", resp.StatusCode, resp.Header.Get("Retry-After"), st.reads.Load())
+	}
+}
+
+// panicStore is the test store, but a read of box's record, a first fetch's
+// count and a revocation panic, as a bug in decoding a record would.
+type panicStore struct {
+	Store
+	box protocol.Address
+}
+
+func (s panicStore) Known(a protocol.Address) (*Box, bool) {
+	if a == s.box {
+		return nil, false
+	}
+	return s.Store.Known(a)
+}
+
+func (s panicStore) Box(ctx context.Context, a protocol.Address) (*Box, error) {
+	if a == s.box {
+		panic("a panic in the read of a box's record")
+	}
+	return s.Store.Box(ctx, a)
+}
+
+func (s panicStore) Fetched(context.Context, protocol.Address, [32]byte) (bool, bool, error) {
+	panic("a panic in a fetch's count")
+}
+
+func (s panicStore) Revoke(context.Context, protocol.Address, *Revocations) error {
+	panic("a panic in a revocation's write")
+}
+
+// A reservation is settled, and a shared read finished, however its call
+// ends, a panic included (IronGall-dev/irongall-server#36): after a panic in
+// a lookup's read, a fetch and a raise of a revocation of certificates, no
+// reservation is held and no read is in flight, and the next lookup of the
+// address is answered.
+func TestAPanicSettlesItsReservations(t *testing.T) {
+	l := relaxed()
+	l.MissesPerMinute, l.DrainBurst, l.DrainRefill, l.CertificateRevocationsPerDay = 10, 10, time.Minute, 10
+	e := newEnv(t, l)
+	victim, owner := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+	s := New(Config{Store: panicStore{e.store, victim.id.Address()}, Limits: l, Now: e.clock.Now})
+	srv := httptest.NewUnstartedServer(apitest.Handler(t, s.Handler()))
+	var panics bytes.Buffer
+	srv.Config.ErrorLog = log.New(&panics, "", 0) // net/http's report of each panic
+	srv.Start()
+	t.Cleanup(srv.Close)
+	api := &env{t: t, clock: e.clock, srv: srv}
+	held := func(bs *buckets) int {
+		bs.mu.Lock()
+		defer bs.mu.Unlock()
+		return len(bs.held)
+	}
+	call := func(method, path string, body any, pass string) {
+		t.Helper()
+		var r io.Reader
+		if body != nil {
+			j, _ := json.Marshal(body)
+			r = bytes.NewReader(j)
+		}
+		req, _ := http.NewRequest(method, srv.URL+path, r)
+		if pass != "" {
+			req.Header.Set("Authorization", pass)
+		}
+		if resp, err := http.DefaultClient.Do(req); err == nil { // a panic ends the connection
+			_ = resp.Body.Close()
+		}
+	}
+
+	call(http.MethodGet, victim.path(""), nil, "")
+	s.reads.mu.Lock()
+	inFlight := len(s.reads.in)
+	s.reads.mu.Unlock()
+	if n := held(s.misses); n != 0 || inFlight != 0 {
+		t.Errorf("after a panic in a lookup's read: %d miss reservations held, %d reads in flight", n, inFlight)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+victim.path(""), nil)
+	if resp, err := http.DefaultClient.Do(req); errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a later lookup of the same address waited on a read that never finishes: %v", err)
+	} else if err == nil {
+		_ = resp.Body.Close()
+	}
+
+	call(http.MethodGet, owner.path("/messages/"+strings.Repeat("ab", 32)), nil, api.passFor(owner.work[1], owner.id.Address(), api.name()))
+	if n := held(s.drained); n != 0 {
+		t.Errorf("after a panic in a fetch: %d drain reservations held", n)
+	}
+
+	call(http.MethodPut, owner.path("/revocations"), owner.certs(5), "")
+	if n := held(s.raises); n != 0 {
+		t.Errorf("after a panic in a raise's write: %d reservations held", n)
+	}
+	if n := strings.Count(panics.String(), "http: panic serving"); n != 4 {
+		t.Errorf("%d of the four calls panicked: %s", n, panics.String())
 	}
 }
 

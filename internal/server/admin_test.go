@@ -3,10 +3,15 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"net/url"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/IronGall-dev/irongall-client/api/apitest"
 	"github.com/IronGall-dev/irongall-client/protocol"
@@ -77,5 +82,53 @@ func TestTheOperatorClearsAnAddress(t *testing.T) {
 	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/limits/clear?ip=127.0.0.1", nil))
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("the API's handler answers the operator's command: %d", w.Code)
+	}
+}
+
+// A caller's address is keyed without its IPv6 zone, which names an
+// interface of this host and is no part of the address
+// (IronGall-dev/irongall-server#48): a link-local caller is counted by its
+// /64 and its /48 as any other IPv6 caller is, the operator's clear reaches
+// it written either way, and a trusted proxy reached over a link-local
+// address is believed.
+func TestAZonedCallerIsKeyedByItsSlash64(t *testing.T) {
+	peer := (&net.TCPAddr{IP: net.ParseIP("fe80::1"), Zone: "eth0", Port: 1234}).String() // as net/http fills RemoteAddr
+	l := relaxed()
+	l.MissesPerMinute = 2
+	s := New(Config{Store: NewMemStore(time.Now), Limits: l, Now: time.Now, TrustedProxies: []netip.Prefix{netip.MustParsePrefix("fe80::/64")}})
+	h := apitest.Handler(t, s.Handler())
+	n := 0
+	miss := func(remote string) int {
+		n++
+		r := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v1/%064x", n), nil)
+		r.RemoteAddr = remote
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	if k, rk := ipKey("fe80::1%eth0"), rangeKey("2001:db8::1%eth0"); k != "fe80::/64" || rk != "2001:db8::/48" {
+		t.Fatalf("a zoned address is keyed %q, its range %q; want fe80::/64 and 2001:db8::/48", k, rk)
+	}
+	for _, ip := range []string{"fe80::1", "fe80::1%eth0"} {
+		for range l.MissesPerMinute {
+			if c := miss(peer); c != http.StatusNotFound {
+				t.Fatalf("a miss from %s: %d", peer, c)
+			}
+		}
+		other := (&net.TCPAddr{IP: net.ParseIP("fe80::2"), Zone: "eth1", Port: 1234}).String()
+		if c := miss(other); c != http.StatusTooManyRequests {
+			t.Fatalf("%s, of the same /64: %d, want 429", other, c)
+		}
+		w := httptest.NewRecorder()
+		s.AdminHandler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/limits/clear?ip="+url.QueryEscape(ip), nil))
+		if got := strings.TrimSpace(w.Body.String()); w.Code != http.StatusOK || got != `{"address":"fe80::/64","cleared":["misses"]}` {
+			t.Fatalf("clear %q: %d %s", ip, w.Code, got)
+		}
+	}
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.RemoteAddr = peer
+	r.Header.Set("CF-Connecting-IP", "192.0.2.7")
+	if got := s.clientIP(r); got != "192.0.2.7" {
+		t.Fatalf("a trusted proxy at %s: the client is %q", peer, got)
 	}
 }

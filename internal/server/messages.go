@@ -243,6 +243,7 @@ func (s *Server) fetch(w http.ResponseWriter, r *http.Request) error {
 			return spent(protocol.CodeFetchPaced, wait, "this box takes out at most so much new mail a minute: the rest waits on the server")
 		}
 	}
+	defer func() { drain.release(s.now()) }() // settled below, but for a panic
 	held, again, err := s.store.Fetched(r.Context(), box, id)
 	if err != nil || !held || again {
 		drain.release(s.now())

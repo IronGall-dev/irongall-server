@@ -3,6 +3,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +74,9 @@ type Server struct {
 	identityTypes []string
 	site          *Site
 	metrics       *Metrics
+	// longestPath is the longest path this server serves (served): the
+	// access log writes a method or a path any longer as its length alone.
+	longestPath int
 
 	polls     *buckets // per box
 	pages     *buckets // per box: list pages after the first
@@ -110,7 +115,7 @@ func New(c Config) *Server {
 		store:         c.Store,
 		limits:        c.Limits,
 		now:           c.Now,
-		log:           c.Log,
+		log:           redacting(c.Log),
 		ready:         c.Ready,
 		proxies:       c.TrustedProxies,
 		names:         c.Names,
@@ -141,9 +146,29 @@ func New(c Config) *Server {
 	if len(s.identityTypes) == 0 {
 		s.identityTypes = protocol.IdentityTypes()
 	}
+	s.longestPath = s.served()
 	s.metrics.watch(s)
 	return s
 }
+
+// served is the length of the longest path this server serves: a route's or
+// the link page's, each wildcard an address or a message id of 64 hex
+// characters, or a site's page.
+func (s *Server) served() int {
+	n := s.site.longestPath()
+	patterns := []string{linkRoute}
+	for _, r := range s.routes() {
+		patterns = append(patterns, r.pattern)
+	}
+	for _, p := range patterns {
+		_, path, _ := strings.Cut(p, " ")
+		n = max(n, len(wildcard.ReplaceAllString(path, strings.Repeat("0", 64))))
+	}
+	return n
+}
+
+// wildcard is a wildcard in a route's pattern.
+var wildcard = regexp.MustCompile(`\{[^}]*\}`)
 
 // route is one of the API's routes: its pattern and its handler.
 type route struct {
@@ -302,10 +327,11 @@ func (s *Server) clientIP(r *http.Request) string {
 }
 
 // fromProxy reports whether the request's peer is one of the trusted
-// proxies, whose headers about the client are believed.
+// proxies, whose headers about the client are believed: read as the limits
+// read an address (hostAddr), since a prefix contains no address with a zone.
 func (s *Server) fromProxy(r *http.Request) bool {
-	peer, err := netip.ParseAddr(peerHost(r))
-	return err == nil && slices.ContainsFunc(s.proxies, func(p netip.Prefix) bool { return p.Contains(peer.Unmap()) })
+	peer, ok := hostAddr(peerHost(r))
+	return ok && slices.ContainsFunc(s.proxies, func(p netip.Prefix) bool { return p.Contains(peer) })
 }
 
 // peerHost is the address of the request's peer, without its port.
@@ -505,31 +531,44 @@ func (s *Server) lookup(r *http.Request, a protocol.Address) (*Box, error) {
 			return b, nil
 		}
 		f, lead := s.reads.start(a)
-		if !lead {
-			b, err := f.wait(r.Context())
-			if errors.Is(err, errReadNotMade) {
-				continue // its caller was refused before reading: try for ourselves
-			}
-			return b, err
+		if lead {
+			return s.lead(r, a, f)
 		}
-		m, err := s.miss(r)
-		if err != nil {
-			s.reads.finish(a, f, nil, errReadNotMade)
-			return nil, err
-		}
-		b, err := s.box(r.Context(), a)
-		s.reads.finish(a, f, b, err)
-		if err == nil && b == nil {
-			m.keep()
-		} else {
-			m.release(s.now())
+		b, err := f.wait(r.Context())
+		if errors.Is(err, errReadNotMade) {
+			continue // its caller was refused before reading: try for ourselves
 		}
 		return b, err
 	}
 }
 
+// lead makes read f of a's record for lookup, the read every lookup of a
+// meanwhile waits on. It runs apart from its caller's request, bounded by
+// loadTimeout, so a caller who hangs up fails none of them
+// (IronGall-dev/irongall-server#32), and it finishes f and settles its
+// reservation however it ends, a panic included (#36).
+func (s *Server) lead(r *http.Request, a protocol.Address, f *read) (*Box, error) {
+	defer s.reads.finish(a, f, nil, errReadNotMade) // finished below, but for a refusal or a panic
+	m, err := s.miss(r)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { m.release(s.now()) }() // settled below, but for a panic
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), loadTimeout)
+	defer cancel()
+	b, err := s.box(ctx, a)
+	s.reads.finish(a, f, b, err)
+	if err == nil && b == nil {
+		m.keep()
+	} else {
+		m.release(s.now())
+	}
+	return b, err
+}
+
 // errReadNotMade is what a shared read tells those waiting on it when its
-// caller was refused before reading: each then asks for itself.
+// caller was refused before reading, or its read ended in a panic: each then
+// asks for itself.
 var errReadNotMade = errors.New("the read was not made")
 
 // reads are the reads of box records in flight, by address, so that lookups
@@ -563,9 +602,15 @@ func (rs *reads) start(a protocol.Address) (f *read, lead bool) {
 }
 
 // finish records what the read of a found, for those waiting on it: a copy
-// of its own, since the read's caller may change the one it has.
+// of its own, since the read's caller may change the one it has. A read
+// already finished is left as it is, so a finish deferred where the read
+// starts finishes it on every path.
 func (rs *reads) finish(a protocol.Address, f *read, b *Box, err error) {
 	rs.mu.Lock()
+	if rs.in[a] != f {
+		rs.mu.Unlock()
+		return
+	}
 	delete(rs.in, a)
 	rs.mu.Unlock()
 	if b != nil {
@@ -634,6 +679,7 @@ func (s *Server) spendRegistration(r *http.Request, why string) error {
 		}
 		return p
 	}
+	defer func() { byIP.release(s.now()) }() // settled below, but for a panic
 	if block != "" {
 		byRange, ok, wait := s.rangeRegs.reserve(r.Context(), block, s.now)
 		if !ok {
@@ -812,19 +858,69 @@ func pathID(r *http.Request) ([32]byte, error) {
 	return id, err
 }
 
-// redact replaces every 64-hex path segment (addresses, message ids) with the
-// first 16 hex characters of its SHA-256: access logs never carry an address.
-func redact(path string) string {
-	parts := strings.Split(path, "/")
-	for i, p := range parts {
-		if len(p) == 64 {
-			if _, err := hex.DecodeString(p); err == nil {
-				h := sha256.Sum256([]byte(strings.ToLower(p)))
-				parts[i] = "#" + hex.EncodeToString(h[:8])
-			}
-		}
+// hexRun is a run of 64 or more hex characters, in either case: every
+// address and message id, wherever a log line holds one.
+var hexRun = regexp.MustCompile(`[0-9A-Fa-f]{64,}`)
+
+// redact replaces each run of 64 or more hex characters in a log line with
+// "#" and the first 16 hex characters of the SHA-256 of the run in lower
+// case, a name only someone already holding the run can match: no log line
+// carries an address or a message id, in a path, a store's error or
+// anywhere else (IronGall-dev/irongall-server#9).
+func redact(line []byte) []byte {
+	return hexRun.ReplaceAllFunc(line, func(run []byte) []byte {
+		h := sha256.Sum256(bytes.ToLower(run))
+		return []byte("#" + hex.EncodeToString(h[:8]))
+	})
+}
+
+// redactor is a log's writer that redacts each line written to it: a
+// log.Logger writes each line whole, in one call.
+type redactor struct{ w io.Writer }
+
+func (r redactor) Write(p []byte) (int, error) {
+	if _, err := r.w.Write(redact(p)); err != nil {
+		return 0, err
 	}
-	return strings.Join(parts, "/")
+	return len(p), nil
+}
+
+// Redacting is w, redacting each line written to it (redact): the writer
+// under every log irongalld keeps, net/http's own among them.
+func Redacting(w io.Writer) io.Writer {
+	if _, ok := w.(redactor); ok {
+		return w
+	}
+	return redactor{w}
+}
+
+// redacting is l writing through Redacting, so that every line logged
+// through a Config's Log is redacted whoever made it; nil if l is.
+func redacting(l *log.Logger) *log.Logger {
+	if l == nil {
+		return nil
+	}
+	if _, ok := l.Writer().(redactor); ok {
+		return l
+	}
+	return log.New(redactor{l.Writer()}, l.Prefix(), l.Flags())
+}
+
+// asSent is what the access log writes of a method or a path as the caller
+// sent it: its length alone when it is longer than the longest path this
+// server serves, so a caller makes no line longer, and never a part, which
+// could hold part of an address the redaction would not find; a path
+// otherwise quoted, so that no byte of it ends the line or passes for the
+// server's own words (IronGall-dev/irongall-server#11). A method is a token,
+// which net/http has checked, and needs no quotes.
+func asSent(what, s string, longest int) string {
+	switch {
+	case len(s) > longest:
+		return fmt.Sprintf("(a %s of %d bytes)", what, len(s))
+	case what == "path":
+		return strconv.Quote(s)
+	}
+	return s
 }
 
 type statusWriter struct {
@@ -857,10 +953,10 @@ func (w *statusWriter) WriteHeader(status int) {
 // Unwrap lets http.ResponseController reach the connection through the log.
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// observed logs each request (method, redacted path, status and duration;
-// never a pass, never a body) and counts it by route, status and code
-// (Metrics). The route is the pattern the routers matched, which each sets on
-// the request as it routes it: never the path as sent.
+// observed logs each request (method, path, status and duration, as asSent
+// and redact write them; never a pass, never a body) and counts it by route,
+// status and code (Metrics). The route is the pattern the routers matched,
+// which each sets on the request as it routes it: never the path as sent.
 func (s *Server) observed(h http.Handler) http.Handler {
 	if s.log == nil && s.metrics == nil {
 		return h
@@ -871,7 +967,7 @@ func (s *Server) observed(h http.Handler) http.Handler {
 		h.ServeHTTP(sw, r)
 		took := time.Since(start)
 		if s.log != nil {
-			s.log.Printf("%s %s %d %s", r.Method, redact(r.URL.Path), sw.status, took.Round(time.Microsecond))
+			s.log.Printf("%s %s %d %s", asSent("method", r.Method, s.longestPath), asSent("path", r.URL.Path, s.longestPath), sw.status, took.Round(time.Microsecond))
 		}
 		s.metrics.answered(r.Pattern, sw.status, sw.code, took)
 	})

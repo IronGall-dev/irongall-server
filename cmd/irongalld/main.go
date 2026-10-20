@@ -48,6 +48,7 @@ import (
 )
 
 func main() {
+	log.SetOutput(server.Redacting(os.Stderr)) // so net/http's own lines, and the last error's, are redacted as the server's are
 	var err error
 	switch {
 	case len(os.Args) >= 2 && os.Args[1] == "serve":
@@ -117,7 +118,7 @@ func serve(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	logger := log.New(os.Stderr, "", log.LstdFlags|log.LUTC)
+	logger := log.New(server.Redacting(os.Stderr), "", log.LstdFlags|log.LUTC)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

@@ -248,7 +248,7 @@ func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert
 	checked, err := checkCertificate(key, under, a, now)
 	if err != nil {
 		if s.log != nil {
-			s.log.Printf("box %s: the certificate on record does not verify against the identity on record: %v", redact("/"+a.String()), err)
+			s.log.Printf("box %s: the certificate on record does not verify against the identity on record: %v", a, err) // the address redacted, as every line is
 		}
 		return fail(protocol.CodeCertificateNotCurrent, "publish a new prekey, which comes with a new certificate: irongall prekey renew", "the box's certificate on record does not verify against its identity")
 	}

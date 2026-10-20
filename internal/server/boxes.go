@@ -350,6 +350,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	defer func() { m.release(s.now()) }() // settled below, but for a panic
 	p, cert, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
 	if err == nil && (cert.Serial() != o.CertSerial || certHash(cert) != o.Cert || p.Serial != o.Serial) {
 		err = fail(protocol.CodeBadKey, "sign a new prekey statement: irongall prekey renew", "the statement does not read the same verified as unverified")
@@ -589,6 +590,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	defer func() { m.release(s.now()) }() // settled below, but for a panic
 	var certs *protocol.RevokedCertificates
 	if hasCerts {
 		if certs, err = protocol.VerifyRevokedCertificates(h, req.Identity, req.RevokedCertificates, req.RevokedCertificatesSignature); err != nil {
@@ -618,6 +620,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 			return s.raisesADay().refusal(wait)
 		}
 	}
+	defer func() { raise.release(s.now()) }() // settled below, but for a panic
 	if raised || req.Revocation != nil {
 		if err := s.store.Revoke(r.Context(), h, rv); err != nil {
 			raise.release(s.now())
