@@ -8,15 +8,18 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
 // A site: with -site, a directory of pages served at the root, outside /v1/
-// and the link page. No site's content is in this repo: a deployment renders
-// its own into a directory and gives the server that.
+// and /to/, the API's and the link page's. No site's content is in this repo:
+// a deployment renders its own into a directory and gives the server that.
 
 // siteTypes are the types of the files a site may hold, by extension, and
 // whether each is text, which is gzipped. Markdown is plain text to a
@@ -37,7 +40,8 @@ var siteTypes = map[string]struct {
 // Site is a directory's files, read once at start, each answered at its own
 // path and nowhere else. A file named index, of any type, answers at its
 // directory's path, which ends in a slash, and not at its own name; that
-// path without the slash redirects to it. Every other path is 404.
+// path without the slash redirects to it, with its query. Every other path
+// is 404.
 type Site struct {
 	pages map[string]*sitePage
 	dirs  map[string]string // the path of each directory with an index, by that path without its slash
@@ -50,14 +54,29 @@ type sitePage struct {
 }
 
 // LoadSite reads every file under dir, and gzips each text file once, at the
-// best compression, since it is done once. A file of a type siteTypes does
-// not name, or anything but a regular file or a directory, is an error: a
-// site is what its renderer wrote, and anything else in it is a mistake.
+// best compression, since it is done once. dir may be a link to the
+// directory, as a web server's root may. A file of a type siteTypes does not
+// name, anything but a regular file or a directory, or a file under v1/ or
+// to/, where the API and the link page answer and it could never be served
+// at its path, is an error: a site is what its renderer wrote, and anything
+// else in it is a mistake.
 func LoadSite(dir string) (*Site, error) {
 	s := &Site{pages: map[string]*sitePage{}, dirs: map[string]string{}}
 	zw, err := gzip.NewWriterLevel(nil, gzip.BestCompression)
 	if err != nil {
 		return nil, err
+	}
+	// WalkDir takes its root by Lstat, so a root that is a link would be
+	// refused as a link inside the site is.
+	if dir, err = filepath.EvalSymlinks(dir); err != nil {
+		return nil, err
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.IsDir() {
+		return nil, fmt.Errorf("%s: not a directory", dir)
 	}
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -69,6 +88,10 @@ func LoadSite(dir string) (*Site, error) {
 		rel, err := filepath.Rel(dir, path)
 		if err != nil {
 			return err
+		}
+		u := "/" + filepath.ToSlash(rel)
+		if strings.HasPrefix(u, "/v1/") || strings.HasPrefix(u, protocol.LinkPath) {
+			return fmt.Errorf("%s: a site holds nothing under /v1/ or %s, where the API and the link page answer", path, protocol.LinkPath)
 		}
 		ext := filepath.Ext(rel)
 		typ, ok := siteTypes[ext]
@@ -83,15 +106,14 @@ func LoadSite(dir string) (*Site, error) {
 		if err != nil {
 			return err
 		}
-		url := "/" + filepath.ToSlash(rel)
 		if name := filepath.Base(rel); strings.TrimSuffix(name, ext) == "index" {
-			url = strings.TrimSuffix(url, name)
-			if url != "/" {
-				s.dirs[strings.TrimSuffix(url, "/")] = url
+			u = strings.TrimSuffix(u, name)
+			if u != "/" {
+				s.dirs[strings.TrimSuffix(u, "/")] = u
 			}
 		}
-		if _, ok := s.pages[url]; ok {
-			return fmt.Errorf("%s: a second index of %s", path, url)
+		if _, ok := s.pages[u]; ok {
+			return fmt.Errorf("%s: a second index of %s", path, u)
 		}
 		p := &sitePage{body: body, ctype: typ.ctype, etag: entityTag(body), mod: info.ModTime()}
 		if typ.text {
@@ -99,7 +121,7 @@ func LoadSite(dir string) (*Site, error) {
 				p.gzTag = entityTag(p.gz)
 			}
 		}
-		s.pages[url] = p
+		s.pages[u] = p
 		return nil
 	})
 	if err != nil {
@@ -131,7 +153,9 @@ func (s *Site) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := s.pages[r.URL.Path]
 	if p == nil {
 		if to, ok := s.dirs[r.URL.Path]; ok {
-			http.Redirect(w, r, to, http.StatusMovedPermanently)
+			// Location is a URI reference: the path is escaped, and the
+			// query kept, as nginx redirects a directory.
+			http.Redirect(w, r, (&url.URL{Path: to, RawQuery: r.URL.RawQuery}).String(), http.StatusMovedPermanently)
 			return
 		}
 		http.NotFound(w, r)

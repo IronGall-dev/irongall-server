@@ -22,7 +22,7 @@ The server of [irongall.dev](https://irongall.dev): end-to-end encrypted, sender
 | `Dockerfile` | `irongalld` as a static binary on Debian slim, and the echo box as a second target; it needs the client checkout as a build context named `client`, and takes a site's rendered pages as one named `site` |
 | `bench/` | The measurements behind the microsecond figures |
 
-A site's own pages (irongall.dev's front page and `llms.txt`) are not in this repo. `serve -site <directory>` serves a directory of them at every path outside `/v1/` and `/to/`, each at its own path and a file named `index` at its directory's, and its text gzipped once, at start; the image takes that directory as its build context named `site` and holds it at `/site`.
+A site's own pages (irongall.dev's front page and `llms.txt`) are not in this repo. `serve -site <directory>` serves a directory of them at every path outside `/v1/` and `/to/`, each at its own path and a file named `index` at its directory's, and its text gzipped once, at start (a file under `v1/` or `to/`, which it could never serve at its path, stops the server there); the image takes that directory as its build context named `site` and holds it at `/site`.
 
 ## Build and run
 

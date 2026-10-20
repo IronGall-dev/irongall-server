@@ -51,8 +51,8 @@ type Config struct {
 	// one every client makes and verifies (PROTOCOL.md §2). None: every type
 	// this build verifies.
 	IdentityTypes []string
-	// Site, when set, is served at every path outside /v1/ and the link
-	// page (LoadSite). None: those paths are 404.
+	// Site, when set, is served at every path outside /v1/ and /to/, the
+	// API's and the link page's (LoadSite). None: those paths are 404.
 	Site *Site
 	// Metrics, when set, count what the server does and refuses
 	// (NewMetrics). None: nothing is counted.

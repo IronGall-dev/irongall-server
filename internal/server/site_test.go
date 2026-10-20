@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,6 +71,27 @@ func get(t *testing.T, srv *httptest.Server, method, path string, hdr ...string)
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return resp, string(b)
+}
+
+// rawGet sends one request line as written, with nothing cleaned or
+// followed, and returns the status, the Location and the body.
+func rawGet(t *testing.T, srv *httptest.Server, target string) (int, string, string) {
+	t.Helper()
+	c, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := io.WriteString(c, "GET "+target+" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, resp.Header.Get("Location"), string(b)
 }
 
 // Each page answers at its own path and nowhere else, with the type of its
@@ -156,6 +180,41 @@ func TestASitePageSpendsOnlyAFloodBudget(t *testing.T) {
 	t.Fatal("a thousand pages at once from one address are all answered")
 }
 
+// A directory's path without its slash redirects to its index, escaped, as
+// Location is a URI reference, and with the request's query
+// (IronGall-dev/irongall-server#44): each lands on its page.
+func TestADirectorysRedirectNamesItsPath(t *testing.T) {
+	site, err := LoadSite(writeSite(t, map[string]string{
+		"p%41/index.html": "PCT", "q?x/index.html": "Q", "h#x/index.html": "HASH", "s p/index.html": "SPACE", "docs/index.md": "docs",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(New(Config{Store: NewMemStore(time.Now), Limits: relaxed(), Site: site}).Handler())
+	t.Cleanup(srv.Close)
+	for path, want := range map[string]struct{ loc, body string }{
+		"/p%2541":   {"/p%2541/", "PCT"},
+		"/q%3Fx":    {"/q%3Fx/", "Q"},
+		"/h%23x":    {"/h%23x/", "HASH"},
+		"/s%20p":    {"/s%20p/", "SPACE"},
+		"/docs?a=1": {"/docs/?a=1", "docs"},
+	} {
+		st, loc, _ := rawGet(t, srv, path)
+		if st != http.StatusMovedPermanently || loc != want.loc {
+			t.Errorf("%s: %d to %q, want 301 to %q", path, st, loc, want.loc)
+			continue
+		}
+		u, _ := url.Parse(srv.URL + path)
+		ref, err := u.Parse(loc) // as a client resolves Location
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st, _, body := rawGet(t, srv, ref.RequestURI()); st != http.StatusOK || body != want.body {
+			t.Errorf("%s, then %s: %d %q, want 200 %q", path, ref.RequestURI(), st, body, want.body)
+		}
+	}
+}
+
 // With no site, every path outside /v1/ and the link page is 404.
 func TestNoSiteIsNotFound(t *testing.T) {
 	srv := httptest.NewServer(New(Config{Store: NewMemStore(time.Now), Limits: relaxed()}).Handler())
@@ -168,12 +227,19 @@ func TestNoSiteIsNotFound(t *testing.T) {
 }
 
 // A site is what its renderer wrote: a file of a type it holds none of, a
-// second index in one directory, or a link is refused at start.
+// second index in one directory, a link, or a file under v1/ or to/, which it
+// could never serve at its path (IronGall-dev/irongall-server#43), is refused
+// at start.
 func TestASiteOfAnythingElseIsRefused(t *testing.T) {
 	for name, files := range map[string]map[string]string{
 		"a type it holds none of": {"index.html": "x", "notes.pdf": "x"},
 		"a file with no type":     {"index.html": "x", "README": "x"},
 		"two indexes":             {"docs/index.md": "x", "docs/index.html": "x"},
+		"a file under v1/":        {"index.html": "x", "v1/hidden.html": "x"},
+		"an index under v1/":      {"v1/index.md": "x"},
+		"an index under to/":      {"to/index.html": "x"},
+		"a file under to/":        {"to/one.html": "x"},
+		"a file deeper in to/":    {"to/a/b.html": "x"},
 	} {
 		if _, err := LoadSite(writeSite(t, files)); err == nil {
 			t.Errorf("%s: loaded", name)
@@ -185,5 +251,28 @@ func TestASiteOfAnythingElseIsRefused(t *testing.T) {
 	}
 	if _, err := LoadSite(dir); err == nil {
 		t.Error("a link: loaded")
+	}
+}
+
+// A site's root may be a link to its directory, as a web server's root may
+// (IronGall-dev/irongall-server#45); a link inside it is still refused
+// (above), and a root that is no directory is refused as one.
+func TestASitesRootMayBeALink(t *testing.T) {
+	dir := writeSite(t, siteFiles)
+	link := filepath.Join(t.TempDir(), "current")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	site, err := LoadSite(link)
+	if err != nil {
+		t.Fatalf("a link to a directory: %v", err)
+	}
+	srv := httptest.NewServer(New(Config{Store: NewMemStore(time.Now), Limits: relaxed(), Site: site}).Handler())
+	t.Cleanup(srv.Close)
+	if resp, body := get(t, srv, http.MethodGet, "/llms.txt"); resp.StatusCode != http.StatusOK || body != siteFiles["llms.txt"] {
+		t.Errorf("a page of the linked site: %d %q", resp.StatusCode, body)
+	}
+	if _, err := LoadSite(filepath.Join(dir, "index.html")); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("a file as the root: %v", err)
 	}
 }
