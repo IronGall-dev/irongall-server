@@ -28,18 +28,26 @@ const pageSize = 50
 // with nothing after it continues nothing, so it is a poll. Only a list with
 // something to return reads storage.
 func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
-	box, err := s.owner(r, cursorParam)
-	if err != nil {
+	// The path and the query first, the cursor's decode among them, before
+	// the pass (PROTOCOL.md §5.1).
+	if _, err := pathAddr(r, cursorParam); err != nil {
 		return err
 	}
 	cursor, hasCursor := r.URL.Query()[cursorParam]
 	var after *Cursor
-	more := 0          // live messages past the cursor
-	continues := false // the cursor is the one this process handed the box last
 	if hasCursor {
+		var err error
 		if after, err = parseCursor(cursor[0]); err != nil {
 			return err
 		}
+	}
+	box, err := s.owner(r, cursorParam)
+	if err != nil {
+		return err
+	}
+	more := 0          // live messages past the cursor
+	continues := false // the cursor is the one this process handed the box last
+	if hasCursor {
 		if more, err = s.store.After(r.Context(), box, after); err != nil {
 			return err
 		}

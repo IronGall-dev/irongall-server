@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"github.com/IronGall-dev/irongall-client/client"
 	"github.com/IronGall-dev/irongall-client/protocol"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -280,6 +282,15 @@ func TestAccounts(t *testing.T) {
 		pass := r.pass(1)
 		e.want(e.do(http.MethodPut, r.path("/account"), protocol.AdoptRequest{Key: "x"}, ""), 401, protocol.CodeUnauthorized)
 		e.want(e.do(http.MethodPut, r.path("/account"), []byte(`{"key":1}`), pass), 400, protocol.CodeBadRequest)
+		// No key, a null one (PROTOCOL.md §0b) or an empty one is a member
+		// missing from the request, not a key refused.
+		for _, body := range []string{`{}`, `{"key":null}`, `{"key":""}`} {
+			got := e.do(http.MethodPut, r.path("/account"), []byte(body), pass)
+			e.want(got, 400, protocol.CodeBadRequest)
+			if got.problem().Member != "key" {
+				t.Errorf("%s: the refusal names %q, want the member key: %s", body, got.problem().Member, got.body)
+			}
+		}
 		e.want(e.do(http.MethodDelete, r.path("/account"), nil, ""), 401, protocol.CodeUnauthorized)
 		e.want(e.do(http.MethodDelete, r.path("/account"), nil, pass), 204, "")
 		// Over the sender's own cap, a send is refused before its body is
@@ -375,6 +386,135 @@ func TestAdoptRaceIsAConflict(t *testing.T) {
 	}
 	if err := a.Leave(context.Background()); client.Code(err) != protocol.CodeBoxChanged {
 		t.Fatalf("leave: %v", err)
+	}
+}
+
+// cannedDynamo answers DynamoDB's calls in turn from its answers, the last
+// one again once they run out, and counts the calls.
+type cannedDynamo struct {
+	n       atomic.Int32
+	answers []string // a 200's body, or a 400's: an error in the SDK's JSON shape, by its "__type"
+}
+
+func (d *cannedDynamo) Do(r *http.Request) (*http.Response, error) {
+	i := int(d.n.Add(1)) - 1
+	if r.Body != nil {
+		_, _ = io.Copy(io.Discard, r.Body)
+	}
+	body := d.answers[min(i, len(d.answers)-1)]
+	status := http.StatusOK
+	if strings.Contains(body, `"__type"`) {
+		status = http.StatusBadRequest
+	}
+	return &http.Response{StatusCode: status, Status: http.StatusText(status), Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header: http.Header{"Content-Type": {"application/x-amz-json-1.0"}, "X-Amzn-Requestid": {"t"}},
+		Body:   io.NopCloser(strings.NewReader(body)), Request: r}, nil
+}
+
+func (d *cannedDynamo) store(logged *bytes.Buffer) *DynamoStore {
+	return NewDynamoStore(DynamoConfig{AWS: aws.Config{Region: "us-east-1", Credentials: credentials.NewStaticCredentialsProvider("AKIDEXAMPLE", "x", ""),
+		HTTPClient: d, BaseEndpoint: aws.String("http://127.0.0.1:1")}, BoxesTable: "b", MsgsTable: "m", AccountsTable: "a", Bucket: "s", Log: log.New(logged, "", 0)})
+}
+
+// cancelled is a TransactWriteItems cancelled for these reasons, one an item.
+func cancelled(reasons ...string) string {
+	var codes []string
+	for _, r := range reasons {
+		codes = append(codes, `{"Code":"`+r+`"}`)
+	}
+	return `{"__type":"com.amazonaws.dynamodb.v20120810#TransactionCanceledException","Message":"Transaction cancelled, please refer cancellation reasons for specific reasons [` + strings.Join(reasons, ", ") + `]","CancellationReasons":[` + strings.Join(codes, ",") + `]}`
+}
+
+// dynamoAdopt is the test store, but with a DynamoStore's Adopt.
+type dynamoAdopt struct {
+	Store
+	d *DynamoStore
+}
+
+func (s dynamoAdopt) Adopt(ctx context.Context, b *Box, account string, key [32]byte) error {
+	return s.d.Adopt(ctx, b, account, key)
+}
+
+// An adopt that meets another transaction on the box's record or the key's
+// item, as two adopts with one multi-use key do, is cancelled for a
+// TransactionConflict, which the SDK does not retry. It applied nothing, so
+// the store sends it again, by a new call, up to four calls in all; one
+// that meets another every time is ErrStale, and the adopt 409 box_changed.
+// A failed condition still wins, whichever item conflicted.
+func TestAnAdoptThatMeetsAnotherIsSentAgain(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, relaxed())
+	acc, key := accountEnv(t, e, true, 5)
+	_, hash, _ := parseAdopt(key)
+	a := e.box(protocol.Classic)
+	conflict := cancelled("None", "TransactionConflict")
+	for _, c := range []struct {
+		name    string
+		answers []string
+		calls   int32
+		want    error
+	}{
+		{"none", []string{`{}`}, 1, nil},
+		{"one conflict", []string{conflict, `{}`}, 2, nil},
+		{"three conflicts", []string{conflict, conflict, cancelled("TransactionConflict", "None"), `{}`}, 4, nil},
+		{"a conflict every time", []string{conflict}, 4, ErrStale}, // the SDK's own tries for DynamoDB
+		{"a key that is spent", []string{cancelled("None", "ConditionalCheckFailed")}, 1, ErrKeyRefused},
+		{"a key that is spent, beside a conflict", []string{cancelled("TransactionConflict", "ConditionalCheckFailed")}, 1, ErrKeyRefused},
+		{"a box that moved on", []string{conflict, cancelled("ConditionalCheckFailed", "None")}, 2, ErrStale},
+	} {
+		b, err := e.store.Box(ctx, a.Address())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var logged bytes.Buffer
+		d := &cannedDynamo{answers: c.answers}
+		if err := d.store(&logged).Adopt(ctx, b, acc.ID, hash); !errors.Is(err, c.want) || (c.want == nil) != (err == nil) {
+			t.Errorf("%s: %v, want %v", c.name, err, c.want)
+		}
+		if n := d.n.Load(); n != c.calls {
+			t.Errorf("%s: %d calls to DynamoDB, want %d", c.name, n, c.calls)
+		}
+	}
+
+	// Through the handler: a conflict that lasts is 409 box_changed, which a
+	// client sends again as it is, and nothing is logged as an internal error.
+	var logged bytes.Buffer
+	srv := New(Config{Store: dynamoAdopt{e.store, (&cannedDynamo{answers: []string{conflict}}).store(&logged)}, Limits: relaxed(), Now: e.clock.Now, Log: log.New(&logged, "", 0)}).Handler()
+	e.setMiddle(func(w http.ResponseWriter, r *http.Request, _ http.Handler) { srv.ServeHTTP(w, r) })
+	defer e.setMiddle(nil)
+	if _, err := e.box(protocol.Classic).Adopt(ctx, key); client.Code(err) != protocol.CodeBoxChanged {
+		t.Errorf("an adopt that met another every time: %v, want box_changed", err)
+	}
+	if strings.Contains(logged.String(), "internal error") {
+		t.Errorf("an adopt that met another is logged as an internal error: %s", logged.String())
+	}
+}
+
+// A write of the box's record alone that meets a transaction on it is
+// refused with a TransactionConflictException, which the SDK does not retry:
+// the record changes if that transaction commits, so it is ErrStale, as a
+// failed condition is, and a client sends it again (409 box_changed).
+func TestARecordWriteThatMeetsATransactionIsStale(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, relaxed())
+	a := e.box(protocol.Classic)
+	b, err := e.store.Box(ctx, a.Address())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflict := `{"__type":"com.amazonaws.dynamodb.v20120810#TransactionConflictException","message":"Transaction is ongoing for the item"}`
+	for name, write := range map[string]func(*DynamoStore) error{
+		"UpdateBox": func(s *DynamoStore) error { return s.UpdateBox(ctx, cloneBox(b)) },
+		"Leave":     func(s *DynamoStore) error { return s.Leave(ctx, cloneBox(b)) },
+	} {
+		var logged bytes.Buffer
+		d := &cannedDynamo{answers: []string{conflict}}
+		if err := write(d.store(&logged)); !errors.Is(err, ErrStale) {
+			t.Errorf("%s that met a transaction: %v, want ErrStale", name, err)
+		}
+		if n := d.n.Load(); n != 1 {
+			t.Errorf("%s: %d calls to DynamoDB, want 1", name, n)
+		}
 	}
 }
 

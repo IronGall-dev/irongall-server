@@ -842,7 +842,7 @@ func (s *DynamoStore) UpdateBox(ctx context.Context, b *Box) error {
 		ExpressionAttributeNames:  names,
 		ExpressionAttributeValues: values,
 	})
-	if _, ok := isConditionFailed(err); ok {
+	if _, ok := isConditionFailed(err); ok || isTransactionConflict(err) {
 		s.cache.evict(b.Addr) // the cached record may be the stale one
 		return ErrStale
 	}

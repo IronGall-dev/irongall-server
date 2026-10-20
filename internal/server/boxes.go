@@ -134,6 +134,12 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	return s.registered(w, r, id, cur, &req)
 }
 
+// statementRevoked is the answer to a prekey statement signed under a
+// certificate the box's identity revoked (PROTOCOL.md §6.3a).
+func statementRevoked() *problem {
+	return fail(protocol.CodeCertificateRevoked, "certify a new working key at a higher serial: irongall prekey renew", "the statement is signed under a certificate this box's identity revoked")
+}
+
 // settled reports whether what is held of an address answers a registration
 // from itself: a box that is registered, or an address that is revoked.
 func settled(b *Box) bool { return b.open() || b != nil && b.State == Revoked }
@@ -143,13 +149,21 @@ func settled(b *Box) bool { return b.open() || b != nil && b.State == Revoked }
 // An identical retry is answered 200 once its pass, under the box's current
 // certificate, is checked; nothing else is. A pass the server remembers costs
 // no check, and one that does not verify counts against the caller's address
-// (checkPassBounded).
+// (checkPassBounded). A certificate the identity revoked signs nothing this
+// server takes, the box's current statement sent again included, so it is
+// refused before the pass, as a prekey upload's identical retry is
+// (PROTOCOL.md §6.3a).
 func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol.Identity, cur *Box, req *protocol.RegisterRequest) error {
 	switch {
 	case cur.State == Revoked:
 		return revoked()
 	case !bytes.Equal(cur.Identity, req.Identity) || !bytes.Equal(cur.Statement, req.Prekey) || !bytes.Equal(cur.Signature, req.PrekeySignature):
 		return fail(protocol.CodeConflict, "registered: to replace its prekey, irongall prekey renew", "this address is registered with another prekey")
+	}
+	if listed, err := cur.listed(cur.CertSerial); err != nil {
+		return err
+	} else if listed {
+		return statementRevoked()
 	}
 	if err := s.checkPassBounded(r, cur.Addr, string(id.PublicKey().Marshal()), cur.Cert); err != nil {
 		return err
@@ -289,7 +303,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	key := string(id.PublicKey().Marshal())
-	refusedRevoked := fail(protocol.CodeCertificateRevoked, "certify a new working key at a higher serial: irongall prekey renew", "the statement is signed under a certificate this box's identity revoked")
+	refusedRevoked := statementRevoked()
 	// An identical retry: it was verified when it was stored, so only its
 	// pass is checked, and nothing changes. A certificate the identity has
 	// revoked signs nothing this server takes, the box's current statement

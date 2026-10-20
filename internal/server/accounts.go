@@ -58,6 +58,12 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
 	if err := decodeBody(w, r, 4<<10, &req); err != nil {
 		return err
 	}
+	// None, null (PROTOCOL.md §0b) or empty is a missing member, as a
+	// parameter sent without a value is an omitted one (RFC 6749 §3.1): the
+	// request is wrong, not the key.
+	if req.Key == "" {
+		return fail(protocol.CodeBadRequest, "irongall account adopt sends the key it reads on stdin", "missing field %q", memberValue("key"))
+	}
 	account, hash, ok := parseAdopt(req.Key)
 	if !ok {
 		return keyRefused()

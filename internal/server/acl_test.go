@@ -94,11 +94,17 @@ func TestACLRoute(t *testing.T) {
 			t.Errorf("%s: %d %s, want 400 %s: %s", name, r.status, r.code(), protocol.CodeBadRequest, r.body)
 		}
 	}
-	e.want(e.do("PUT", path, aclOf(1, []string{"*", x}, []string{y, x}), pass), 413, protocol.CodeTooLarge)
-	// A body larger than any ACL the server takes is refused before it is
-	// parsed.
+	// Over the entries, and over the body's bound drawn from them, which is
+	// refused before it is parsed: the limit is the entries either way
+	// (PROTOCOL.md §13: a too_large on an ACL is entries).
 	huge := aclOf(1, []string{"*"}, []string{strings.Repeat(" ", int(e.server.aclBodyLimit()))})
-	e.want(e.do("PUT", path, huge, pass), 413, protocol.CodeTooLarge)
+	for _, body := range []any{aclOf(1, []string{"*", x}, []string{y, x}), huge} {
+		r := e.do("PUT", path, body, pass)
+		e.want(r, 413, protocol.CodeTooLarge)
+		if p := r.problem(); p.Limit == nil || *p.Limit != 3 {
+			t.Errorf("an ACL over 3 entries is told the limit %v, want its 3 entries: %s", p.Limit, r.body)
+		}
+	}
 	if r := e.do("GET", path, nil, pass); !bytes.Contains(r.body, []byte(`"version":0`)) {
 		t.Fatalf("a refused ACL was stored: %s", r.body)
 	}
@@ -140,6 +146,22 @@ func TestACLRoute(t *testing.T) {
 	}
 	if back, err := decodeBox(item(boxItem(none))); err != nil || back.ACL != nil {
 		t.Fatalf("a record with no ACL reads back with one: %+v, %v", back.ACL, err)
+	}
+}
+
+// With no bound on its entries, an ACL's body is still bounded, to keep the
+// record one item: a body over that is too_large with the body's bytes as
+// its limit, the one limit there is (PROTOCOL.md §13).
+func TestAnUnboundedACLNamesItsBodysBytes(t *testing.T) {
+	l := relaxed()
+	l.ACLEntries = 0
+	e := newEnv(t, l)
+	b := e.box(protocol.Classic)
+	huge := aclOf(1, []string{"*"}, []string{strings.Repeat(" ", int(e.server.aclBodyLimit()))})
+	r := e.do("PUT", "/v1/"+b.Address().String()+"/acl", huge, e.pass(b))
+	e.want(r, 413, protocol.CodeTooLarge)
+	if p := r.problem(); p.Limit == nil || *p.Limit != uint64(aclBodyUnbounded) {
+		t.Errorf("an unbounded ACL's body over its bound is told the limit %v, want its %d bytes: %s", p.Limit, aclBodyUnbounded, r.body)
 	}
 }
 

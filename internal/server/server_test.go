@@ -38,9 +38,14 @@ type reply struct {
 }
 
 func (r reply) code() protocol.Code {
+	return r.problem().Code
+}
+
+// problem is the reply's body read as an error's.
+func (r reply) problem() protocol.Problem {
 	var p protocol.Problem
 	_ = json.Unmarshal(r.body, &p)
-	return p.Code
+	return p
 }
 
 // quota is the limit a rate_limited answer names, and whom it says that
@@ -629,6 +634,22 @@ func TestAQueryHoldsOnlyTheCallsParameters(t *testing.T) {
 	// A query that does not parse names nothing.
 	e.want(e.do("GET", r.path("/messages?%zz"), nil, pass), 400, protocol.CodeBadRequest)
 	e.want(e.do("GET", r.path("/messages"), nil, pass), 200, "")
+}
+
+// A list's query is read before its pass, the cursor's decode included
+// (PROTOCOL.md §5.1): a cursor that is empty, not of a cursor's form, or not
+// one this server could have made is 400 naming cursor, with a pass or none.
+func TestACursorIsReadBeforeThePass(t *testing.T) {
+	e := newEnv(t, relaxed())
+	r := e.raw().register(protocol.MaxPrekeyLifetime)
+	for _, q := range []string{"?cursor=", "?cursor=a%2Fb", "?cursor=zzz"} {
+		for _, pass := range []string{"", r.pass(1)} {
+			got := e.do("GET", r.path("/messages"+q), nil, pass)
+			if got.status != 400 || got.code() != protocol.CodeBadRequest || got.problem().Member != "cursor" {
+				t.Errorf("%s, pass %v: %d %s, member %q; want 400 bad_request naming cursor", q, pass != "", got.status, got.code(), got.problem().Member)
+			}
+		}
+	}
 }
 
 // A call with two Authorization lines carries no pass, whatever each holds:

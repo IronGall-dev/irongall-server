@@ -475,3 +475,18 @@ func TestTheRemedyRenewsWhenATakerSpentTheDaysRenewals(t *testing.T) {
 		t.Fatalf("the box stands at certificate %d, not the one the remedy made, %d", cert, r.Below)
 	}
 }
+
+// The box's current statement, registered again once its identity revoked
+// the certificate it is signed under, is refused before its pass, as the
+// same statement sent to PUT …/prekey is (PROTOCOL.md §3 step 5, §6.3a):
+// nothing under that certificate is taken, an identical retry included.
+func TestAnIdenticalRegistrationUnderARevokedCertificateIsRefused(t *testing.T) {
+	e := newEnv(t, relaxed())
+	r := e.raw().register(protocol.MaxPrekeyLifetime)
+	e.want(e.do("PUT", r.path(""), r.registration(1), r.pass(1)), 200, "")
+	e.want(e.do("PUT", r.path("/revocations"), r.certs(1), ""), 200, "")
+	for _, pass := range []string{r.pass(1), ""} {
+		e.want(e.do("PUT", r.path("/prekey"), r.upload(1), pass), 401, protocol.CodeCertificateRevoked)
+		e.want(e.do("PUT", r.path(""), r.registration(1), pass), 401, protocol.CodeCertificateRevoked)
+	}
+}

@@ -28,6 +28,12 @@ func (s *Server) aclBodyLimit() int64 {
 // hintACL names what writes an ACL: the client does, from its own lists.
 const hintACL = "irongall peer allow and irongall peer block write this box's ACL from its own lists"
 
+// aclTooLarge is the answer to an ACL over -acl-entries, by its entries or by
+// the body bound drawn from them.
+func (s *Server) aclTooLarge() *problem {
+	return fail(protocol.CodeTooLarge, "list fewer addresses: "+hintACL, "an ACL here holds at most %d entries, its two lists together", limitValue(s.limits.ACLEntries))
+}
+
 // putACL is PUT /v1/<address>/acl (with the pass): the box's sender ACL,
 // replaced whole by one of a higher version (PROTOCOL.md §6.2). Then the
 // box's unacked mail from every sender its deny list matches is deleted, as
@@ -42,12 +48,19 @@ func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 	}
 	var doc protocol.ACLDocument
 	if err := decodeBody(w, r, s.aclBodyLimit(), &doc); err != nil {
+		// The bound is drawn from the entries, so a body over it is answered
+		// for them: an ACL's limit is in entries (PROTOCOL.md §13). With
+		// them unbounded, the body's bytes are the one limit there is.
+		var p *problem
+		if errors.As(err, &p) && p.code == protocol.CodeTooLarge && s.limits.ACLEntries > 0 {
+			return s.aclTooLarge()
+		}
 		return err
 	}
 	acl, err := protocol.CheckACL(&doc, s.limits.ACLEntries)
 	switch {
 	case errors.Is(err, protocol.ErrACLTooLarge):
-		return fail(protocol.CodeTooLarge, "list fewer addresses: "+hintACL, "an ACL here holds at most %d entries, its two lists together", limitValue(s.limits.ACLEntries))
+		return s.aclTooLarge()
 	case err != nil:
 		return failErr(protocol.CodeBadRequest, hintACL, err)
 	}

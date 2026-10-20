@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math/rand/v2"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -192,7 +194,7 @@ func (s *DynamoStore) Leave(ctx context.Context, b *Box) error {
 		ExpressionAttributeNames:  upd.ExpressionAttributeNames,
 		ExpressionAttributeValues: upd.ExpressionAttributeValues,
 	})
-	if _, ok := isConditionFailed(err); ok {
+	if _, ok := isConditionFailed(err); ok || isTransactionConflict(err) {
 		s.cache.evict(b.Addr) // the cached record may be the stale one
 		return ErrStale
 	}
@@ -204,27 +206,66 @@ func (s *DynamoStore) Leave(ctx context.Context, b *Box) error {
 	return nil
 }
 
+// A transaction that meets another on one of its items is cancelled for a
+// TransactionConflict, which the SDK does not retry (AWS, "Transaction
+// conflict handling in DynamoDB"). It applied nothing and DynamoDB checks
+// every condition again, so it is sent again as it is: by a new call, which
+// carries a new client token. The tries and pauses are the SDK's own for
+// DynamoDB under its newer retry behaviour (AWS_NEW_RETRIES_2026): four in
+// all, each pause a random share of 25 ms, doubled after each try.
+const (
+	transactTries = 4
+	transactPause = 25 * time.Millisecond
+)
+
 // transact writes items in one transaction. A condition that failed is the
-// error named for its item; a failed box condition also evicts the box's
-// cached record, which may be the stale one.
+// error named for its item, whatever else met another; a failed box
+// condition also evicts the box's cached record, which may be the stale one.
+// A conflict that lasts every try is ErrStale, and evicts it too.
 func (s *DynamoStore) transact(ctx context.Context, b *Box, items []types.TransactWriteItem, failed map[int]error) error {
-	_, err := s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
-	var tc *types.TransactionCanceledException
-	if !errors.As(err, &tc) {
-		return err
-	}
-	for i, r := range tc.CancellationReasons {
-		if aws.ToString(r.Code) != "ConditionalCheckFailed" {
-			continue
+	for try := 1; ; try++ {
+		_, err := s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+		var tc *types.TransactionCanceledException
+		if !errors.As(err, &tc) {
+			return err
 		}
-		if e, ok := failed[i]; ok {
-			if errors.Is(e, ErrStale) {
-				s.cache.evict(b.Addr)
+		conflict := false
+		for i, r := range tc.CancellationReasons {
+			switch aws.ToString(r.Code) {
+			case "ConditionalCheckFailed":
+				if e, ok := failed[i]; ok {
+					if errors.Is(e, ErrStale) {
+						s.cache.evict(b.Addr)
+					}
+					return e
+				}
+			case "TransactionConflict":
+				conflict = true
 			}
-			return e
+		}
+		if !conflict {
+			return err
+		}
+		if try == transactTries {
+			s.cache.evict(b.Addr)
+			return ErrStale
+		}
+		pause := time.NewTimer(rand.N(transactPause << (try - 1))) //nolint:gosec // a pause's jitter, no secret
+		select {
+		case <-pause.C:
+		case <-ctx.Done():
+			pause.Stop()
+			return ctx.Err()
 		}
 	}
-	return err
+}
+
+// isTransactionConflict reports whether err is a write of one item that met a
+// transaction on it, which the SDK does not retry either. The item changes if
+// that transaction commits, so the write is answered as a failed condition.
+func isTransactionConflict(err error) bool {
+	var tc *types.TransactionConflictException
+	return errors.As(err, &tc)
 }
 
 // applyAccountRecord applies one record of the -accounts-table stream to the
