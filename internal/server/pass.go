@@ -177,10 +177,12 @@ func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert
 	if p == nil {
 		var err error
 		if p, err = protocol.ParsePass(auth); err != nil {
-			if !count {
-				return unauthorized(hintPass, "no pass, or not a pass")
+			err = unauthorized(hintPass, "no pass, or not a pass")
+			if count {
+				err = s.notAPass(r)
 			}
-			return s.notAPass(r)
+			s.metrics.pass(false, err)
+			return err
 		}
 	}
 	// A pass is remembered in the one form a client writes it, so the same

@@ -57,6 +57,7 @@ func TestMetricsCountWhatTheServerDoes(t *testing.T) {
 		e.want(e.do("GET", to+"/messages/"+id, nil, e.pass(b)), http.StatusOK, "")
 	}
 	e.caller()("192.0.2.1", "GET", to+"/nothing/here", nil, "")
+	e.want(e.do("GET", to+"/messages", nil, "irongall-pass nonsense"), http.StatusUnauthorized, protocol.CodeUnauthorized)
 
 	for _, c := range []struct {
 		what string
@@ -72,6 +73,7 @@ func TestMetricsCountWhatTheServerDoes(t *testing.T) {
 		{"polls", m.lists.WithLabelValues("poll"), 1},
 		{"first fetches", m.fetches.WithLabelValues("first"), 1},
 		{"repeat fetches", m.fetches.WithLabelValues("repeat"), 1},
+		{"a value that is no pass", m.passes.WithLabelValues("refused", string(protocol.CodeUnauthorized)), 1},
 	} {
 		if got := testutil.ToFloat64(c.got); got != c.want {
 			t.Errorf("%s: %v, want %v", c.what, got, c.want)
