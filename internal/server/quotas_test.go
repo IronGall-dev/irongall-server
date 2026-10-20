@@ -83,33 +83,34 @@ func TestEveryRefusalNamesItsLimit(t *testing.T) {
 
 // A refusal of a box's calls gives the longest wait among the box's other
 // counts in memory that the same call would spend, under that count's name
-// (RFC 8555 §6.6; IronGall-dev/irongall-server#56): a send's sends a day, a
-// renewal's renewals a day. A box whose other counts are not spent is told
-// the calls' wait.
+// (RFC 8555 §6.6; IronGall-dev/irongall-server#56): a renewal's renewals a
+// day. A send's sends a day are not among them: only the dedupe, behind the
+// body, shows whether a send is new mail that spends them, so a send past
+// its calls is told their wait, and one past its sends too meets them once
+// that wait is over (IronGall-dev/irongall-server#61).
 func TestARefusalGivesTheLongestWait(t *testing.T) {
 	l := relaxed()
 	l.CallBurst, l.CallRefill = 1, time.Minute
 	l.SendsPerDay, l.RenewalsPerDay = 1, 1
 	e := newEnv(t, l)
-	a, b, c := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic)
+	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	to := "/v1/" + b.Address().String()
 
 	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(a)), http.StatusCreated, "")
 	got := e.do("POST", to+"/messages", e.sealTo(b), e.pass(a))
+	e.limited(got, protocol.QuotaCalls)
+	if w := waits(got); w > 60 {
+		t.Fatalf("a send past its calls and its sends waits %d s, want the calls' minute", w)
+	}
+	e.clock.Add(time.Minute)
+	got = e.do("POST", to+"/messages", e.sealTo(b), e.pass(a))
 	e.limited(got, protocol.QuotaSends)
 	if w := waits(got); w < 23*3600 || w > 24*3600 {
-		t.Fatalf("a send past its calls and its sends waits %d s, want the sends' day", w)
+		t.Fatalf("a send past its sends waits %d s, want the sends' day", w)
 	}
 	var p protocol.Problem
 	if err := json.Unmarshal(got.body, &p); err != nil || p.Limit == nil || *p.Limit != 1 {
 		t.Fatalf("the sends' refusal carries no limit: %s", got.body)
-	}
-	// The control: a box that has sent nothing is told its calls' wait.
-	e.want(e.do("GET", "/v1/"+c.Address().String()+"/acl", nil, e.pass(c)), http.StatusOK, "")
-	got = e.do("POST", to+"/messages", e.sealTo(b), e.pass(c))
-	e.limited(got, protocol.QuotaCalls)
-	if w := waits(got); w > 60 {
-		t.Fatalf("a send past its calls alone waits %d s, want the calls' minute", w)
 	}
 
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
@@ -121,6 +122,36 @@ func TestARefusalGivesTheLongestWait(t *testing.T) {
 	e.limited(got, protocol.QuotaRenewals)
 	if w := waits(got); w < 23*3600 {
 		t.Fatalf("a renewal past its calls and its renewals waits %d s, want the renewals' day", w)
+	}
+}
+
+// The same ciphertext posted again, of a send the server holds, is never
+// refused by a quota; a budget may defer it (PROTOCOL.md §8, §4.5 step 6). A
+// retry past its sender's calls, with its sends a day spent, is told the
+// calls' wait, and is then answered with the original receipt
+// (IronGall-dev/irongall-server#61).
+func TestARetryPastTheCallsIsDeferredByTheCalls(t *testing.T) {
+	l := relaxed()
+	l.CallBurst, l.CallRefill = 2, time.Minute
+	l.SendsPerDay = 1
+	e := newEnv(t, l)
+	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
+	to := "/v1/" + b.Address().String() + "/messages"
+	x := e.sealTo(b)
+
+	first := e.do("POST", to, x, e.pass(a)) // the day's one send
+	e.want(first, http.StatusCreated, "")
+	e.want(e.do("GET", "/v1/"+a.Address().String()+"/acl", nil, e.pass(a)), http.StatusOK, "") // and the last call
+	got := e.do("POST", to, x, e.pass(a))
+	e.limited(got, protocol.QuotaCalls)
+	if w := waits(got); w > 60 {
+		t.Fatalf("a retry past its calls waits %d s, want the calls' minute", w)
+	}
+	e.clock.Add(time.Minute)
+	again := e.do("POST", to, x, e.pass(a))
+	e.want(again, http.StatusOK, "")
+	if !bytes.Equal(again.body, first.body) {
+		t.Fatalf("the retry's receipt %s, want the original %s", again.body, first.body)
 	}
 }
 

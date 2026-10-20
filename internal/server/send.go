@@ -33,11 +33,12 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	// A refusal of the calls gives the longer wait of the calls and the
-	// sends a day, which a new message would spend too (longest).
+	// A refusal of the calls gives their wait alone. The sends a day are
+	// behind the dedupe (step 6): only it shows whether the call is new mail
+	// that spends them, and a retry spends none (PROTOCOL.md §8).
 	if lim, err := s.limitsOf(ctx, from); err != nil {
 		return err
-	} else if err := s.spendCall(from, lim, s.sendsOf(lim)...); err != nil {
+	} else if err := s.spendCall(from, lim); err != nil {
 		return err
 	}
 	// The pass showed the box exists, so reading its record is no guess at
