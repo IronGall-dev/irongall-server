@@ -197,7 +197,8 @@ const (
 )
 
 // ttlMs is how long a message is kept after it was received, in ms: the
-// TTL less the hour the maker of a time-limited thing leaves (protocol.Retention).
+// TTL less the hour the maker of a time-limited thing leaves, and a post's own
+// time (protocol.Retention).
 var ttlMs = uint64(protocol.Retention / time.Millisecond)
 
 func ms(t time.Time) uint64     { return uint64(t.UnixMilli()) }          //nolint:gosec // times after 1970

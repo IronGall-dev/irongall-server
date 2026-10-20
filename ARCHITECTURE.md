@@ -80,7 +80,7 @@ type mark struct { // layer 1
 	tag  uint64 // first 8 bytes of HMAC-SHA-256 of the whole id, under a key this process made at random: what the mark is known by
 	id   uint64 // first 8 bytes of the message id, for the list's order within a millisecond only
 	from uint64 // first 8 bytes of the sender's address, for the per-pair cap
-	exp  uint64 // expiry in unix ms: received_at + the TTL less an hour (protocol.Retention), so it also gives the header's key (PROTOCOL-SERVER.md §7)
+	exp  uint64 // expiry in unix ms: received_at + the TTL less an hour and two minutes (protocol.Retention), so it also gives the header's key (PROTOCOL-SERVER.md §7)
 	n    uint8  // fetches of it this process has served: a second one is a repeat (PROTOCOL.md §5.7); 40 B in all
 }
 
@@ -280,11 +280,11 @@ As `PROTOCOL-SERVER.md` §7 has it: DynamoDB tables for boxes and messages (each
                              The one made with the prekey published last signs mail and passes; older ones are deleted when a newer prekey is published
   pass                       0600: the Authorization value last signed, sent on every call until it is about to run out (PROTOCOL §6.1b)
   serial                     the highest prekey serial this box published: a renewal refuses a served serial below it
-  prekey-lifetime            how long each new prekey is valid for, in seconds: 33 days unless its owner sets less, down to a day and two hours (PROTOCOL §6.4)
+  prekey-lifetime            how long each new prekey is valid for, in seconds: 33 days unless its owner sets less, down to a day and three hours (PROTOCOL §6.4)
   peers/<addr>/              the pinned identity document, the highest prekey serial and certificate serial seen, the last statement fetched.
                              Made on a send once the peer's prekey statement verified, and on a receive once a message from it passed every check
   seen                       ciphertext hash, sent_at, from, msg_id: 66 days and an hour from each sent_at (PROTOCOL §5 check 9)
-  seen-floor                 the highest cutoff a prune of seen dropped a line at: mail sent before it is stale
+  seen-floor                 the highest cutoff a prune of seen dropped a line at: mail sent before it, or less than 33 days after it, is stale
   outbox/                    each signed envelope line awaiting a receipt, and nothing else: a seal is made for each post and never kept
   outbox/failed/             entries that can never be delivered: refused for good, or older than 33 days
   inbox/, quarantine/        accepted mail, one line of JSON each built from the checked fields; refused mail, never delivered (PROTOCOL §5).

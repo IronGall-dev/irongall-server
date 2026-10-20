@@ -238,7 +238,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		From:       from,
 		Size:       len(ciphertext),
 		ReceivedAt: now.UTC().Truncate(time.Millisecond),
-		ExpiresAt:  now.UTC().Truncate(time.Millisecond).Add(protocol.Retention), // the TTL less the hour (PROTOCOL.md §0, §7)
+		ExpiresAt:  now.UTC().Truncate(time.Millisecond).Add(protocol.Retention), // the TTL less the hour and a post's own time (PROTOCOL.md §0, §7)
 	}
 	orig, err := s.store.PutMessage(ctx, to, h, ciphertext)
 	if err != nil {
