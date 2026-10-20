@@ -27,47 +27,76 @@ import (
 // memory.
 
 // seenPass is a pass this process checked: the hash of its Authorization
-// value, the certificate it is signed under, and until when it is taken: the
-// moment it runs out or its certificate ends, whichever comes first.
+// value in the one form a client writes it (Pass.Authorization) and in the
+// form it was shown in, the certificate it is signed under, and until when it
+// is taken: the moment it runs out or its certificate ends, whichever comes
+// first.
 type seenPass struct {
 	sum   [32]byte
+	raw   [32]byte
 	cert  [32]byte
 	until time.Time
 }
 
-// passes remembers, for each box, the pass it showed last. An entry goes
+// passes remembers, for each box, the pass it showed last, and each such
+// pass's two hashes, for the gate, which knows no box (known). An entry goes
 // when its pass has run out, which is at most protocol.MaxPassLifetime after
-// it was checked, so the map holds only boxes that called within that time.
+// it was checked, so the maps hold only boxes that called within that time.
 type passes struct {
 	mu    sync.Mutex
 	seen  map[protocol.Address]seenPass
-	sweep time.Time // when prune next runs
+	sums  map[[32]byte]time.Time // each seenPass's sum and raw, until it is taken
+	sweep time.Time              // when prune next runs
 }
 
-func newPasses() *passes { return &passes{seen: map[protocol.Address]seenPass{}} }
+func newPasses() *passes {
+	return &passes{seen: map[protocol.Address]seenPass{}, sums: map[[32]byte]time.Time{}}
+}
 
 // has reports whether the Authorization value hashing to sum is the pass box
-// a showed last, checked under the certificate cert and not run out at now.
+// a showed last, in either form, checked under the certificate cert and not
+// run out at now.
 func (ps *passes) has(a protocol.Address, sum, cert [32]byte, now time.Time) bool {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	p, ok := ps.seen[a]
-	return ok && p.sum == sum && p.cert == cert && now.Before(p.until)
+	return ok && (p.sum == sum || p.raw == sum) && p.cert == cert && now.Before(p.until)
 }
 
-// keep remembers a pass of box a that was checked at now.
+// known reports whether the Authorization value hashing to sum is, in either
+// form, a pass some box showed last that has not run out at now.
+func (ps *passes) known(sum [32]byte, now time.Time) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	until, ok := ps.sums[sum]
+	return ok && now.Before(until)
+}
+
+// keep remembers a pass of box a that was checked at now, in place of the
+// one it showed before.
 func (ps *passes) keep(a protocol.Address, p seenPass, now time.Time) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	if !now.Before(ps.sweep) {
 		for k, v := range ps.seen {
 			if !now.Before(v.until) {
-				delete(ps.seen, k)
+				ps.forget(k, v)
 			}
 		}
 		ps.sweep = now.Add(protocol.MaxPassLifetime)
 	}
+	if old, ok := ps.seen[a]; ok {
+		ps.forget(a, old)
+	}
 	ps.seen[a] = p
+	ps.sums[p.sum], ps.sums[p.raw] = p.until, p.until
+}
+
+// forget drops box a's pass p. The caller holds mu.
+func (ps *passes) forget(a protocol.Address, p seenPass) {
+	delete(ps.seen, a)
+	delete(ps.sums, p.sum)
+	delete(ps.sums, p.raw)
 }
 
 // standingOf returns what checking box a's pass needs: from memory when this
@@ -185,9 +214,11 @@ func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert
 			return err
 		}
 	}
-	// A pass is remembered in the one form a client writes it, so the same
-	// pass written in another form a server reads (PROTOCOL.md §6.1b) is
-	// answered from memory too, and its many spellings cost one check.
+	// A pass is remembered in the one form a client writes it, its signature
+	// as a verifier reads it, so the same pass written in another form a
+	// server reads (PROTOCOL.md §6.1b, §3) is answered from memory too, and
+	// its many spellings cost one check (IronGall-dev/irongall-server#69).
+	raw := sum
 	if one := sha256.Sum256([]byte(p.Authorization())); one != sum {
 		if s.passes.has(a, one, cert, now) {
 			s.metrics.pass(true, nil)
@@ -257,7 +288,7 @@ func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert
 	if end := checked.NotAfter(); end.Before(until) {
 		until = end
 	}
-	s.passes.keep(a, seenPass{sum: sum, cert: cert, until: until}, now)
+	s.passes.keep(a, seenPass{sum: sum, raw: raw, cert: cert, until: until}, now)
 	return nil
 }
 

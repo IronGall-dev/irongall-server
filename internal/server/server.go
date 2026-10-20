@@ -169,30 +169,33 @@ func (s *Server) served() int {
 // wildcard is a wildcard in a route's pattern.
 var wildcard = regexp.MustCompile(`\{[^}]*\}`)
 
-// route is one of the API's routes: its pattern and its handler.
+// route is one of the API's routes: its pattern, its handler, and whether it
+// checks the call's pass before it does anything else, so that a pass this
+// process has checked makes the call its box's at the gate.
 type route struct {
 	pattern string
 	h       func(http.ResponseWriter, *http.Request) error
+	pass    bool
 }
 
 // routes are the API's, each the client repo's api/openapi.yaml gives
 // (TestTheRoutesAreTheDescriptions).
 func (s *Server) routes() []route {
 	return []route{
-		{"GET /v1/{addr}", s.getBox},
-		{"PUT /v1/{addr}", s.register},
-		{"DELETE /v1/{addr}", s.deleteBox},
-		{"PUT /v1/{addr}/prekey", s.prekey},
-		{"PUT /v1/{addr}/revocations", s.revoke},
-		{"GET /v1/{addr}/revocations", s.getRevocations},
-		{"PUT /v1/{addr}/acl", s.putACL},
-		{"GET /v1/{addr}/acl", s.getACL},
-		{"PUT /v1/{addr}/account", s.adopt},
-		{"DELETE /v1/{addr}/account", s.leave},
-		{"POST /v1/{addr}/messages", s.send},
-		{"GET /v1/{addr}/messages", s.list},
-		{"GET /v1/{addr}/messages/{id}", s.fetch},
-		{"DELETE /v1/{addr}/messages/{id}", s.ack},
+		{"GET /v1/{addr}", s.getBox, true},
+		{"PUT /v1/{addr}", s.register, false}, // its pass is read after its body
+		{"DELETE /v1/{addr}", s.deleteBox, true},
+		{"PUT /v1/{addr}/prekey", s.prekey, false}, // its pass is read after its body
+		{"PUT /v1/{addr}/revocations", s.revoke, false},
+		{"GET /v1/{addr}/revocations", s.getRevocations, false},
+		{"PUT /v1/{addr}/acl", s.putACL, true},
+		{"GET /v1/{addr}/acl", s.getACL, true},
+		{"PUT /v1/{addr}/account", s.adopt, true},
+		{"DELETE /v1/{addr}/account", s.leave, true},
+		{"POST /v1/{addr}/messages", s.send, true},
+		{"GET /v1/{addr}/messages", s.list, true},
+		{"GET /v1/{addr}/messages/{id}", s.fetch, true},
+		{"DELETE /v1/{addr}/messages/{id}", s.ack, true},
 	}
 }
 
@@ -201,33 +204,58 @@ func (s *Server) routes() []route {
 const linkRoute = "GET " + protocol.LinkPath + "{addr}"
 
 // Handler returns the API's routes, the page a box's link opens, and the
-// site, if there is one. Both pages, like every call with no pass and every
-// request no route matches, spend the caller's address's flood budget
-// (spendRequest). Both are answered before the API is ready, since neither
-// reads a store.
+// site, if there is one. Every route is put on its router through the gate,
+// which counts a request before its route does anything for it, and a
+// request no route answers is counted instead by unrouted. Both pages are
+// answered before the API is ready, since neither reads a store.
 func (s *Server) Handler() http.Handler {
 	api := http.NewServeMux()
 	for _, r := range s.routes() {
-		api.Handle(r.pattern, registered{s.handle(r.h)})
+		api.Handle(r.pattern, registered{s.gate(r.pass, s.handle(r.h))})
 	}
 	mux := http.NewServeMux()
-	mux.Handle(linkRoute, registered{s.flooding(s.linkPage())})
+	mux.Handle(linkRoute, registered{s.gate(false, s.linkPage())})
 	mux.Handle("/v1/", registered{notStored(s.whenReady(s.unrouted(api)))})
 	if s.site != nil {
-		mux.Handle("/", registered{s.flooding(s.site)})
+		mux.Handle("/", registered{s.gate(false, s.site)})
 	}
 	return s.observed(s.dated(s.unrouted(mux)))
 }
 
-// flooding spends the caller's flood budget before h answers (spendRequest).
-func (s *Server) flooding(h http.Handler) http.Handler {
+// gate counts a request its route answers, before the route does anything
+// for it (LIMITS.md, rule 1). A call that carries a pass this process has
+// checked, to a route that checks the pass before it does anything else
+// (pass), is its box's, and goes on to spend the box's budgets. Every other
+// spends one of its address's flood budget first (spendRequest): a call with
+// no pass, and one with a pass the process has not checked, which costs a
+// parse and up to two signature checks to find out whose it is
+// (IronGall-dev/irongall-server#67, IronGall-dev/irongall-client#269). Until
+// its pass is checked, a call is its address's. All the gate does first is
+// read the Authorization line and hash it, which costs what reading its
+// bytes does.
+func (s *Server) gate(pass bool, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if p := s.spendRequest(r); p != nil {
-			writeProblem(w, p)
-			return
+		if !pass || !s.checked(r) {
+			if p := s.spendRequest(r); p != nil {
+				writeProblem(w, p)
+				return
+			}
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// checked reports whether the call carries, on one Authorization line, a
+// pass this process has checked and that has not run out: a lookup in memory
+// by the value's hash, with nothing parsed. Whose pass it is, and whether it
+// is under its box's current certificate, the route's own check of it says
+// (checkPass).
+func (s *Server) checked(r *http.Request) bool {
+	auth, one := authorization(r)
+	if !one || auth == "" || len(auth) > protocol.MaxPassAuthorization {
+		return false
+	}
+	return s.passes.known(sha256.Sum256([]byte(auth)), s.now())
 }
 
 // unrouted spends the caller's flood budget for a request no route of mux
@@ -634,8 +662,9 @@ func (s *Server) miss(r *http.Request) (*reservation, error) {
 }
 
 // spendRequest spends one of the flood budget of the caller's address
-// (Limits.RequestBurst): every call with no pass, and every request no route
-// matches, as Let's Encrypt limits every endpoint per address
+// (Limits.RequestBurst): every call that carries no pass this process has
+// checked (gate), and every request no route matches (unrouted), as Let's
+// Encrypt limits every endpoint per address
 // (IronGall-dev/irongall-server#58). It is sized far above what an honest
 // crowd behind one address makes, the site's pages included: for floods
 // alone. A refusal is the problem to answer with.
@@ -767,14 +796,11 @@ func (s *Server) spendOwner(ctx context.Context, a protocol.Address, also ...per
 
 // spendLookup spends a call that may carry its caller's pass, a GET of what
 // is public about a box (PROTOCOL.md §4.1): with a pass it is the calling
-// box's, once the pass is checked. With none it spends its address's flood
-// budget (spendRequest), and a read that finds no box counts as a miss
+// box's, once the pass is checked. With none, its address's flood budget is
+// all it spends, at the gate, and a read that finds no box counts as a miss
 // (lookup).
 func (s *Server) spendLookup(r *http.Request) error {
 	if auth, one := authorization(r); one && auth == "" {
-		if p := s.spendRequest(r); p != nil {
-			return p
-		}
 		return nil
 	}
 	from, err := s.sender(r)

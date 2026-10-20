@@ -23,8 +23,8 @@ const hintDocument = "the identity document is \"irongall-v1\", LF, one SSH publ
 
 // register is PUT /v1/<address> (PROTOCOL.md §3). It is a call of a box that
 // does not exist yet, so its address pays for it: its body is read only once
-// the call has spent one of its address's flood budget, as a revocation's is
-// (spendRequest), and the statement and the pass it carries are checked only
+// the call has spent one of its address's flood budget at the gate, as a
+// revocation's is, and the statement and the pass it carries are checked only
 // for a box this process does not already hold, after the address's count of
 // registrations.
 //
@@ -33,9 +33,6 @@ const hintDocument = "the identity document is \"irongall-v1\", LF, one SSH publ
 // revoked, and, while a deleted box's record is kept, a later certificate
 // than its last and a key it never published, which undoes the delete.
 func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
-	if p := s.spendRequest(r); p != nil {
-		return p
-	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -298,13 +295,10 @@ func (s *Server) checkPrekey(id *protocol.Identity, statement, sig []byte) (*pro
 // answered from its record.
 //
 // The pass is read only after the body, so until then the call is its
-// address's: it spends the address's flood budget first, as a registration
-// and a revocation do (spendRequest), and none of the box's budgets until
-// its pass is checked.
+// address's: it spends the address's flood budget at the gate, whatever it
+// carries, as a registration and a revocation do, and none of the box's
+// budgets until its pass is checked.
 func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
-	if p := s.spendRequest(r); p != nil {
-		return p
-	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -485,9 +479,6 @@ func (s *Server) getBox(w http.ResponseWriter, r *http.Request) error {
 // a client that lists this server as one of its revocation servers. It takes
 // no pass, as the PUT beside it takes none.
 func (s *Server) getRevocations(w http.ResponseWriter, r *http.Request) error {
-	if p := s.spendRequest(r); p != nil {
-		return p
-	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -546,9 +537,6 @@ const (
 // Everything else in the body is checked before anything is changed, and a
 // check that fails counts against the caller's address (s.miss).
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
-	if p := s.spendRequest(r); p != nil {
-		return p
-	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err

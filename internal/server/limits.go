@@ -56,6 +56,15 @@ type Limits struct {
 	// the one large read.
 	BodyTimeout time.Duration // [tunable]
 	BodyMinRate int           // bytes a second [tunable]
+
+	// HeadBytes is the most of a request's head, its request line and its
+	// headers, that the server reads (http.Server.MaxHeaderBytes): what the
+	// longest call needs, a pass of protocol.MaxPassAuthorization bytes
+	// with the request line and the other headers a client and a proxy in
+	// front of it send, and no more (decided 2026-10-20: 8 KiB, least need).
+	// A head is read before any count, since the address a call is counted
+	// by may be one of its headers (LIMITS.md, rule 1).
+	HeadBytes int
 }
 
 // DefaultLimits are the decided numbers, and the proposed values of the
@@ -87,6 +96,7 @@ func DefaultLimits() Limits {
 		ACLEntries:                   500,
 		BodyTimeout:                  20 * time.Second,
 		BodyMinRate:                  500,
+		HeadBytes:                    8 << 10,
 	}
 }
 

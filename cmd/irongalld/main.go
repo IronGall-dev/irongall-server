@@ -111,6 +111,7 @@ func serve(args []string) error {
 	fs.IntVar(&l.ACLEntries, "acl-entries", l.ACLEntries, "the most entries a box's ACL holds, its two lists together (0: off)")
 	fs.DurationVar(&l.BodyTimeout, "body-timeout", l.BodyTimeout, "how long a request body, or a response, may take before one more second for each -body-min-rate bytes moved; also the longest wait for the one large read (0: off)")
 	fs.IntVar(&l.BodyMinRate, "body-min-rate", l.BodyMinRate, "bytes a second a body must keep up, as Apache's RequestReadTimeout MinRate (0: off)")
+	fs.IntVar(&l.HeadBytes, "max-header-bytes", l.HeadBytes, "the most of a request's head, its request line and headers, the server reads: what the longest call needs, its pass at the longest a pass can be, and no more; net/http answers a longer one 431 (0: net/http's default)")
 	adminSocket := fs.String("admin-socket", "", "a Unix socket for the operator's commands (irongalld limits): 0600 from the moment this process makes it, never on the API's listener (empty: none)")
 	idle := fs.Duration("idle-timeout", 75*time.Second, "how long an idle keep-alive connection stays open (nginx's default as a server): above the idle timeout of a proxy in front, which may otherwise reuse a connection this one has just closed")
 	metricsListen := fs.String("metrics-listen", "", "address to serve the operator's metrics on, at /metrics in Prometheus' text format: a listener of its own, never the API's (empty: none)")
@@ -237,13 +238,8 @@ func serve(args []string) error {
 		defer metrics.Close() //nolint:errcheck // the process is ending
 		logger.Printf("metrics on %s", *metricsListen)
 	}
-	srv := &http.Server{
-		Addr:              *listen,
-		Handler:           api.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       *idle,
-		ConnState:         cfg.Metrics.ConnState,
-	}
+	srv := apiServer(*listen, api.Handler(), l, *idle)
+	srv.ConnState = cfg.Metrics.ConnState
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
 	if start != nil {
@@ -265,4 +261,17 @@ func serve(args []string) error {
 		return errors.New("stopped: memory could not be shown current")
 	}
 	return nil
+}
+
+// apiServer is the API's HTTP server, at addr: it reads a request's head in
+// at most ten seconds and to l.HeadBytes, no further, before any handler,
+// and so before any count, sees it (LIMITS.md, rule 1).
+func apiServer(addr string, h http.Handler, l server.Limits, idle time.Duration) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    l.HeadBytes,
+		IdleTimeout:       idle,
+	}
 }
