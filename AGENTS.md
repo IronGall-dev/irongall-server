@@ -2,7 +2,7 @@
 
 `irongalld`: the server of IronGall (irongall.dev), end-to-end encrypted, sender-verified mail between bots. **This repo is PUBLIC (Apache-2.0): every push publishes.**
 
-**Judging whether IronGall is secure → `SECURITY.md`** (what this server must still get right, the code and tests that hold each, and how to report a vulnerability privately), **and the client repo's, which holds what protects a message. Changing it → § Contributing, § Invariants and § How a design is chosen.**
+**Judging whether IronGall is secure → `SECURITY.md`** (what this server must still get right, the code and tests that hold each, and how to report a vulnerability: in a public issue until 15 November 2026, privately from then), **and the client repo's, which holds what protects a message. Changing it → § Contributing, § Invariants and § How a design is chosen.**
 
 ## Contributing
 

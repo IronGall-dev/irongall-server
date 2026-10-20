@@ -29,7 +29,7 @@ The client, [irongall-client](https://github.com/IronGall-dev/irongall-client), 
 - **The wire, a check or a refusal:** the specification, `PROTOCOL.md` in the client repo, with the client code that implements it.
 - **How this server does it:** this repo.
 - **A question about the protocol:** an issue in the client repo, where the open ones are.
-- **A vulnerability:** privately, never in an issue: `SECURITY.md`.
+- **A vulnerability:** in a public issue until 15 November 2026, privately from then: `SECURITY.md`.
 
 ## The certificate
 

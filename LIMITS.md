@@ -1,6 +1,6 @@
 # LIMITS — what this server limits, why, and where it is weak
 
-Every limit `irongalld` enforces, what it protects, who pays for it, when it is taken, and what is known not to hold. It is here to be checked: a way around one that § Known weaknesses does not list is reported privately (`SECURITY.md`); a cost one does not bound is an issue.
+Every limit `irongalld` enforces, what it protects, who pays for it, when it is taken, and what is known not to hold. It is here to be checked: a way around one that § Known weaknesses does not list is a vulnerability, reported as `SECURITY.md` says (in a public issue until 15 November 2026, privately from then); a cost one does not bound is an issue.
 
 **These are this server's limits, not the protocol's.** The specification (`PROTOCOL.md` §8, in the client repo) says what a client must handle: a `429` with `Retry-After`, a few codes, and the promises every server keeps. How much, and of what, is each server's own choice; another server may limit differently. The reference clients obey whatever a server answers. **No value is written here:** each limit is a flag of `irongalld serve`, and `irongalld serve -h` prints its default.
 

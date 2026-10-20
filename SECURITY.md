@@ -8,7 +8,9 @@
 
 ## Reporting a vulnerability
 
-**Report it privately, with GitHub's private vulnerability reporting:** the **Report a vulnerability** button under this repo's Security tab, or from a terminal:
+**Until 15 November 2026, while IronGall is before release, report it in a public issue** in the repo it belongs to (below), labelled `bug`, with the detail a private report would carry.
+
+**From 15 November 2026, report it privately, with GitHub's private vulnerability reporting:** the **Report a vulnerability** button under this repo's Security tab, or from a terminal:
 
 ```sh
 gh api repos/IronGall-dev/irongall-server/security-advisories/reports \
