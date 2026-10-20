@@ -84,7 +84,7 @@ type Server struct {
 	rangeRegs *buckets // per IPv6 /48: registrations, beside regs
 	sendIPs   *buckets // per IP
 	misses    *buckets // per IP: reads of the boxes table that found no box, and checks that failed
-	requests  *buckets // per IP: every call with no pass, and every request no route matches
+	requests  *buckets // per IP: every call with no pass this process has checked, and every request no route matches
 	calls     *buckets // per box: its calls with its pass that no other budget counts
 	receives  *buckets // per box: new messages it takes
 	drained   *buckets // per box: its first fetches of held messages
@@ -670,7 +670,7 @@ func (s *Server) miss(r *http.Request) (*reservation, error) {
 // alone. A refusal is the problem to answer with.
 func (s *Server) spendRequest(r *http.Request) *problem {
 	if ok, wait := s.requests.take(ipKey(s.clientIP(r)), s.now()); !ok {
-		return rateLimited(protocol.QuotaRequests, wait, "too many calls with no pass from this address")
+		return rateLimited(protocol.QuotaRequests, wait, "too many calls from this address with no pass this server has checked")
 	}
 	return nil
 }

@@ -98,7 +98,7 @@ func serve(args []string) error {
 	fs.IntVar(&l.RangeRegistrationsPerHour, "range-registrations-per-hour", l.RangeRegistrationsPerHour, "registrations per IPv6 /48, beside -registrations-per-hour (0: off)")
 	fs.IntVar(&l.SendsPerMinutePerIP, "sends-per-minute-per-ip", l.SendsPerMinutePerIP, "pre-auth sends per IP (0: off)")
 	fs.IntVar(&l.MissesPerMinute, "misses-per-minute", l.MissesPerMinute, "calls per IP that named no box or carried nothing that verified (0: off)")
-	fs.IntVar(&l.RequestBurst, "request-burst", l.RequestBurst, "per IP, at once: every call with no pass, and every request no route matches, the link page and the site's pages among them; a budget for floods alone (0: off)")
+	fs.IntVar(&l.RequestBurst, "request-burst", l.RequestBurst, "per IP, at once: every call that carries no pass this process has checked, a new pass among them, and every request no route matches, the link page and the site's pages among them; a budget for floods alone (0: off)")
 	fs.DurationVar(&l.RequestRefill, "request-refill", l.RequestRefill, "one more such request each")
 	fs.IntVar(&l.ReceiveBurst, "receive-burst", l.ReceiveBurst, "new messages a box takes at once, from all senders together (0: off)")
 	fs.DurationVar(&l.ReceiveRefill, "receive-refill", l.ReceiveRefill, "one more new message each")
