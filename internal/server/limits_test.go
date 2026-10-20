@@ -252,6 +252,18 @@ func TestMissesPerIP(t *testing.T) {
 	if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, pass); r.status != http.StatusOK {
 		t.Fatalf("the owner's poll with its pass remembered: %d %s", r.status, r.body)
 	}
+	// So is that pass written in another form a server reads (PROTOCOL.md
+	// §6.1b): it is remembered by the one form a client writes, so a new
+	// spelling of it costs no check, and the address past its count is no
+	// bar.
+	for _, respelled := range []string{
+		strings.Replace(pass, "irongall-pass ", "IRONGALL-PASS ", 1),
+		strings.ReplaceAll(pass, `", `, `" ,  `),
+	} {
+		if r := e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, respelled); r.status != http.StatusOK {
+			t.Fatalf("the owner's poll with its pass remembered, written another way: %d %s", r.status, r.body)
+		}
+	}
 	e.clock.Add(time.Second)
 	e2.want(e2.do(http.MethodGet, "/v1/"+b.Address().String()+"/messages", nil, e2.pass(b)), http.StatusTooManyRequests, protocol.CodeRateLimited)
 	e.clock.Add(-time.Second)

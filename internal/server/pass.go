@@ -174,6 +174,25 @@ func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert
 		s.metrics.pass(true, nil)
 		return nil
 	}
+	if p == nil {
+		var err error
+		if p, err = protocol.ParsePass(auth); err != nil {
+			if !count {
+				return unauthorized(hintPass, "no pass, or not a pass")
+			}
+			return s.notAPass(r)
+		}
+	}
+	// A pass is remembered in the one form a client writes it, so the same
+	// pass written in another form a server reads (PROTOCOL.md §6.1b) is
+	// answered from memory too, and its many spellings cost one check.
+	if one := sha256.Sum256([]byte(p.Authorization())); one != sum {
+		if s.passes.has(a, one, cert, now) {
+			s.metrics.pass(true, nil)
+			return nil
+		}
+		sum = one
+	}
 	defer func() { s.metrics.pass(false, err) }()
 	if count {
 		var m *reservation
@@ -187,12 +206,6 @@ func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert
 				m.release(s.now())
 			}
 		}()
-	}
-	if p == nil {
-		var err error
-		if p, err = protocol.ParsePass(auth); err != nil {
-			return unauthorized(hintPass, "no pass, or not a pass")
-		}
 	}
 	if p.Address != a {
 		return unauthorized(hintPass, "the pass is another box's")
