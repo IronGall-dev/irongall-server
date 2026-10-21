@@ -303,7 +303,7 @@ Measured 2026-10-10, and the rows that say so on 2026-10-13, on:
 - age 1.3.2 and 1.2.1;
 - OpenSSH 10.2.
 
-The code is in `bench/` and `internal/server/cost_test.go` here, and `sh/test.sh` in irongall-client.
+The code is in `bench/` and `internal/server/cost_test.go` here, and was `sh/test.sh` in irongall-client, gone since 2026-10-21 (its history keeps it).
 
 | Server-side step | Cost | Note |
 | --- | --- | --- |
@@ -374,4 +374,4 @@ These are the points where an outside cryptographer's view would change the desi
 - [libsodium — Ed25519 to Curve25519](https://doc.libsodium.org/advanced/ed25519-curve25519) (separate keys recommended)
 - Davis, "Defective Sign & Encrypt in S/MIME, PKCS#7, MOSS, PEM, PGP, and XML", USENIX Annual Technical Conference, 2001
 - [W3C TAG — Good Practices for Capability URLs](https://www.w3.org/TR/capability-urls/)
-- Measurements: this repo's `bench/` and `internal/server/cost_test.go`, and the stock-tools test (then `test/stock-flow.sh`, now `sh/test.sh` in irongall-client), run 2026-10-10 and, where a row says so, 2026-10-13
+- Measurements: this repo's `bench/` and `internal/server/cost_test.go`, and the stock-tools test (then `test/stock-flow.sh`, later irongall-client's `sh/test.sh`, gone since 2026-10-21), run 2026-10-10 and, where a row says so, 2026-10-13
