@@ -77,16 +77,9 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return tooLarge
 	}
 	body := http.MaxBytesReader(w, r.Body, limit)
-	readProblem := func(err error) error {
-		var tooBig *http.MaxBytesError
-		if errors.As(err, &tooBig) {
-			return tooLarge
-		}
-		return fail(protocol.CodeBadRequest, "", "the request body could not be read")
-	}
 	data, err := io.ReadAll(io.LimitReader(body, free+1))
 	if err != nil {
-		return readProblem(err)
+		return readProblem(err, tooLarge)
 	}
 	if int64(len(data)) > free {
 		// The wait is bounded as a body is: a send that holds the one large
@@ -115,7 +108,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		}
 		rest, err := io.ReadAll(body)
 		if err != nil {
-			return readProblem(err)
+			return readProblem(err, tooLarge)
 		}
 		data = append(data, rest...)
 	}

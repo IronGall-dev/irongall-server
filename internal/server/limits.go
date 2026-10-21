@@ -65,6 +65,9 @@ type Limits struct {
 	// A head is read before any count, since the address a call is counted
 	// by may be one of its headers (LIMITS.md, rule 1).
 	HeadBytes int
+	// HeadTimeout is how long a request's head may take to arrive
+	// (http.Server.ReadHeaderTimeout), before any handler sees it.
+	HeadTimeout time.Duration
 }
 
 // DefaultLimits are the decided numbers, and the proposed values of the
@@ -97,6 +100,7 @@ func DefaultLimits() Limits {
 		BodyTimeout:                  20 * time.Second,
 		BodyMinRate:                  500,
 		HeadBytes:                    8 << 10,
+		HeadTimeout:                  10 * time.Second,
 	}
 }
 

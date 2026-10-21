@@ -169,33 +169,49 @@ func (s *Server) served() int {
 // wildcard is a wildcard in a route's pattern.
 var wildcard = regexp.MustCompile(`\{[^}]*\}`)
 
-// route is one of the API's routes: its pattern, its handler, and whether it
-// checks the call's pass before it does anything else, so that a pass this
-// process has checked makes the call its box's at the gate.
+// route is one of the API's routes: its pattern, its handler, and whose pass
+// this process has checked makes a call on it its box's at the gate.
 type route struct {
 	pattern string
 	h       func(http.ResponseWriter, *http.Request) error
-	pass    bool
+	pass    passRule
 }
+
+// passRule is whose checked pass makes a call its box's at the gate, on a
+// route that checks the pass before it does anything else.
+type passRule int
+
+const (
+	// passNone: none. The route reads its pass, if it takes one, after its
+	// body, or takes none.
+	passNone passRule = iota
+	// passAnyBox: the pass's own box's, whichever box the path names: the
+	// read of a box and a send, which a box makes to another.
+	passAnyBox
+	// passPathBox: only the pass of the box the path names: the calls a box
+	// makes about itself, which answer that box's state before they look at
+	// a pass (IronGall-dev/irongall-server#74).
+	passPathBox
+)
 
 // routes are the API's, each the client repo's api/openapi.yaml gives
 // (TestTheRoutesAreTheDescriptions).
 func (s *Server) routes() []route {
 	return []route{
-		{"GET /v1/{addr}", s.getBox, true},
-		{"PUT /v1/{addr}", s.register, false}, // its pass is read after its body
-		{"DELETE /v1/{addr}", s.deleteBox, true},
-		{"PUT /v1/{addr}/prekey", s.prekey, false}, // its pass is read after its body
-		{"PUT /v1/{addr}/revocations", s.revoke, false},
-		{"GET /v1/{addr}/revocations", s.getRevocations, false},
-		{"PUT /v1/{addr}/acl", s.putACL, true},
-		{"GET /v1/{addr}/acl", s.getACL, true},
-		{"PUT /v1/{addr}/account", s.adopt, true},
-		{"DELETE /v1/{addr}/account", s.leave, true},
-		{"POST /v1/{addr}/messages", s.send, true},
-		{"GET /v1/{addr}/messages", s.list, true},
-		{"GET /v1/{addr}/messages/{id}", s.fetch, true},
-		{"DELETE /v1/{addr}/messages/{id}", s.ack, true},
+		{"GET /v1/{addr}", s.getBox, passAnyBox},
+		{"PUT /v1/{addr}", s.register, passNone}, // its pass is read after its body
+		{"DELETE /v1/{addr}", s.deleteBox, passPathBox},
+		{"PUT /v1/{addr}/prekey", s.prekey, passNone}, // its pass is read after its body
+		{"PUT /v1/{addr}/revocations", s.revoke, passNone},
+		{"GET /v1/{addr}/revocations", s.getRevocations, passNone},
+		{"PUT /v1/{addr}/acl", s.putACL, passPathBox},
+		{"GET /v1/{addr}/acl", s.getACL, passPathBox},
+		{"PUT /v1/{addr}/account", s.adopt, passPathBox},
+		{"DELETE /v1/{addr}/account", s.leave, passPathBox},
+		{"POST /v1/{addr}/messages", s.send, passAnyBox},
+		{"GET /v1/{addr}/messages", s.list, passPathBox},
+		{"GET /v1/{addr}/messages/{id}", s.fetch, passPathBox},
+		{"DELETE /v1/{addr}/messages/{id}", s.ack, passPathBox},
 	}
 }
 
@@ -204,38 +220,51 @@ func (s *Server) routes() []route {
 const linkRoute = "GET " + protocol.LinkPath + "{addr}"
 
 // Handler returns the API's routes, the page a box's link opens, and the
-// site, if there is one. Every route is put on its router through the gate,
-// which counts a request before its route does anything for it, and a
-// request no route answers is counted instead by unrouted. Both pages are
-// answered before the API is ready, since neither reads a store.
+// site, if there is one. Every answer is paced, and every request is counted
+// before anything is done for it (LIMITS.md, rule 1): each handler is put on
+// its router by mount, through the gate, and a request no route answers is
+// counted instead by unrouted. Both pages are answered before the API is
+// ready, since neither reads a store.
 func (s *Server) Handler() http.Handler {
 	api := http.NewServeMux()
 	for _, r := range s.routes() {
-		api.Handle(r.pattern, registered{s.gate(r.pass, s.handle(r.h))})
+		s.mount(api, r.pattern, r.pass, s.whenReady(s.handle(r.h)))
 	}
 	mux := http.NewServeMux()
-	mux.Handle(linkRoute, registered{s.gate(false, s.linkPage())})
-	mux.Handle("/v1/", registered{notStored(s.whenReady(s.unrouted(api)))})
+	s.mount(mux, linkRoute, passNone, s.linkPage())
+	s.subtree(mux, "/v1/", api, notStored)
 	if s.site != nil {
-		mux.Handle("/", registered{s.gate(false, s.site)})
+		s.mount(mux, "/", passNone, s.site)
 	}
-	return s.observed(s.dated(s.unrouted(mux)))
+	return s.paced(s.observed(s.dated(s.unrouted(mux))))
+}
+
+// mount puts h on mux at pattern behind the gate, so the request is counted
+// before h does anything for it. It is how every handler reaches a router:
+// unrouted takes a request as routed only to a handler mount or subtree put
+// there.
+func (s *Server) mount(mux *http.ServeMux, pattern string, pass passRule, h http.Handler) {
+	mux.Handle(pattern, registered{s.gate(pass, h)})
+}
+
+// subtree puts the router inner on mux at prefix, wrapped by wrap: its
+// routes are mounted on it, and it counts a request none of them answers
+// itself (unrouted).
+func (s *Server) subtree(mux *http.ServeMux, prefix string, inner *http.ServeMux, wrap func(http.Handler) http.Handler) {
+	mux.Handle(prefix, registered{wrap(s.unrouted(inner))})
 }
 
 // gate counts a request its route answers, before the route does anything
-// for it (LIMITS.md, rule 1). A call that carries a pass this process has
-// checked, to a route that checks the pass before it does anything else
-// (pass), is its box's, and goes on to spend the box's budgets. Every other
-// spends one of its address's flood budget first (spendRequest): a call with
-// no pass, and one with a pass the process has not checked, which costs a
-// parse and up to two signature checks to find out whose it is
-// (IronGall-dev/irongall-server#67, IronGall-dev/irongall-client#269). Until
-// its pass is checked, a call is its address's. All the gate does first is
-// read the Authorization line and hash it, which costs what reading its
-// bytes does.
-func (s *Server) gate(pass bool, h http.Handler) http.Handler {
+// for it (LIMITS.md, rule 1). A call that is its box's (boxsCall) goes on to
+// spend the box's budgets. Every other spends one of its address's flood
+// budget first (spendRequest): a call with no pass, and one with a pass the
+// process has not checked, which costs a parse and up to two signature
+// checks to find out whose it is (IronGall-dev/irongall-server#67,
+// IronGall-dev/irongall-client#269). Until its pass is checked, a call is
+// its address's.
+func (s *Server) gate(pass passRule, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !pass || !s.checked(r) {
+		if !s.boxsCall(pass, r) {
 			if p := s.spendRequest(r); p != nil {
 				writeProblem(w, p)
 				return
@@ -245,21 +274,56 @@ func (s *Server) gate(pass bool, h http.Handler) http.Handler {
 	})
 }
 
-// checked reports whether the call carries, on one Authorization line, a
-// pass this process has checked and that has not run out: a lookup in memory
-// by the value's hash, with nothing parsed. Whose pass it is, and whether it
-// is under its box's current certificate, the route's own check of it says
-// (checkPass).
-func (s *Server) checked(r *http.Request) bool {
+// boxsCall reports whether a call is its box's at the gate: it carries a
+// pass this process has checked, to a route that takes that box's pass
+// (pass), and the box is live in this process's memory (live). All this
+// reads is the Authorization line, its hash, and lookups in memory, which
+// cost what reading its bytes does. Whether the pass is under the box's
+// current certificate, the route's own check of it says (checkPass).
+func (s *Server) boxsCall(pass passRule, r *http.Request) bool {
+	if pass == passNone {
+		return false
+	}
+	a, ok := s.checked(r)
+	if !ok || pass == passPathBox && r.PathValue("addr") != a.String() {
+		return false
+	}
+	return s.live(a)
+}
+
+// live reports whether this process's memory holds box a as live, with no
+// read of a store: loaded (Held), or its record in the cache (Known), and
+// not deleted, not revoked, its current certificate not one its identity
+// revoked. Memory is what the stream keeps current, so a change made through
+// another process counts as one made here. A box memory does not hold is
+// not live here: its call spends its address's flood budget, and its route
+// reads it.
+func (s *Server) live(a protocol.Address) bool {
+	if st, ok := s.store.Held(a); ok {
+		return st.State == Active && !st.Listed
+	}
+	b, ok := s.store.Known(a)
+	if !ok || b == nil || b.State != Active {
+		return false
+	}
+	listed, err := b.listed(b.CertSerial)
+	return err == nil && !listed
+}
+
+// checked returns the box whose pass the call carries, on one Authorization
+// line, if this process has checked that pass and it has not run out: a
+// lookup in memory by the value's hash, with nothing parsed.
+func (s *Server) checked(r *http.Request) (protocol.Address, bool) {
 	auth, one := authorization(r)
 	if !one || auth == "" || len(auth) > protocol.MaxPassAuthorization {
-		return false
+		return protocol.Address{}, false
 	}
 	return s.passes.known(sha256.Sum256([]byte(auth)), s.now())
 }
 
 // unrouted spends the caller's flood budget for a request no route of mux
-// answers, before mux answers it itself: 404, 405, or a redirect
+// answers, before mux answers it itself: 404, 405, a redirect, or a 400 to a
+// request for *, which reaches the handler (HTTPServer)
 // (spendRequest).
 func (s *Server) unrouted(mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -274,17 +338,37 @@ func (s *Server) unrouted(mux *http.ServeMux) http.Handler {
 }
 
 // routed reports whether one of mux's routes answers r: whether the handler
-// ServeMux.Handler finds for it, the one ServeHTTP calls, is one the server
-// registered, not one the router makes itself (a redirect, a 404 or a 405).
-// So nothing here copies how ServeMux matches, cleans or redirects a path.
+// ServeMux.Handler finds for it, the one ServeHTTP calls, is one mount or
+// subtree put there, not one the router makes itself (a redirect, a 404 or
+// a 405). So nothing here copies how ServeMux matches, cleans or redirects a
+// path.
 func routed(mux *http.ServeMux, r *http.Request) bool {
 	h, _ := mux.Handler(r)
 	_, ok := h.(registered)
 	return ok
 }
 
-// registered marks each handler the server puts on one of its routers.
+// registered marks each handler mount or subtree puts on a router, and only
+// those.
 type registered struct{ http.Handler }
+
+// HTTPServer is the API's HTTP server, at addr, with h as its handler. It
+// reads a request's head in at most l.HeadTimeout and to l.HeadBytes, no
+// further, before any handler sees it, and so before any count (LIMITS.md,
+// rule 1); every request after its head reaches h, OPTIONS * among them,
+// which net/http would otherwise answer itself, uncounted
+// (IronGall-dev/irongall-server#75). An idle keep-alive connection is closed
+// after idle.
+func HTTPServer(addr string, h http.Handler, l Limits, idle time.Duration) *http.Server {
+	return &http.Server{
+		Addr:                         addr,
+		Handler:                      h,
+		ReadHeaderTimeout:            l.HeadTimeout,
+		MaxHeaderBytes:               l.HeadBytes,
+		IdleTimeout:                  idle,
+		DisableGeneralOptionsHandler: true,
+	}
+}
 
 // notStored marks every answer of the API as one no cache may keep. What a
 // box's identity, prekey or revocation is can change at any moment, and an
@@ -362,7 +446,6 @@ const retryLater = time.Minute
 // handle adapts a handler that returns its error as a problem.
 func (s *Server) handle(h func(http.ResponseWriter, *http.Request) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w, r = s.paced(w, r)
 		err := h(w, r)
 		if err == nil {
 			return
@@ -383,25 +466,37 @@ func (s *Server) handle(h func(http.ResponseWriter, *http.Request) error) http.H
 	}
 }
 
-// paced holds a call's body and its response to Limits.BodyTimeout and
-// Limits.BodyMinRate (IronGall-dev/irongall-server#7): a deadline that
+// paced holds every request's body and every answer to Limits.BodyTimeout
+// and Limits.BodyMinRate (IronGall-dev/irongall-server#7): a deadline that
 // starts at BodyTimeout and grows a second for each BodyMinRate bytes
 // moved, so a slow link that keeps sending is let through, and a peer that
-// stops is cut off. Off when either is zero.
-func (s *Server) paced(w http.ResponseWriter, r *http.Request) (http.ResponseWriter, *http.Request) {
+// stops is cut off. It is the outermost wrapper, so no answer goes without
+// it: a refusal at the gate, the router's own, the link page's, a site's
+// (IronGall-dev/irongall-server#31, #77). A body the handler leaves unread
+// is drained by net/http before the answer, under the read deadline, and an
+// answer with no body, or a body's last bytes, is written once the handler
+// returns, under a write deadline set then. Off when either is zero.
+func (s *Server) paced(h http.Handler) http.Handler {
 	if s.limits.BodyTimeout <= 0 || s.limits.BodyMinRate <= 0 {
-		return w, r
+		return h
 	}
-	rc := http.NewResponseController(w)
-	start := time.Now()
-	if r.Body != nil && r.Body != http.NoBody {
-		_ = rc.SetReadDeadline(start.Add(s.limits.BodyTimeout))
-		r.Body = &pacedBody{ReadCloser: r.Body, rc: rc, start: start, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate), m: s.metrics}
-	}
-	return &pacedWriter{ResponseWriter: w, rc: rc, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate)}, r
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		start := time.Now()
+		if r.Body != nil && r.Body != http.NoBody {
+			_ = rc.SetReadDeadline(start.Add(s.limits.BodyTimeout))
+			r.Body = &pacedBody{ReadCloser: r.Body, rc: rc, start: start, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate), m: s.metrics}
+		}
+		h.ServeHTTP(&pacedWriter{ResponseWriter: w, rc: rc, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate)}, r)
+		_ = rc.SetWriteDeadline(time.Now().Add(s.limits.BodyTimeout))
+	})
 }
 
-// pacedBody moves the read deadline on as a body's bytes arrive.
+// pacedBody moves the read deadline on as a body's bytes arrive, while the
+// body is open. The read that ends it does not: net/http has then begun its
+// own read of the connection, for the next request, and a deadline set on it
+// would cut that read and with it the context of every request still to
+// come on the connection (IronGall-dev/irongall-server#28).
 type pacedBody struct {
 	io.ReadCloser
 	rc      *http.ResponseController
@@ -414,8 +509,8 @@ type pacedBody struct {
 
 func (p *pacedBody) Read(b []byte) (int, error) {
 	n, err := p.ReadCloser.Read(b)
-	if n > 0 {
-		p.got += int64(n)
+	p.got += int64(n)
+	if n > 0 && err == nil {
 		_ = p.rc.SetReadDeadline(p.start.Add(p.timeout + time.Duration(p.got/p.rate)*time.Second))
 	}
 	if errors.Is(err, os.ErrDeadlineExceeded) {
@@ -482,16 +577,21 @@ func queryProblem(err error, hint string) error {
 func decodeBody(w http.ResponseWriter, r *http.Request, limit int64, v any) error {
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	if err != nil {
-		return readProblem(err, limit)
+		return readProblem(err, fail(protocol.CodeTooLarge, "send less", "the request body is over %d bytes", limitValue(int(limit))))
 	}
 	return decodeJSON(data, v)
 }
 
-// readProblem is the answer to a body that could not be read whole.
-func readProblem(err error, limit int64) error {
+// readProblem is the answer to a body that could not be read whole: past
+// its cap, tooLarge; cut off at its deadline (paced), 408 (RFC 9110
+// §15.5.9); anything else, a body that could not be read.
+func readProblem(err, tooLarge error) error {
 	var tooBig *http.MaxBytesError
-	if errors.As(err, &tooBig) {
-		return fail(protocol.CodeTooLarge, "send less", "the request body is over %d bytes", limitValue(int(limit)))
+	switch {
+	case errors.As(err, &tooBig):
+		return tooLarge
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return fail(protocol.CodeRequestTimeout, "send it again", "the request body did not arrive in the time this server waits for one")
 	}
 	return fail(protocol.CodeBadRequest, "", "the request body could not be read")
 }

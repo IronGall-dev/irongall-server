@@ -39,18 +39,25 @@ type seenPass struct {
 }
 
 // passes remembers, for each box, the pass it showed last, and each such
-// pass's two hashes, for the gate, which knows no box (known). An entry goes
-// when its pass has run out, which is at most protocol.MaxPassLifetime after
-// it was checked, so the maps hold only boxes that called within that time.
+// pass's two hashes with its box, for the gate, which knows the pass only by
+// its hash (known). An entry goes when its pass has run out, which is at
+// most protocol.MaxPassLifetime after it was checked, so the maps hold only
+// boxes that called within that time.
 type passes struct {
 	mu    sync.Mutex
 	seen  map[protocol.Address]seenPass
-	sums  map[[32]byte]time.Time // each seenPass's sum and raw, until it is taken
+	sums  map[[32]byte]knownPass // each seenPass's sum and raw
 	sweep time.Time              // when prune next runs
 }
 
+// knownPass is whose a checked pass is, and until when it is taken.
+type knownPass struct {
+	box   protocol.Address
+	until time.Time
+}
+
 func newPasses() *passes {
-	return &passes{seen: map[protocol.Address]seenPass{}, sums: map[[32]byte]time.Time{}}
+	return &passes{seen: map[protocol.Address]seenPass{}, sums: map[[32]byte]knownPass{}}
 }
 
 // has reports whether the Authorization value hashing to sum is the pass box
@@ -63,13 +70,17 @@ func (ps *passes) has(a protocol.Address, sum, cert [32]byte, now time.Time) boo
 	return ok && (p.sum == sum || p.raw == sum) && p.cert == cert && now.Before(p.until)
 }
 
-// known reports whether the Authorization value hashing to sum is, in either
-// form, a pass some box showed last that has not run out at now.
-func (ps *passes) known(sum [32]byte, now time.Time) bool {
+// known returns the box whose pass the Authorization value hashing to sum
+// is, in either form, if it is the pass that box showed last and it has not
+// run out at now.
+func (ps *passes) known(sum [32]byte, now time.Time) (protocol.Address, bool) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	until, ok := ps.sums[sum]
-	return ok && now.Before(until)
+	k, ok := ps.sums[sum]
+	if !ok || !now.Before(k.until) {
+		return protocol.Address{}, false
+	}
+	return k.box, true
 }
 
 // keep remembers a pass of box a that was checked at now, in place of the
@@ -89,7 +100,7 @@ func (ps *passes) keep(a protocol.Address, p seenPass, now time.Time) {
 		ps.forget(a, old)
 	}
 	ps.seen[a] = p
-	ps.sums[p.sum], ps.sums[p.raw] = p.until, p.until
+	ps.sums[p.sum], ps.sums[p.raw] = knownPass{a, p.until}, knownPass{a, p.until}
 }
 
 // forget drops box a's pass p. The caller holds mu.

@@ -43,7 +43,7 @@ func headOf(t *testing.T, addr, head string) int {
 func TestTheHeadIsReadToWhatTheLongestCallNeeds(t *testing.T) {
 	serve := func(l server.Limits) (string, *int) {
 		reached := new(int)
-		srv := apiServer("", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		srv := server.HTTPServer("", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			*reached++
 			w.WriteHeader(http.StatusNoContent)
 		}), l, time.Minute)

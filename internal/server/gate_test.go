@@ -81,69 +81,132 @@ func respelled(t *testing.T, pass string) string {
 	return passSignature.ReplaceAllLiteralString(pass, `signature="`+base64.StdEncoding.EncodeToString([]byte(spaced))+`"`)
 }
 
-// Every request is counted before anything is done for it: every route is
+// Every request is counted before anything is done for it: every handler is
 // put on its router through one gate, and a request no route answers is
 // counted by the router's own (LIMITS.md, rule 1;
-// IronGall-dev/irongall-client#269, IronGall-dev/irongall-server#67, #69). So
-// from an address past its flood budget, every route, the link page, a site's
-// page and a request no route answers are refused 429 requests, whatever
-// the call carries, with nothing else done: no other count of any limit
-// taken, no pass parsed or checked, no box looked up, no body read. A pass
-// this process has checked, to a route that checks a pass before anything
-// else, is its box's call and goes on, and its body is read only once a
-// count of its box's, or of its address's for a lookup, has been taken. A
-// new route is held to this by being one of routes().
+// IronGall-dev/irongall-client#269, IronGall-dev/irongall-server#67, #69,
+// #74). So from an address past its flood budget, every route on a box in
+// every state (live, revoked, deleted, its current certificate revoked, and
+// one the server holds nothing of), the link page, a site's page and a
+// request no route answers are refused 429 requests, whatever the call
+// carries, with nothing else done: no other count of any limit taken, no
+// pass parsed or checked, no box looked up, no body read. The one call that
+// goes on is a box's: a pass this process has checked, of a box that is
+// live, to a route that takes that box's pass (a read of a box and a send
+// take any box's, a call about a box only its own). Its answer moves a count
+// of its box's, whatever it is. A new route is held to this by being one of
+// routes(), and a new state by being one of these.
 func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 	l := relaxed()
 	l.RequestBurst, l.RequestRefill = 1, time.Hour
 	l.MissesPerMinute = 1000
 	l.CallBurst, l.CallRefill = 1000, time.Hour
+	l.PollBurst, l.PollRefill = 1000, time.Hour
+	l.DrainBurst, l.DrainRefill = 1000, time.Hour
+	l.ReceiveBurst, l.ReceiveRefill = 1000, time.Hour
+	l.SendsPerDay = 1000
 	site, err := LoadSite(writeSite(t, siteFiles))
 	if err != nil {
 		t.Fatal(err)
 	}
 	reg := prometheus.NewRegistry()
 	e := newEnv(t, l, func(c *Config) { c.Metrics, c.Site = NewMetrics(reg), site })
-	b := e.box(protocol.Classic)
-	own := "/v1/" + b.Address().String()
-	checked := e.pass(b)
-	e.want(e.do("GET", own+"/messages", nil, checked), http.StatusOK, "")
-	e.clock.Add(time.Second)
-	values := []struct{ name, auth string }{
-		{"no pass", ""},
-		{"5,600 bytes of commas", "irongall-pass " + strings.Repeat(",", protocol.MaxPassAuthorization-len("irongall-pass "))},
-		{"a new pass of a registered box", e.pass(b)},
-		{"the checked pass, respelled", respelled(t, checked)},
-		{"the checked pass", checked},
+	n := 0
+	fresh := func() string { // an address that has spent nothing
+		n++
+		return fmt.Sprintf("10.%d.%d.%d", n/40000, n/200%200, n%200+1)
 	}
+	call := e.caller()
+	// checked is a box registered, a pass of it checked by this process, and
+	// that pass.
+	checked := func() (*raw, string) {
+		r := e.raw()
+		r.prekey(1, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+		e.want(call(fresh(), "PUT", r.path(""), r.registration(1), r.pass(1)), http.StatusCreated, "")
+		p := r.pass(1)
+		e.want(call(fresh(), "GET", r.path("/messages"), nil, p), http.StatusOK, "")
+		return r, p
+	}
+	live, livePass := checked()
+	other, otherPass := checked()
+	// A box whose pass was checked by a read of another box, which loads
+	// nothing into memory but its record: a box that sends and never polls.
+	sender := e.raw()
+	sender.prekey(1, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	e.want(call(fresh(), "PUT", sender.path(""), sender.registration(1), sender.pass(1)), http.StatusCreated, "")
+	senderPass := sender.pass(1)
+	e.want(call(fresh(), "GET", other.path(""), nil, senderPass), http.StatusOK, "")
+	revoked, revokedPass := checked()
+	rev, err := protocol.SignRevocation(revoked.signer, revoked.id.Address())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.want(call(fresh(), "PUT", revoked.path("/revocations"), protocol.Revocations{Identity: revoked.id.Document(), Revocation: rev}, ""), http.StatusCreated, "")
+	deleted, deletedPass := checked()
+	e.want(call(fresh(), "DELETE", deleted.path(""), nil, deletedPass), http.StatusNoContent, "")
+	listed, listedPass := checked()
+	e.want(call(fresh(), "PUT", listed.path("/revocations"), listed.certs(1), ""), http.StatusOK, "")
+	e.clock.Add(time.Second)
 	nobody := strings.Repeat("ab", 32) // an address the server holds nothing of
+
+	type state struct {
+		name string
+		addr string
+		pass string // the box's own checked pass, if it has one
+	}
+	states := []state{
+		{"live", live.id.Address().String(), livePass},
+		{"revoked", revoked.id.Address().String(), revokedPass},
+		{"deleted", deleted.id.Address().String(), deletedPass},
+		{"its certificate revoked", listed.id.Address().String(), listedPass},
+		{"held by nobody", nobody, ""},
+	}
+	// The passes of a live box, which make a call its box's where the
+	// route takes them.
+	boxOf := map[string]string{livePass: live.id.Address().String(), otherPass: other.id.Address().String(), senderPass: sender.id.Address().String()}
 	type target struct {
 		method, path string
-		pass         bool // a route that checks a pass before anything else
-		direct       bool // answered by the router or a site, which the API's description does not hold
+		pass         passRule
+		box          string // the box in the path
+		own          string // its own checked pass
+		direct       bool   // answered by the router or a site, which the API's description does not hold
 	}
-	var targets []target
+	var targets, last []target
 	for _, r := range e.server.routes() {
 		method, path, _ := strings.Cut(r.pattern, " ")
-		path = strings.NewReplacer("{addr}", nobody, "{id}", strings.Repeat("0", 64)).Replace(path)
-		targets = append(targets, target{method, path, r.pass, false})
-		if r.pass { // the same route on the pass's own box
-			targets = append(targets, target{method, strings.Replace(path, nobody, b.Address().String(), 1), true, false})
+		for _, st := range states {
+			p := strings.NewReplacer("{addr}", st.addr, "{id}", strings.Repeat("0", 64)).Replace(path)
+			if r.pattern == "DELETE /v1/{addr}" { // it deletes the live box: last
+				last = append(last, target{method, p, r.pass, st.addr, st.pass, false})
+				continue
+			}
+			targets = append(targets, target{method, p, r.pass, st.addr, st.pass, false})
 		}
 	}
+	targets = append(targets, last...)
 	targets = append(targets,
-		target{"GET", protocol.LinkPath + nobody, false, false},
-		target{"GET", "/llms.txt", false, true},
-		target{"GET", "/v1/" + nobody + "/nothing/here", false, true},
-		target{"POST", protocol.LinkPath + nobody, false, true},
+		target{"GET", protocol.LinkPath + nobody, passNone, nobody, "", false},
+		target{"GET", "/llms.txt", passNone, "", "", true},
+		target{"GET", "/v1/" + nobody + "/nothing/here", passNone, nobody, "", true},
+		target{"POST", protocol.LinkPath + nobody, passNone, nobody, "", true},
 	)
 	described, direct := apitest.Handler(t, e.server.Handler()), e.server.Handler()
-	n := 0
 	for _, tg := range targets {
+		values := []struct{ name, auth string }{
+			{"no pass", ""},
+			{"5,600 bytes of commas", "irongall-pass " + strings.Repeat(",", protocol.MaxPassAuthorization-len("irongall-pass "))},
+			{"a new pass of a live box", live.pass(1)},
+			{"a live box's checked pass, respelled", respelled(t, livePass)},
+			{"a live box's checked pass", livePass},
+			{"another live box's checked pass", otherPass},
+			{"the checked pass of a live box that never polled", senderPass},
+		}
+		if tg.own != "" && tg.own != livePass {
+			values = append(values, struct{ name, auth string }{"the box's own checked pass", tg.own})
+		}
 		for _, v := range values {
-			n++
-			ip := fmt.Sprintf("10.0.%d.%d", n/200, n%200+1)
-			if got := e.caller()(ip, "GET", protocol.LinkPath+nobody, nil, ""); got.status != http.StatusOK { // its one call
+			ip := fresh()
+			if got := call(ip, "GET", protocol.LinkPath+nobody, nil, ""); got.status != http.StatusOK { // its one call
 				t.Fatalf("the address's one call: %d", got.status)
 			}
 			body := &recorded{r: strings.NewReader(`{"identity":"` + strings.Repeat("A", 4000) + `"}`)}
@@ -162,12 +225,12 @@ func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 			}
 			got := reply{status: w.Code, header: w.Header(), body: w.Body.Bytes()}
 			what := fmt.Sprintf("%s %s with %s", tg.method, tg.path, v.name)
-			if tg.pass && v.auth == checked {
+			if box, ok := boxOf[v.auth]; ok && (tg.pass == passAnyBox || tg.pass == passPathBox && box == tg.box) {
 				if q, _ := got.quota(); q == protocol.QuotaRequests {
 					t.Errorf("%s: refused for the address's flood budget, though its box's pass was checked", what)
 				}
-				if d := moved(limits, counts(t, reg, "irongalld_limit_requests_total")); body.read && len(d) == 0 {
-					t.Errorf("%s: its body was read with no count taken", what)
+				if d := moved(limits, counts(t, reg, "irongalld_limit_requests_total")); len(d) == 0 {
+					t.Errorf("%s: answered %d with no count taken", what, got.status)
 				}
 				continue
 			}
@@ -184,6 +247,26 @@ func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 			if body.read {
 				t.Errorf("%s: its body was read", what)
 			}
+		}
+	}
+}
+
+// A server that is not ready yet answers 503 only to a call it has counted:
+// from an address past its flood budget, every route is refused 429
+// requests, before its 503 (IronGall-dev/irongall-server#75's note).
+func TestAServerNotReadyCountsFirst(t *testing.T) {
+	l := relaxed()
+	l.RequestBurst, l.RequestRefill = 1, time.Hour
+	e := newEnv(t, l, func(c *Config) { c.Ready = func() bool { return false } })
+	call := e.caller()
+	nobody := strings.Repeat("ab", 32)
+	for i, r := range e.server.routes() {
+		method, path, _ := strings.Cut(r.pattern, " ")
+		path = strings.NewReplacer("{addr}", nobody, "{id}", strings.Repeat("0", 64)).Replace(path)
+		ip := fmt.Sprintf("10.1.0.%d", i+1)
+		e.want(call(ip, method, path, nil, ""), http.StatusServiceUnavailable, protocol.CodeUnavailable)
+		if got := call(ip, method, path, nil, ""); got.status != http.StatusTooManyRequests {
+			t.Errorf("%s %s, past the address's flood budget, before the server is ready: %d %s, want 429 requests", method, path, got.status, got.body)
 		}
 	}
 }
