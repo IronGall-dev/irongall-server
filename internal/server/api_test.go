@@ -29,8 +29,8 @@ func TestTheRoutesAreTheDescriptions(t *testing.T) {
 
 // The read of a box is GET /v1/<address>, and the read of its identity it
 // replaced is no route of this server: GET …/identity gets the router's plain
-// 404. GET …/revocations is a route, the revocation server's read that every
-// mailbox server answers too (TestEveryMailboxServerIsARevocationServer).
+// 404. GET …/revocations is a route, the read of what the server keeps of an
+// address (TestTheRevocationsOfAnyAddressAreServed).
 func TestTheReadTheBoxReplacedIsGone(t *testing.T) {
 	e := newEnv(t, relaxed())
 	b := e.box(protocol.Classic)

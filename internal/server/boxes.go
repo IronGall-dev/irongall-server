@@ -472,12 +472,11 @@ func (s *Server) getBox(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// getRevocations is GET /v1/<address>/revocations, a revocation server's read
-// (PROTOCOL.md §6.3): the record this server holds of the address, or 404
-// not_revoked. Every mailbox server is a revocation server. A box learns the
-// same of the boxes it writes to from their read (getBox); this route is for
-// a client that lists this server as one of its revocation servers. It takes
-// no pass, as the PUT beside it takes none.
+// getRevocations is GET /v1/<address>/revocations (PROTOCOL.md §6.3): the
+// record this server holds of the address, with a box here or none, or 404
+// not_revoked. A box learns the same of the boxes it writes to from their read
+// (getBox); this route is for its own, where this server holds no box for it.
+// It takes no pass, as the PUT beside it takes none.
 func (s *Server) getRevocations(w http.ResponseWriter, r *http.Request) error {
 	h, err := pathAddr(r)
 	if err != nil {

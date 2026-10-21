@@ -348,12 +348,12 @@ func TestARevokedBoxIsReadAsItsRecord(t *testing.T) {
 	}
 }
 
-// Every mailbox server is a revocation server (PROTOCOL.md §6.3): it answers
-// GET …/revocations with no pass, with the record it holds of the address, in
+// The server keeps and serves a revocation of any address (PROTOCOL.md §6.3):
+// it answers GET …/revocations with no pass, with the record it holds of the address, in
 // the same bytes the read of the box carries, and 404 not_revoked when it
 // holds none, for an address with no box as for one with a box and nothing
 // revoked.
-func TestEveryMailboxServerIsARevocationServer(t *testing.T) {
+func TestTheRevocationsOfAnyAddressAreServed(t *testing.T) {
 	e := newEnv(t, relaxed())
 	none, certsOnly, ended := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
 	e.want(e.do("GET", revocationPath(protocol.Address{7}), nil, ""), 404, protocol.CodeNotRevoked)
@@ -392,7 +392,7 @@ func TestEveryMailboxServerIsARevocationServer(t *testing.T) {
 			t.Errorf("%s: the record has %d members, want its type first and %d more: %s", name, len(members), c.members-1, got.body)
 		}
 		if shown := held(t, e.do("GET", c.box.path(""), nil, "")); !bytes.Equal(shown.RevokedCertificates, rec.RevokedCertificates) || !bytes.Equal(shown.Revocation, rec.Revocation) {
-			t.Errorf("%s: the read of the box shows another record than the revocation server's read", name)
+			t.Errorf("%s: the read of the box shows another record than the read of its revocations", name)
 		}
 	}
 }
