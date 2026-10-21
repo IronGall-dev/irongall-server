@@ -71,13 +71,13 @@ func TestASendersCallsBoundTheDedupeRead(t *testing.T) {
 	for range 3 {
 		e2.want(e2.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, pass), http.StatusOK, "")
 	}
-	before := cs.reads.Load()
+	before := cs.calls.Load()
 	r := e2.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, pass)
 	e2.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
 	if r.header.Get("Retry-After") == "" {
 		t.Error("no Retry-After")
 	}
-	if n := cs.reads.Load(); n != before {
+	if n := cs.calls.Load(); n != before {
 		t.Fatalf("%d storage calls for a replay past the sender's calls", n-before)
 	}
 }
@@ -98,7 +98,7 @@ func TestTheReceiveBudget(t *testing.T) {
 	send(t, s2, b, "two")
 	_, err := s3.Send(ctx, b.Address(), "three")
 	var ae *client.APIError
-	if client.Code(err) != protocol.CodeMailboxBusy || !errorsAs(err, &ae) || ae.RetryAfter <= 0 || ae.Status != http.StatusTooManyRequests {
+	if codeOf(err) != protocol.CodeMailboxBusy || !errorsAs(err, &ae) || ae.RetryAfter <= 0 || ae.Status != http.StatusTooManyRequests {
 		t.Fatalf("a third new message in the burst: %v", err)
 	}
 	e.want(e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(s1)), http.StatusOK, "") // a retry: nothing new
@@ -167,14 +167,14 @@ func TestLookupsArePaidByTheirCaller(t *testing.T) {
 		e2, cs := counted(t, e, l)
 		read := "/v1/" + b.Address().String()
 		e2.want(e2.do(http.MethodGet, read, nil, ""), http.StatusOK, "")
-		before := cs.reads.Load()
+		before := cs.calls.Load()
 		for range 50 {
 			e2.want(e2.do(http.MethodGet, read, nil, ""), http.StatusOK, "")
 			if r := e2.do(http.MethodGet, protocol.LinkPath+b.Address().String(), nil, ""); r.status != http.StatusOK {
 				t.Fatalf("the link page: %d", r.status)
 			}
 		}
-		if got := cs.reads.Load(); got != before {
+		if got := cs.calls.Load(); got != before {
 			t.Errorf("50 more lookups of a box held in memory made %d storage calls, want none", got-before)
 		}
 	})

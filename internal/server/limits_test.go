@@ -70,7 +70,7 @@ func TestContinuationAllowance(t *testing.T) {
 // state, whose storage calls are counted.
 func counted(t *testing.T, e *env, l Limits) (*env, *countingStore) {
 	t.Helper()
-	cs := &countingStore{Store: e.store}
+	cs := &countingStore{s: e.store}
 	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: cs, Limits: l, Now: e.clock.Now}).Handler()))
 	t.Cleanup(srv.Close)
 	return &env{t: t, clock: e.clock, srv: srv}, cs
@@ -109,7 +109,7 @@ func TestCursorIsNoWayAroundThePollRate(t *testing.T) {
 		}
 	}
 	e2.want(list(start), http.StatusTooManyRequests, protocol.CodeRateLimited)
-	if n := cs.reads.Load(); n != 0 {
+	if n := cs.calls.Load(); n != 0 {
 		t.Fatalf("%d storage calls for lists of an empty box", n)
 	}
 
@@ -133,13 +133,13 @@ func TestCursorIsNoWayAroundThePollRate(t *testing.T) {
 
 	// Nothing after the cursor: a poll too, read from memory.
 	e.clock.Add(l.PollRefill)
-	before := cs.reads.Load()
+	before := cs.calls.Load()
 	r = list(end)
 	if got := listOf(t, r); r.status != http.StatusOK || got.Count != 3 || len(got.Messages) != 0 || got.NextCursor != nil {
 		t.Fatalf("a cursor past the last message: %d %s", r.status, r.body)
 	}
 	e2.want(list(end), http.StatusTooManyRequests, protocol.CodeRateLimited)
-	if n := cs.reads.Load(); n != before {
+	if n := cs.calls.Load(); n != before {
 		t.Fatalf("%d storage calls: a list with nothing to return read storage", n-before)
 	}
 }
@@ -192,18 +192,18 @@ func TestUnknownIDsStayInMemory(t *testing.T) {
 	unknown := strings.Repeat("ab", 32)
 	e2.want(msg(http.MethodGet, unknown), http.StatusNotFound, protocol.CodeNoSuchMessage)
 	e2.want(msg(http.MethodDelete, unknown), http.StatusNotFound, protocol.CodeNoSuchMessage)
-	if n := cs.reads.Load(); n != 0 {
+	if n := cs.calls.Load(); n != 0 {
 		t.Fatalf("%d storage calls for an id the box does not hold", n)
 	}
 	id := send(t, a, b, "x").ID
 	e2.want(msg(http.MethodGet, id), http.StatusOK, "")
 	e2.want(msg(http.MethodDelete, id), http.StatusNoContent, "")
-	if n := cs.reads.Load(); n != 2 {
+	if n := cs.calls.Load(); n != 2 {
 		t.Fatalf("%d storage calls for a fetch and an ack", n)
 	}
 	e2.want(msg(http.MethodGet, id), http.StatusNotFound, protocol.CodeNoSuchMessage)
 	e2.want(msg(http.MethodDelete, id), http.StatusNotFound, protocol.CodeNoSuchMessage)
-	if n := cs.reads.Load(); n != 2 {
+	if n := cs.calls.Load(); n != 2 {
 		t.Fatalf("%d storage calls: an acked id reached storage again", n)
 	}
 }
@@ -234,13 +234,13 @@ func TestMissesPerIP(t *testing.T) {
 	}
 	e2.want(read(nobody(1)), http.StatusNotFound, protocol.CodeNoSuchMailbox)
 	e2.want(e2.do(http.MethodGet, "/v1/"+nobody(2).String()+"/messages", nil, e2.pass(b)), http.StatusNotFound, protocol.CodeNoSuchMailbox) // a call with a pass, naming no box
-	before := cs.reads.Load()
+	before := cs.calls.Load()
 	r := read(nobody(3))
 	e2.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
 	if !strings.Contains(string(r.body), "named no box") || r.header.Get("Retry-After") != "30" {
 		t.Fatalf("a third miss in a minute: Retry-After %q, %s", r.header.Get("Retry-After"), r.body)
 	}
-	if n := cs.reads.Load(); n != before {
+	if n := cs.calls.Load(); n != before {
 		t.Fatalf("%d storage calls from an address past its misses", n-before)
 	}
 	for range 3 {
@@ -302,11 +302,11 @@ func TestARememberedMissIsFree(t *testing.T) {
 		return e2.do(http.MethodGet, "/v1/"+a.String(), nil, "")
 	}
 	e2.want(read(nobody), http.StatusNotFound, protocol.CodeNoSuchMailbox) // the read, and the address's one miss
-	before := cs.reads.Load()
+	before := cs.calls.Load()
 	for range 5 {
 		e2.want(read(nobody), http.StatusNotFound, protocol.CodeNoSuchMailbox)
 	}
-	if n := cs.reads.Load(); n != before {
+	if n := cs.calls.Load(); n != before {
 		t.Fatalf("%d storage calls for a box remembered as missing", n-before)
 	}
 	e2.want(read(e.raw().id.Address()), http.StatusTooManyRequests, protocol.CodeRateLimited) // another address needs a read
@@ -330,14 +330,14 @@ func TestAFetchedMessageIsFetchedAgainFromAnAllowance(t *testing.T) {
 	e2.want(msg(http.MethodGet, id2), http.StatusOK, "")
 	e2.want(msg(http.MethodGet, id1), http.StatusOK, "") // again: one of the two at once
 	e2.want(msg(http.MethodGet, id1), http.StatusOK, "") // the other
-	before := cs.reads.Load()
+	before := cs.calls.Load()
 	r := msg(http.MethodGet, id1)
 	e2.want(r, http.StatusTooManyRequests, protocol.CodeRefetchSpent)
 	if !strings.Contains(string(r.body), "fetched before") || r.header.Get("Retry-After") != "60" {
 		t.Fatalf("a fetch past the allowance: Retry-After %q, %s", r.header.Get("Retry-After"), r.body)
 	}
 	e2.want(msg(http.MethodGet, id2), http.StatusTooManyRequests, protocol.CodeRefetchSpent) // the allowance is the box's
-	if n := cs.reads.Load(); n != before {
+	if n := cs.calls.Load(); n != before {
 		t.Fatalf("%d storage calls for fetches past the allowance", n-before)
 	}
 	for range 2 { // the polls are another allowance, untouched

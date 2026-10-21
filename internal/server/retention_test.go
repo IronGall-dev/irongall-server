@@ -31,7 +31,7 @@ func TestMailIsTakenWhileTheServerServesIt(t *testing.T) {
 		landAll(t, r)
 		held := 0
 		for i := 0; i <= DefaultLimits().PairCap; i++ {
-			if _, err := s.Send(ctx, r.Address(), "a message"); client.Code(err) == protocol.CodePairFull {
+			if _, err := s.Send(ctx, r.Address(), "a message"); codeOf(err) == protocol.CodePairFull {
 				held++
 			}
 		}

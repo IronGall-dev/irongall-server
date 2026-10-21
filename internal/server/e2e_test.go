@@ -480,7 +480,7 @@ func TestLimits(t *testing.T) {
 			}
 		}
 		e.clock.Add(30 * time.Second)
-		if _, err := b.Receive(ctx); client.Code(err) != protocol.CodeRateLimited {
+		if _, err := b.Receive(ctx); codeOf(err) != protocol.CodeRateLimited {
 			t.Fatalf("polls every 30 s outlasted the burst: %v", err)
 		}
 	})
@@ -502,7 +502,7 @@ func TestTheGoClientsACL(t *testing.T) {
 		t.Fatalf("the box still holds %d messages, %v", n, err)
 	}
 	_, err := a.Send(ctx, b.Address(), "refused")
-	if client.Code(err) != protocol.CodeSenderNotAllowed || !strings.Contains(err.Error(), "moved to outbox/failed/") {
+	if codeOf(err) != protocol.CodeSenderNotAllowed || !strings.Contains(err.Error(), "moved to outbox/failed/") {
 		t.Fatalf("a send from a blocked sender: %v", err)
 	}
 	if err := b.SetPolicy(client.Policy{Unknown: client.LandHeld, Server: client.AdmitAllowed}); err != nil {
@@ -510,7 +510,7 @@ func TestTheGoClientsACL(t *testing.T) {
 	}
 	send(t, b, c, "hello")
 	send(t, c, b, "the reply")
-	if _, err := stranger.Send(ctx, b.Address(), "refused"); client.Code(err) != protocol.CodeSenderNotAllowed {
+	if _, err := stranger.Send(ctx, b.Address(), "refused"); codeOf(err) != protocol.CodeSenderNotAllowed {
 		t.Fatalf("a stranger's send: %v", err)
 	}
 	if res := receive(t, b); len(res.Delivered) != 1 || len(res.Held) != 0 {

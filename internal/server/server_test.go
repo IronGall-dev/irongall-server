@@ -37,6 +37,14 @@ type reply struct {
 	body   []byte
 }
 
+// codeOf is the code of the API error a client's one call met.
+func codeOf(err error) protocol.Code {
+	if e, ok := errors.AsType[*client.APIError](err); ok {
+		return e.Problem.Code
+	}
+	return ""
+}
+
 func (r reply) code() protocol.Code {
 	return r.problem().Code
 }
@@ -543,7 +551,7 @@ func TestOwnerCalls(t *testing.T) {
 	e.want(e.do("GET", r.path(""), nil, ""), 404, protocol.CodeNoSuchMailbox)
 	e.want(e.do("GET", r.path("/revocations"), nil, ""), 404, protocol.CodeNotRevoked)
 	e.want(e.do("DELETE", r.path(""), nil, pass), 404, protocol.CodeNoSuchMailbox)
-	if _, err := a.Send(context.Background(), r.id.Address(), "to a deleted box"); client.Code(err) != protocol.CodeNoSuchMailbox {
+	if _, err := a.Send(context.Background(), r.id.Address(), "to a deleted box"); codeOf(err) != protocol.CodeNoSuchMailbox {
 		t.Fatalf("send to a deleted box: %v", err)
 	}
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(1), pass), 404, protocol.CodeNoSuchMailbox)
@@ -920,7 +928,7 @@ func TestSendPipeline(t *testing.T) {
 	big.MaxSize = 100
 	small := newEnv(t, big)
 	sa, sb := small.box(protocol.Classic), small.box(protocol.Classic)
-	if _, err := sa.Send(ctx, sb.Address(), strings.Repeat("x", 200)); client.Code(err) != protocol.CodeTooLarge {
+	if _, err := sa.Send(ctx, sb.Address(), strings.Repeat("x", 200)); codeOf(err) != protocol.CodeTooLarge {
 		t.Fatalf("send over the cap: %v", err)
 	}
 	// The body is read to the sender's cap, the ciphertext's bytes, and no

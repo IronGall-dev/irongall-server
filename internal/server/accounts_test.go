@@ -169,12 +169,12 @@ func TestAccounts(t *testing.T) {
 			send(t, a, b, strings.Repeat("x", 100*i))
 		}
 		send(t, a, b, strings.Repeat("x", 5000)) // over 4096
-		if _, err := a.Send(ctx, b.Address(), strings.Repeat("x", 20000)); client.Code(err) != protocol.CodeTooLarge || !strings.Contains(err.Error(), "16384") {
+		if _, err := a.Send(ctx, b.Address(), strings.Repeat("x", 20000)); codeOf(err) != protocol.CodeTooLarge || !strings.Contains(err.Error(), "16384") {
 			t.Fatalf("over the largest cap: %v", err)
 		}
 		// A box in no account has the server's limits.
 		send(t, c, b, "1")
-		if _, err := c.Send(ctx, b.Address(), strings.Repeat("x", 5000)); client.Code(err) != protocol.CodeTooLarge || !strings.Contains(err.Error(), "4096") {
+		if _, err := c.Send(ctx, b.Address(), strings.Repeat("x", 5000)); codeOf(err) != protocol.CodeTooLarge || !strings.Contains(err.Error(), "4096") {
 			t.Fatalf("over the cap: %v", err)
 		}
 		send(t, c, b, "2")
@@ -182,7 +182,7 @@ func TestAccounts(t *testing.T) {
 			t.Fatalf("third send: %v", err)
 		}
 		// The key's one use is spent.
-		if _, err := c.Adopt(ctx, key); client.Code(err) != protocol.CodeAdoptKeyRefused {
+		if _, err := c.Adopt(ctx, key); codeOf(err) != protocol.CodeAdoptKeyRefused {
 			t.Fatalf("a spent key: %v", err)
 		}
 		// Leaving gives a back the server's limits; sends in the account
@@ -193,7 +193,7 @@ func TestAccounts(t *testing.T) {
 		if err := a.Leave(ctx); err != nil {
 			t.Fatalf("leave again: %v", err)
 		}
-		if _, err := a.Send(ctx, b.Address(), strings.Repeat("x", 5000)); client.Code(err) != protocol.CodeTooLarge || !strings.Contains(err.Error(), "4096") {
+		if _, err := a.Send(ctx, b.Address(), strings.Repeat("x", 5000)); codeOf(err) != protocol.CodeTooLarge || !strings.Contains(err.Error(), "4096") {
 			t.Fatalf("after leaving, over the cap: %v", err)
 		}
 		send(t, a, b, "4")
@@ -232,7 +232,7 @@ func TestAccounts(t *testing.T) {
 			"not a key":               "iga1_x",
 			"a key's hash, not a key": adoptPrefix + base64.RawURLEncoding.EncodeToString(append([]byte(acc.ID), func() []byte { h := sha256.Sum256([]byte(key)); return h[:] }()...)),
 		} {
-			if _, err := a.Adopt(ctx, k); client.Code(err) != protocol.CodeAdoptKeyRefused {
+			if _, err := a.Adopt(ctx, k); codeOf(err) != protocol.CodeAdoptKeyRefused {
 				t.Errorf("%s: %v", name, err)
 			}
 		}
@@ -243,11 +243,11 @@ func TestAccounts(t *testing.T) {
 		// and a key that was never stored is refused there too.
 		adopt(t, a, key)
 		adopt(t, a, key)
-		if _, err := a.Adopt(ctx, unstored); client.Code(err) != protocol.CodeAdoptKeyRefused {
+		if _, err := a.Adopt(ctx, unstored); codeOf(err) != protocol.CodeAdoptKeyRefused {
 			t.Fatalf("a key never stored, naming the box's own account: %v", err)
 		}
 		adopt(t, b, key)
-		if _, err := e.box(protocol.Classic).Adopt(ctx, key); client.Code(err) != protocol.CodeAdoptKeyRefused {
+		if _, err := e.box(protocol.Classic).Adopt(ctx, key); codeOf(err) != protocol.CodeAdoptKeyRefused {
 			t.Fatalf("a third box on a two-use key: %v", err)
 		}
 		// The key is spent, and a box already in its account is still
@@ -363,7 +363,7 @@ func TestARefusedKeyWritesNothing(t *testing.T) {
 	expiring := e.adoptKey(t, acc.ID, 1, time.Minute)
 	e.clock.Add(2 * time.Minute)
 	for name, k := range map[string]string{"spent": key, "never stored": unstored, "expired": expiring} {
-		if _, err := b.Adopt(ctx, k); client.Code(err) != protocol.CodeAdoptKeyRefused {
+		if _, err := b.Adopt(ctx, k); codeOf(err) != protocol.CodeAdoptKeyRefused {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -381,10 +381,10 @@ func TestAdoptRaceIsAConflict(t *testing.T) {
 	stale := New(Config{Store: staleStore{e.store}, Limits: l, Now: e.clock.Now}).Handler()
 	e.setMiddle(func(w http.ResponseWriter, r *http.Request, _ http.Handler) { stale.ServeHTTP(w, r) })
 	b := e.box(protocol.Classic)
-	if _, err := b.Adopt(context.Background(), key); client.Code(err) != protocol.CodeBoxChanged {
+	if _, err := b.Adopt(context.Background(), key); codeOf(err) != protocol.CodeBoxChanged {
 		t.Fatalf("adopt: %v", err)
 	}
-	if err := a.Leave(context.Background()); client.Code(err) != protocol.CodeBoxChanged {
+	if err := a.Leave(context.Background()); codeOf(err) != protocol.CodeBoxChanged {
 		t.Fatalf("leave: %v", err)
 	}
 }
@@ -482,7 +482,7 @@ func TestAnAdoptThatMeetsAnotherIsSentAgain(t *testing.T) {
 	srv := New(Config{Store: dynamoAdopt{e.store, (&cannedDynamo{answers: []string{conflict}}).store(&logged)}, Limits: relaxed(), Now: e.clock.Now, Log: log.New(&logged, "", 0)}).Handler()
 	e.setMiddle(func(w http.ResponseWriter, r *http.Request, _ http.Handler) { srv.ServeHTTP(w, r) })
 	defer e.setMiddle(nil)
-	if _, err := e.box(protocol.Classic).Adopt(ctx, key); client.Code(err) != protocol.CodeBoxChanged {
+	if _, err := e.box(protocol.Classic).Adopt(ctx, key); codeOf(err) != protocol.CodeBoxChanged {
 		t.Errorf("an adopt that met another every time: %v, want box_changed", err)
 	}
 	if strings.Contains(logged.String(), "internal error") {

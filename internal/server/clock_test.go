@@ -108,7 +108,7 @@ func TestABoxWhoseClockIsTooFarOffIsRefusedAndTold(t *testing.T) {
 		e := newEnv(t, relaxed())
 		off, dir := c.off, t.TempDir()
 		_, err := client.Init(ctx, dir, e.skewed(&off), protocol.Classic)
-		if client.Code(err) != c.code {
+		if codeOf(err) != c.code {
 			t.Errorf("a clock %v off: init: %v, want the code %s", c.off, err, c.code)
 			continue
 		}
@@ -157,7 +157,7 @@ func TestABoxWhoseClockGoesBackFetchesNothing(t *testing.T) {
 
 	off = -12 * time.Minute
 	res, err := b.Receive(ctx)
-	if client.Code(err) != protocol.CodePassExpired || !strings.Contains(err.Error(), "12m0s behind that") || (res != nil && len(res.Delivered)+len(res.Refused) != 0) {
+	if codeOf(err) != protocol.CodePassExpired || !strings.Contains(err.Error(), "12m0s behind that") || (res != nil && len(res.Delivered)+len(res.Refused) != 0) {
 		t.Fatalf("its clock set back 12 minutes: %+v, %v", res, err)
 	}
 	// Control: at that clock the mail would be refused, so the stop above is

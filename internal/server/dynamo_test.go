@@ -489,36 +489,130 @@ func TestNotReadyIs503(t *testing.T) {
 	}
 }
 
-// countingStore counts the calls that read storage, and the ack, which
-// writes it.
+// countingStore counts every call of a Store that reaches storage. It does
+// not embed the Store, so each method is written here, and a new one is
+// counted or not by a choice made where it is added: those a DynamoStore
+// answers from memory (the index and the record cache, after a box's one
+// load on its first use) are not counted.
 type countingStore struct {
-	Store
-	reads atomic.Int64
+	s     Store
+	calls atomic.Int64
+}
+
+func (c *countingStore) count() { c.calls.Add(1) }
+
+func (c *countingStore) Held(a protocol.Address) (Standing, bool) { return c.s.Held(a) }
+
+func (c *countingStore) Known(a protocol.Address) (*Box, bool) { return c.s.Known(a) }
+
+func (c *countingStore) Count(ctx context.Context, box protocol.Address) (int, error) {
+	return c.s.Count(ctx, box)
+}
+
+func (c *countingStore) PairCount(ctx context.Context, box, from protocol.Address) (int, time.Time, error) {
+	return c.s.PairCount(ctx, box, from)
+}
+
+func (c *countingStore) After(ctx context.Context, box protocol.Address, cur *Cursor) (int, error) {
+	return c.s.After(ctx, box, cur)
+}
+
+func (c *countingStore) Holds(ctx context.Context, box protocol.Address, id [32]byte) (bool, error) {
+	return c.s.Holds(ctx, box, id)
+}
+
+func (c *countingStore) Fetched(ctx context.Context, box protocol.Address, id [32]byte) (bool, bool, error) {
+	return c.s.Fetched(ctx, box, id)
 }
 
 func (c *countingStore) Box(ctx context.Context, a protocol.Address) (*Box, error) {
-	c.reads.Add(1)
-	return c.Store.Box(ctx, a)
+	c.count()
+	return c.s.Box(ctx, a)
 }
 
-func (c *countingStore) List(ctx context.Context, box protocol.Address, after *Cursor, limit int) ([]Header, error) {
-	c.reads.Add(1)
-	return c.Store.List(ctx, box, after, limit)
+func (c *countingStore) CreateBox(ctx context.Context, b *Box) error {
+	c.count()
+	return c.s.CreateBox(ctx, b)
+}
+
+func (c *countingStore) UpdateBox(ctx context.Context, b *Box) error {
+	c.count()
+	return c.s.UpdateBox(ctx, b)
+}
+
+func (c *countingStore) DeleteBox(ctx context.Context, a protocol.Address) error {
+	c.count()
+	return c.s.DeleteBox(ctx, a)
+}
+
+func (c *countingStore) Revoke(ctx context.Context, a protocol.Address, rv *Revocations) error {
+	c.count()
+	return c.s.Revoke(ctx, a, rv)
 }
 
 func (c *countingStore) Dedupe(ctx context.Context, box protocol.Address, id [32]byte) (*Header, error) {
-	c.reads.Add(1)
-	return c.Store.Dedupe(ctx, box, id)
+	c.count()
+	return c.s.Dedupe(ctx, box, id)
+}
+
+func (c *countingStore) PutMessage(ctx context.Context, box protocol.Address, h *Header, body []byte) (*Header, error) {
+	c.count()
+	return c.s.PutMessage(ctx, box, h, body)
+}
+
+func (c *countingStore) List(ctx context.Context, box protocol.Address, after *Cursor, limit int) ([]Header, error) {
+	c.count()
+	return c.s.List(ctx, box, after, limit)
 }
 
 func (c *countingStore) Message(ctx context.Context, box protocol.Address, id [32]byte) (*Header, []byte, error) {
-	c.reads.Add(1)
-	return c.Store.Message(ctx, box, id)
+	c.count()
+	return c.s.Message(ctx, box, id)
 }
 
 func (c *countingStore) DeleteMessage(ctx context.Context, box protocol.Address, id [32]byte) error {
-	c.reads.Add(1)
-	return c.Store.DeleteMessage(ctx, box, id)
+	c.count()
+	return c.s.DeleteMessage(ctx, box, id)
+}
+
+func (c *countingStore) DeleteMessages(ctx context.Context, box protocol.Address) error {
+	c.count()
+	return c.s.DeleteMessages(ctx, box)
+}
+
+func (c *countingStore) DeleteFrom(ctx context.Context, box protocol.Address, from func(protocol.Address) bool) error {
+	c.count()
+	return c.s.DeleteFrom(ctx, box, from)
+}
+
+func (c *countingStore) Account(ctx context.Context, id string) (*Account, error) {
+	c.count()
+	return c.s.Account(ctx, id)
+}
+
+func (c *countingStore) CreateAccount(ctx context.Context, a *Account) error {
+	c.count()
+	return c.s.CreateAccount(ctx, a)
+}
+
+func (c *countingStore) PutAdoptKey(ctx context.Context, k *AdoptKey) error {
+	c.count()
+	return c.s.PutAdoptKey(ctx, k)
+}
+
+func (c *countingStore) AdoptKey(ctx context.Context, account string, hash [32]byte) (*AdoptKey, error) {
+	c.count()
+	return c.s.AdoptKey(ctx, account, hash)
+}
+
+func (c *countingStore) Adopt(ctx context.Context, b *Box, account string, key [32]byte) error {
+	c.count()
+	return c.s.Adopt(ctx, b, account, key)
+}
+
+func (c *countingStore) Leave(ctx context.Context, b *Box) error {
+	c.count()
+	return c.s.Leave(ctx, b)
 }
 
 // An empty poll never leaves the process (ARCHITECTURE.md § Memory): a box
@@ -529,7 +623,7 @@ func TestPollStaysInMemory(t *testing.T) {
 	e := newEnv(t, relaxed())
 	ctx := context.Background()
 	b, c := e.box(protocol.Classic), e.box(protocol.Classic)
-	cs := &countingStore{Store: e.store}
+	cs := &countingStore{s: e.store}
 	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: cs, Limits: relaxed(), Now: e.clock.Now}).Handler()))
 	defer srv.Close()
 	e2 := &env{t: t, clock: e.clock, srv: srv}
@@ -569,19 +663,19 @@ func TestPollStaysInMemory(t *testing.T) {
 	if r := poll(c, e2.pass(c)); r.code() != protocol.CodeNoSuchMailbox {
 		t.Fatalf("deleted box: %d %s", r.status, r.body)
 	}
-	before := cs.reads.Load()
+	before := cs.calls.Load()
 	rv := record(t, b)
 	if err := e.store.Revoke(ctx, b.Address(), &Revocations{Identity: rv.Identity, Address: rv.Revocation}); err != nil {
 		t.Fatal(err)
 	}
-	if cs.reads.Load() != before {
-		t.Fatal("the test's own reads were counted")
+	if cs.calls.Load() != before {
+		t.Fatal("the test's own calls were counted")
 	}
 	if r := poll(b, e2.pass(b)); r.code() != protocol.CodeRevoked {
 		t.Fatalf("revoked box: %d %s", r.status, r.body)
 	}
-	if n := cs.reads.Load(); n != 0 {
-		t.Fatalf("%d storage reads for polls", n)
+	if n := cs.calls.Load(); n != 0 {
+		t.Fatalf("%d storage calls for polls", n)
 	}
 }
 

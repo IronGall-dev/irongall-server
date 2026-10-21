@@ -233,12 +233,12 @@ func TestAnIDThatSharesAPrefixIsNotHeld(t *testing.T) {
 	_, _ = rand.Read(tail)
 	forged = append(forged, tail...)
 	path := "/v1/" + b.Address().String() + "/messages/" + hex.EncodeToString(forged)
-	before := cs.reads.Load()
+	before := cs.calls.Load()
 	for range 5 {
 		e2.want(e2.do(http.MethodDelete, path, nil, pass), http.StatusNotFound, protocol.CodeNoSuchMessage)
 		e2.want(e2.do(http.MethodGet, path, nil, pass), http.StatusNotFound, protocol.CodeNoSuchMessage)
 	}
-	if n := cs.reads.Load(); n != before {
+	if n := cs.calls.Load(); n != before {
 		t.Fatalf("%d storage calls for an id that only shares a held message's prefix", n-before)
 	}
 	if res := receive(t, b); len(res.Delivered) != 1 {
