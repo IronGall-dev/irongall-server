@@ -15,14 +15,12 @@
 #      holds an address revoked answers 410, which it takes once what it serves verifies;
 #   9. the sender ACL: a Go box's block reaches this server, which refuses the recipe box's send.
 # The recipe runs a box of its own: the two clients meet over the wire, never in one box directory.
-# Every script step runs in a FRESH shell (agents run each command in a new one). --no-pq boxes only when the local
-# age is older than 1.3 (it cannot make or send to a post-quantum box); the Go client handles both either way.
-# Needs: go, bash ≥ 4, age, age-keygen, ssh-keygen, curl, jq, sha256sum, base64, od. Run from anywhere:
+# Every script step runs in a FRESH shell (agents run each command in a new one). Every box is post-quantum: where the
+# local age is older than 1.3, the client module's own (its go.mod's tool, built by go tool) goes first in PATH.
+# Needs: go, bash ≥ 4, ssh-keygen, curl, jq, sha256sum, base64, od, and the client checkout beside this repo. Run from anywhere:
 #   test/interop.sh            SCRIPT=<path> overrides the irongall.sh it sources.
 # With IRONGALL_TEST_BOXES_TABLE, IRONGALL_TEST_MSGS_TABLE, IRONGALL_TEST_ACCOUNTS_TABLE and IRONGALL_TEST_BUCKET set, the server runs on those tables and
 # that bucket instead of --dev: tables and a bucket kept for tests, never the ones a running server uses.
-# For post-quantum script boxes where the packaged age is older than 1.3, put age ≥ 1.3 first in PATH:
-#   GOBIN=<dir> go install filippo.io/age/cmd/...@v1.3.2   (never under ulimit -v)
 # The work dir is a LITERAL path, so no rm -rf ever runs on a variable. A run that passes deletes it, since /tmp may
 # be tmpfs (memory) and it holds two builds; one that fails leaves it to look at.
 set -uo pipefail
@@ -40,8 +38,9 @@ export PATH=$PATH:/usr/local/go/bin
 [ -r "$SCRIPT" ] || { echo "no $SCRIPT"; exit 1; }
 echo "stock client: $SCRIPT ($(grep -c '^ig_[a-z_]*()' "$SCRIPT") functions)"
 
-if age-keygen -pq > /dev/null 2>&1; then kt=pq; else kt=no-pq; fi
-echo "local age: $(age --version) → recipe boxes are $kt"
+age-keygen -pq > /dev/null 2>&1 || PATH=$(cd "$(dirname "$repo")/irongall-client" && dirname "$(go tool -n age)"):$(cd "$(dirname "$repo")/irongall-client" && dirname "$(go tool -n age-keygen)"):$PATH
+age-keygen -pq > /dev/null 2>&1 || { echo "no age that makes post-quantum keys"; exit 1; }
+echo "age: $(age --version)"
 port=$((20000 + RANDOM % 20000))
 if [ -n "${IRONGALL_TEST_MSGS_TABLE:-}" ]; then
   store=(-boxes-table "$IRONGALL_TEST_BOXES_TABLE" -msgs-table "$IRONGALL_TEST_MSGS_TABLE" -accounts-table "$IRONGALL_TEST_ACCOUNTS_TABLE" -bucket "$IRONGALL_TEST_BUCKET" -names "127.0.0.1:$port")
@@ -64,13 +63,12 @@ linkof(){ jq -er 'select(.type == "box") | .link'; }      # a box line, as init 
 revoked_line(){ printf '{"type":"revoked","address":"%s","message":"published to the server and to each revocation server"}' "$1"; }      # <address> → the line revocation publish prints
 record_of(){ local a; a=$(cat "$1/address") && printf 'irongall-revoke-v1\n%s\n' "$a" | ssh-keygen -q -Y sign -n "irongall-revoke-v1:$a" -f "$1/identity" > "$work/rev.sig" &&
   jq -cn --arg i "$(base64 < "$1/identity.doc" | tr -d '\n')" --arg s "$(base64 < "$work/rev.sig" | tr -d '\n')" '{type:"revocation_record", identity:$i, revocation_signature:$s}'; }      # <box dir> → its revocation record, made with ssh-keygen as PROTOCOL.md §6.3 shows: the recipe makes none
-nopq_arg(){ [ "$kt" = no-pq ] && echo --no-pq; }
 look(){ curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/v1/$1"; }   # <address> → the status of a read of the box at this server: 410 once it is revoked
 
 # --- 1. both ways, across renewals ---
 ig_hex(){ [[ $1 =~ ^[0-9a-f]{64}$ ]]; }
-RL=$(recipe "$R" "ig_init $(nopq_arg)" | linkof) && RA=${RL##*/} && ig_hex "$RA" && [ "$RL" = "$IG_BASE/to/$RA" ] && ok "recipe init prints its link: $RL" || bad "recipe init: $RL"
-GL=$(gocli "$G" init $(nopq_arg) | linkof) && GA=${GL##*/} && ig_hex "$GA" && [ "$GL" = "$IG_BASE/to/$GA" ] && ok "Go init prints its link: $GL" || bad "Go init: $GL"
+RL=$(recipe "$R" "ig_init" | linkof) && RA=${RL##*/} && ig_hex "$RA" && [ "$RL" = "$IG_BASE/to/$RA" ] && ok "recipe init prints its link: $RL" || bad "recipe init: $RL"
+GL=$(gocli "$G" init | linkof) && GA=${GL##*/} && ig_hex "$GA" && [ "$GL" = "$IG_BASE/to/$GA" ] && ok "Go init prints its link: $GL" || bad "Go init: $GL"
 for L in "$RL" "$GL"; do
   curl -sf "$L" | grep -qF "<code>${L##*/}</code>" && ok "the link opens its page: $L" || bad "no page at $L"
 done
@@ -85,7 +83,7 @@ recipe "$R" "ig_send $GL '$work/body'" && ok "recipe → Go: sent, to the Go box
 out=$(gocli "$G" recv 2> "$work/err") && jq -e --arg f "$RA" '.body == "from the recipe\n" and .from == $f' <<< "$out" > /dev/null \
   && ok "recipe → Go: delivered by irongall recv, verified" || bad "recipe → Go: recv: $out $(cat "$work/err")"
 
-recipe "$R" "ig_rekey $(nopq_arg)" && ok "recipe: ig_rekey" || bad "recipe: ig_rekey"
+recipe "$R" "ig_rekey" && ok "recipe: ig_rekey" || bad "recipe: ig_rekey"
 gocli "$G" prekey renew > /dev/null && ok "Go: prekey renew" || bad "Go: prekey renew"
 printf 'after both renewals\n' | gocli "$G" send "$RA" > /dev/null && recipe "$R" "ig_send $GA '$work/body'" && ok "both ways after renewals: sent" || bad "send after renewals"
 out=$(recipe "$R" ig_recv 2>&1) && grep -q 'after both renewals' <<< "$out" && ok "recipe receives after renewals" || bad "recipe after renewals: $out"
@@ -117,9 +115,9 @@ jq -e --argjson d "$out" '(.receipt | keys == ["expires_at", "id", "received_at"
 # then exchanges mail with the other client's Ed25519 box of step 1, which declared that it verifies the type.
 RP="$work/rp"; GP="$work/gp"; mkdir -p "$RP"
 ssh-keygen -q -t ecdsa -b 256 -N '' -C '' -f "$RP/identity" < /dev/null
-RPL=$(recipe "$RP" "ig_init $(nopq_arg)" | linkof) && RPA=${RPL##*/} && ig_hex "$RPA" && [ "$(sed -n 2p "$RP/identity.doc" | cut -d' ' -f1)" = ecdsa-sha2-nistp256 ] \
+RPL=$(recipe "$RP" "ig_init" | linkof) && RPA=${RPL##*/} && ig_hex "$RPA" && [ "$(sed -n 2p "$RP/identity.doc" | cut -d' ' -f1)" = ecdsa-sha2-nistp256 ] \
   && ok "recipe init on a P-256 identity made by ssh-keygen" || bad "recipe init on P-256: $RPL"
-GPO=$(gocli "$GP" init --identity-type ecdsa-sha2-nistp256 $(nopq_arg) 2> "$work/err") && GPL=$(linkof <<< "$GPO") && GPA=${GPL##*/} && ig_hex "$GPA" && jq -e '.message | startswith("WARNING: ")' <<< "$GPO" > /dev/null \
+GPO=$(gocli "$GP" init --identity-type ecdsa-sha2-nistp256 2> "$work/err") && GPL=$(linkof <<< "$GPO") && GPA=${GPL##*/} && ig_hex "$GPA" && jq -e '.message | startswith("WARNING: ")' <<< "$GPO" > /dev/null \
   && ok "Go init --identity-type ecdsa-sha2-nistp256, with its warning" || bad "Go init on P-256: $GPL $(cat "$work/err")"
 [ "$(curl -s "$IG_BASE/v1/$GA" | jq -c .sender_key_types)" = '["ssh-ed25519","ecdsa-sha2-nistp256"]' ] && [ "$(curl -s "$IG_BASE/v1/$RA" | jq -c .sender_key_types)" = '["ssh-ed25519","ecdsa-sha2-nistp256"]' ] \
   && ok "each client's box is served with the sender key types it declared" || bad "sender_key_types: $(curl -s "$IG_BASE/v1/$GA" | jq -c .sender_key_types) $(curl -s "$IG_BASE/v1/$RA" | jq -c .sender_key_types)"
@@ -135,7 +133,7 @@ recipe "$R" "ig_send $GPL '$work/body5'" && out=$(gocli "$GP" recv 2> "$work/err
   && ok "recipe → Go on P-256: delivered" || bad "recipe → Go on P-256: $out $(cat "$work/err")"
 # A box that declares Ed25519 only: the server refuses it a P-256 sender's mail, and the Go client does not even post it.
 GE="$work/ge"
-GEL=$(IRONGALL_SENDER_KEY_TYPES=ssh-ed25519 gocli "$GE" init $(nopq_arg) | linkof) && GEA=${GEL##*/} && [ "$(curl -s "$IG_BASE/v1/$GEA" | jq -c .sender_key_types)" = '["ssh-ed25519"]' ] \
+GEL=$(IRONGALL_SENDER_KEY_TYPES=ssh-ed25519 gocli "$GE" init | linkof) && GEA=${GEL##*/} && [ "$(curl -s "$IG_BASE/v1/$GEA" | jq -c .sender_key_types)" = '["ssh-ed25519"]' ] \
   && ok "a box told to declare Ed25519 only is served so" || bad "IRONGALL_SENDER_KEY_TYPES: $(curl -s "$IG_BASE/v1/$GEA")"
 out=$(printf 'x\n' | gocli "$GP" send "$GEL" 2>&1); [ $? -ne 0 ] && grep -q "does not verify identities of this box's key type" <<< "$out" \
   && ok "Go on P-256 does not send to a box that does not verify its key type" || bad "Go on P-256 → Ed25519-only box: $out"
@@ -148,24 +146,24 @@ out=$(recipe "$RP" "ig_send $GEL '$work/body5'" 2>&1); [ $? -ne 0 ] && grep -q "
 clock(){ echo "ig_now(){ echo \$((\$(date -u +%s) + ($1))); }"; }   # <seconds> → the recipe's clock, that far from the real one
 for c in "-540 9 minutes slow" "2940 49 minutes fast"; do
   off=${c%% *}; name=${c#* }; d="$work/clock$off"; gf="$work/gf$off"
-  L=$(recipe "$d" "$(clock "$off"); ig_init $(nopq_arg)" 2> "$work/err" | linkof) && A=${L##*/} && ig_hex "$A" && GFL=$(gocli "$gf" init $(nopq_arg) | linkof) && GFA=${GFL##*/} \
+  L=$(recipe "$d" "$(clock "$off"); ig_init" 2> "$work/err" | linkof) && A=${L##*/} && ig_hex "$A" && GFL=$(gocli "$gf" init | linkof) && GFA=${GFL##*/} \
     && printf 'to the box whose clock is off\n' | gocli "$gf" send "$L" > /dev/null \
     && out=$(recipe "$d" "$(clock "$off"); ig_recv" 2>> "$work/err") && jq -e --arg f "$GFA" '.body == "to the box whose clock is off\n" and .from == $f' <<< "$out" > /dev/null \
     && printf 'from the box whose clock is off\n' > "$work/body6" && recipe "$d" "$(clock "$off"); ig_send $GFL '$work/body6'" 2>> "$work/err" \
     && out=$(gocli "$gf" recv 2>> "$work/err") && jq -e --arg f "$A" '.body == "from the box whose clock is off\n" and .from == $f' <<< "$out" > /dev/null \
-    && recipe "$d" "$(clock "$off"); ig_rekey $(nopq_arg)" 2>> "$work/err" \
+    && recipe "$d" "$(clock "$off"); ig_rekey" 2>> "$work/err" \
     && ok "a recipe box whose clock is $name registers, renews, and exchanges mail with a Go box made that moment" || bad "clock $name: $out $(cat "$work/err")"
 done
-out=$(recipe "$work/clock-late" "$(clock -660); ig_init $(nopq_arg)" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 401 pass_expired" <<< "$out" && grep -q "the server dates its answer 20" <<< "$out" && grep -q "this machine's clock reads" <<< "$out" \
+out=$(recipe "$work/clock-late" "$(clock -660); ig_init" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 401 pass_expired" <<< "$out" && grep -q "the server dates its answer 20" <<< "$out" && grep -q "this machine's clock reads" <<< "$out" \
   && ok "a recipe box 11 minutes slow is refused at its pass: the server's answer is dated by its clock, and the recipe says that beside what its own reads" || bad "clock 11 minutes slow: $out"
-out=$(recipe "$work/clock-early" "$(clock 3660); ig_init $(nopq_arg)" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 400 prekey_time" <<< "$out" && grep -q "the server dates its answer 20" <<< "$out" \
-  && L=$(recipe "$work/clock-early" "ig_init $(nopq_arg)" 2> "$work/err" | linkof) && ig_hex "${L##*/}" \
+out=$(recipe "$work/clock-early" "$(clock 3660); ig_init" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 400 prekey_time" <<< "$out" && grep -q "the server dates its answer 20" <<< "$out" \
+  && L=$(recipe "$work/clock-early" "ig_init" 2> "$work/err" | linkof) && ig_hex "${L##*/}" \
   && ok "a recipe box first made 61 minutes fast is refused, the answer dated by the server's clock; with the clock right, the same box registers" || bad "clock 61 minutes fast: $out $(cat "$work/err")"
 
 # --- 6. revocation (PROTOCOL.md §6.3): the server keeps the identity's own signature and shows it in the read of the box, and each client checks it ---
 V1="$work/v1"; V2="$work/v2"; V3="$work/v3"; V4="$work/v4"; V5="$work/v5"
-V1L=$(recipe "$V1" "ig_init $(nopq_arg)" | linkof) && V1A=${V1L##*/} && V2L=$(gocli "$V2" init $(nopq_arg) | linkof) && V2A=${V2L##*/} && V3L=$(gocli "$V3" init $(nopq_arg) | linkof) && V3A=${V3L##*/} \
-  && V4L=$(recipe "$V4" "ig_init $(nopq_arg)" | linkof) && V4A=${V4L##*/} && V5L=$(gocli "$V5" init $(nopq_arg) | linkof) && V5A=${V5L##*/} || bad "revocation: the boxes"
+V1L=$(recipe "$V1" "ig_init" | linkof) && V1A=${V1L##*/} && V2L=$(gocli "$V2" init | linkof) && V2A=${V2L##*/} && V3L=$(gocli "$V3" init | linkof) && V3A=${V3L##*/} \
+  && V4L=$(recipe "$V4" "ig_init" | linkof) && V4A=${V4L##*/} && V5L=$(gocli "$V5" init | linkof) && V5A=${V5L##*/} || bad "revocation: the boxes"
 [ "$(curl -s -D "$work/head" -o "$work/box.json" -w '%{http_code}' "$IG_BASE/v1/$V1A")" = 200 ] && jq -e '(has("revoked_certificates") or has("revoked_certificates_signature")) | not' "$work/box.json" > /dev/null \
   && [ "$(tr -d '\r' < "$work/head" | grep -i '^cache-control:' | cut -d' ' -f2)" = no-store ] \
   && ok "a box nobody revoked: read 200 with no revocation in it, and the API's answers say no-store" || bad "not revoked: $(curl -s -D - "$IG_BASE/v1/$V1A")"
@@ -204,7 +202,7 @@ out=$(IRONGALL_HOME="$work/nobox" "$work/irongall" revocation publish --record "
 
 # --- 7. certificates revoked (PROTOCOL.md §6.3a): the identity's revocation ends what a certificate signed, and the address goes on ---
 W1="$work/w1"; W2="$work/w2"; W3="$work/w3"
-W1L=$(gocli "$W1" init $(nopq_arg) | linkof) && W1A=${W1L##*/} && W2L=$(recipe "$W2" "ig_init $(nopq_arg)" | linkof) && W2A=${W2L##*/} && W3L=$(gocli "$W3" init $(nopq_arg) | linkof) && W3A=${W3L##*/} || bad "revoked certificates: the boxes"
+W1L=$(gocli "$W1" init | linkof) && W1A=${W1L##*/} && W2L=$(recipe "$W2" "ig_init" | linkof) && W2A=${W2L##*/} && W3L=$(gocli "$W3" init | linkof) && W3A=${W3L##*/} || bad "revoked certificates: the boxes"
 kept(){ jq -r .revoked_certificates "$1" | base64 -d; }   # <the record a box keeps a revocation of certificates as> → the statement in it
 put(){ curl -s -o "$work/put.json" -w '%{http_code}' -X PUT -H 'Content-Type: application/json' --data-binary "@$1" "$IG_BASE/v1/$2/revocations"; }   # <record> <address> → the status; the body is left in put.json
 printf 'under the first certificate\n' > "$work/body8"
@@ -228,7 +226,7 @@ recipe "$W2" "ig_send $W1L '$work/body8'" 2> "$work/err" && gocli "$W3" send "$W
 mkcerts(){ printf 'irongall-revoke-certs-v1\n%s\n%s\n' "$W2A" "$2" > "$work/$1.certs" && ssh-keygen -q -Y sign -n "irongall-revoke-certs-v1:$W2A" -f "$3" < "$work/$1.certs" > "$work/$1.sig" \
   && jq -cn --arg i "$(base64 < "$W2/identity.doc" | tr -d '\n')" --arg l "$(base64 < "$work/$1.certs" | tr -d '\n')" --arg g "$(base64 < "$work/$1.sig" | tr -d '\n')" '{identity:$i, revoked_certificates:$l, revoked_certificates_signature:$g}' > "$work/$1.json"; }   # <name> <serial> <key>
 w2a=$(cat "$W2/serial")   # a box takes each number from its clock: the recipe box's first, and after its renewal its second
-recipe "$W2" "ig_send $W3L '$work/body8'" 2> "$work/err" && recipe "$W2" "ig_rekey $(nopq_arg)" 2>> "$work/err" && recipe "$W2" "ig_send $W3L '$work/body8b'" 2>> "$work/err" || bad "revoked certificates: the recipe's renewal: $(cat "$work/err")"
+recipe "$W2" "ig_send $W3L '$work/body8'" 2> "$work/err" && recipe "$W2" "ig_rekey" 2>> "$work/err" && recipe "$W2" "ig_send $W3L '$work/body8b'" 2>> "$work/err" || bad "revoked certificates: the recipe's renewal: $(cat "$work/err")"
 w2b=$(cat "$W2/serial"); [ "$w2b" -gt "$w2a" ] || bad "revoked certificates: the recipe's renewal took no later number: $w2a, then $w2b"
 mkcerts bywork "$w2a" "$W2/work/$w2b-cert.pub" && mkcerts one "$w2a" "$W2/identity" && mkcerts lower $((w2a - 1)) "$W2/identity" && mkcerts two "$w2b" "$W2/identity" || bad "revoked certificates: ssh-keygen did not sign a revocation"
 [ "$(put "$work/bywork.json" "$W2A")" = 400 ] && [ "$(jq -r .code "$work/put.json")" = bad_revocation ] && [ "$(put "$work/one.json" "$W3A")" = 400 ] && [ "$(jq -r .code "$work/put.json")" = identity_mismatch ] \
@@ -247,7 +245,7 @@ out=$(recipe "$W2" "ig_recv" 2>&1); [ $? -ne 0 ] && grep -q "ERROR 401 certifica
 out=$(gocli "$W3" send "$W2L" < "$work/body8" 2>&1); [ $? -ne 0 ] && grep -q "under a certificate its identity has revoked" <<< "$out" && ! grep -q "prekey_expired" <<< "$out" && ls "$W3"/outbox/*.P > /dev/null 2>&1 \
   && kept "$W3/peers/$W2A/revoked-certs.json" | cmp -s - "$work/two.certs" && ! ls "$W3"/outbox/*.json > /dev/null 2>&1 \
   && ok "a sender asks before it posts: shown the revocation, it keeps it, seals nothing to a statement under a revoked certificate, and the message waits in the outbox" || bad "a send to a box whose certificate is revoked: $out"
-recipe "$W2" "ig_rekey $(nopq_arg)" 2> "$work/err" && gocli "$W3" outbox flush > /dev/null 2>> "$work/err" && out=$(recipe "$W2" "ig_recv" 2>&1) && grep -q 'under the first certificate' <<< "$out" \
+recipe "$W2" "ig_rekey" 2> "$work/err" && gocli "$W3" outbox flush > /dev/null 2>> "$work/err" && out=$(recipe "$W2" "ig_recv" 2>&1) && grep -q 'under the first certificate' <<< "$out" \
   && ok "one renewal, under a new certificate, cures both: the box polls again, and the waiting message is delivered" || bad "after the box renewed: $(cat "$work/err") $out"
 out=$(gocli "$W3" revocation ask "$W2L" 2> /dev/null) && [ "$out" = "{\"type\":\"certificates_revoked\",\"address\":\"$W2A\",\"through\":$w2b}" ] && out=$(gocli "$W1" revocation ask "$W3L" 2> "$work/err") && [ "$(jq -r '"\(.type) \(.address)"' <<< "$out")" = "not_revoked $W3A" ] && jq -e '.message | contains("the word of whoever was asked")' <<< "$out" > /dev/null \
   && ok "asked at any time, the server shows a box's revocation of its certificates, or that it holds nothing, which the client says as the word of whoever it asked" || bad "revoked --ask: $out $(cat "$work/err")"
@@ -260,8 +258,8 @@ up(){ for _ in $(seq 300); do code=$(curl -s -o /dev/null -w '%{http_code}' "$1/
 rport=$((port + 1)); REV="http://127.0.0.1:$rport"; second "$rport"; rev=$!; up "$REV" || bad "the second server did not come up"
 at(){ curl -s -o /dev/null -w '%{http_code}' "$1/v1/$2/revocations"; }   # <revocation server> <address> → the status of a lookup there
 X1="$work/x1"; X3="$work/x3"; X5="$work/x5"; X6="$work/x6"
-X1L=$(gocli "$X1" init $(nopq_arg) | linkof) && X1A=${X1L##*/} && X3L=$(gocli "$X3" init $(nopq_arg) | linkof) && X3A=${X3L##*/} \
-  && X5L=$(gocli "$X5" init $(nopq_arg) | linkof) && X5A=${X5L##*/} && X6L=$(gocli "$X6" init $(nopq_arg) | linkof) && X6A=${X6L##*/} || bad "the revocation server: the boxes"
+X1L=$(gocli "$X1" init | linkof) && X1A=${X1L##*/} && X3L=$(gocli "$X3" init | linkof) && X3A=${X3L##*/} \
+  && X5L=$(gocli "$X5" init | linkof) && X5A=${X5L##*/} && X6L=$(gocli "$X6" init | linkof) && X6A=${X6L##*/} || bad "the revocation server: the boxes"
 for b in "$X1" "$X3" "$X6"; do echo "$REV" > "$b/revocation-servers"; done      # the one setting, in the box: X5 lists none
 [ "$(at "$REV" "$X1A")" = 404 ] && [ "$(curl -s "$REV/v1/$X1A/revocations" | jq -r .code)" = not_revoked ] && [ "$(at "$REV" "$X5A")" = 404 ] && [ "$(gocli "$X1" status | jq -r '.revocation_servers[0]')" = "$REV" ] \
   && ok "a server answers 404 not_revoked for an address it holds no revocation of, with a box there or none, and a box's status names the servers it asks" || bad "the revocation server, before anything"
@@ -275,7 +273,7 @@ gocli "$X3" revocation make > "$work/x3.json" 2> /dev/null && [ "$(curl -s -o /d
   && [ "$(look "$X3A")" = 200 ] && curl -sf "$IG_BASE/v1/$X3A" | jq -e '(has("revoked_certificates") or has("revoked_certificates_signature")) | not' > /dev/null \
   && [ "$(curl -s -o /dev/null -w '%{http_code}' "$REV/v1/$X3A")" = 410 ] && cmp -s <(curl -s "$REV/v1/$X3A" | jq -S .record) <(jq -S . "$work/x3.json") \
   && ok "a server with no box at an address keeps a revocation of it, and its read of the address is 410 with the record" || bad "a revocation at the revocation server alone"
-d3="$X3.atrev"; mkdir -p -m 700 "$d3" && cp "$X3/identity" "$d3/identity" && out=$(IRONGALL_BASE=$REV gocli "$d3" init $(nopq_arg) 2>&1); [ $? -ne 0 ] && grep -qi 'revoked' <<< "$out" && [ "$(curl -s -o /dev/null -w '%{http_code}' "$REV/v1/$X3A")" = 410 ] \
+d3="$X3.atrev"; mkdir -p -m 700 "$d3" && cp "$X3/identity" "$d3/identity" && out=$(IRONGALL_BASE=$REV gocli "$d3" init 2>&1); [ $? -ne 0 ] && grep -qi 'revoked' <<< "$out" && [ "$(curl -s -o /dev/null -w '%{http_code}' "$REV/v1/$X3A")" = 410 ] \
   && ok "and refuses that address's registration: it is revoked there, box or none" || bad "a registration of an address revoked with no box: $out"
 printf 'to an address its owner ended\n' > "$work/body9"
 gocli "$X5" send "$X3L" < "$work/body9" > /dev/null 2> "$work/err" && ok "the control: a box that asks this server alone posts to the revoked address, and this server takes it" || bad "the control: $(cat "$work/err")"
@@ -301,7 +299,7 @@ out=$(gocli "$X6" revocation publish "$X6A" 2>&1) && [ "$out" = "$(revoked_line 
   && ok "the same command again publishes what a server missed, and a 410 from a server that holds the address revoked is taken once its record verifies" || bad "revoke again: $out"
 
 # --- 9. the sender ACL: a Go box that blocks a recipe box, and a recipe send that the server then refuses ---
-XB="$work/xb"; XBL=$(recipe "$XB" "ig_init $(nopq_arg)" | linkof) && XBA=${XBL##*/} || bad "recipe init for the ACL: $XBL"
+XB="$work/xb"; XBL=$(recipe "$XB" "ig_init" | linkof) && XBA=${XBL##*/} || bad "recipe init for the ACL: $XBL"
 out=$(gocli "$G" peer block "$XBL" 2>&1) && curl -s -H "Authorization: $(cat "$G/pass")" "$IG_BASE/v1/$GA/acl" | jq -e --arg x "$XBA" '.allow == ["*"] and .deny == [$x] and .version > 0' > /dev/null \
   && out=$(recipe "$XB" "ig_send $GL '$work/body'" 2>&1); [ $? -ne 0 ] && grep -q 'ERROR 403 sender_not_allowed' <<< "$out" && grep -q 'nothing is sent' <<< "$out" && [ ! -e "$XB/outbox" ] \
   && ok "a Go box's block reaches the server as its ACL, which refuses the recipe box's send: nothing is sent or kept" || bad "the ACL: $out"
