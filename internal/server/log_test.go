@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +19,8 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
+	"github.com/aws/smithy-go/logging"
 )
 
 // errorWithURL is the test store, but a read of box's record fails with the
@@ -60,9 +61,10 @@ func (s deadS3) PutMessage(ctx context.Context, box protocol.Address, h *Header,
 // No line the server logs carries an address or a message id
 // (IronGall-dev/irongall-server#9, PROTOCOL-SERVER.md §13): not a store's
 // error, whose text holds a request's URL, not a real S3 client's, and not
-// a path that holds one inside a longer segment or in capitals. Each line
-// names the box by the name redact gives it, so the four lines about one box
-// still match.
+// a path that holds one inside a longer segment or in capitals. A line
+// about the box names it by the name redact gives it, so the store's error
+// and the access line of its read match; a path's segment that is not the
+// address is named as a whole (loggedPath), the address inside it unseen.
 func TestNoLogLineCarriesAnAddress(t *testing.T) {
 	var logged bytes.Buffer
 	var a protocol.Address
@@ -74,7 +76,7 @@ func TestNoLogLineCarriesAnAddress(t *testing.T) {
 		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, p, nil))
 	}
 	name := string(redact([]byte(a.String())))
-	if lines := strings.Count(logged.String(), name); strings.Contains(logged.String(), a.String()) || strings.Contains(strings.ToLower(logged.String()), id) || lines != 4 {
+	if lines := strings.Count(logged.String(), name); strings.Contains(strings.ToLower(logged.String()), a.String()) || strings.Contains(strings.ToLower(logged.String()), id) || lines != 2 {
 		t.Errorf("the log names the box %d times, and holds it or the id in the clear:\n%s", lines, logged.String())
 	}
 
@@ -99,15 +101,19 @@ func TestNoLogLineCarriesAnAddress(t *testing.T) {
 	}
 }
 
-// The access log writes one line a request, and nothing a caller sent can
-// end it, pass for the server's own words or make it longer than what the
-// server serves (IronGall-dev/irongall-server#11): a path is quoted, and a
-// method or a path longer than the longest path this server serves is
-// written as its length alone. The longest the routes and the site serve is
-// written whole, and so is a method no route names.
+// The access log writes one line a request, built from what the routers
+// matched and never from the path as sent (IronGall-dev/irongall-server#11,
+// #62): a route's pattern, each wildcard's value as logName names it,
+// whatever the value holds; a site's page as the site's pattern and its
+// path's length; and a path no route answered by its length alone. So
+// nothing a caller sent can end a line, pass for the server's own words,
+// make it longer, or put an address in it past the redaction, an address
+// with one character escaped among them, which the router decodes and a
+// run of hex in the path as sent would split. A method longer than the
+// longest path this server serves is written as its length alone.
 // The server is not wrapped in apitest: a site's pages are a deployment's,
 // which api/openapi.yaml does not describe (site_test.go's are not either).
-func TestTheAccessLogWritesWhatACallerSentAsOneLine(t *testing.T) {
+func TestTheAccessLogWritesWhatTheRoutersMatched(t *testing.T) {
 	site := t.TempDir()
 	page := strings.Repeat("p", 200) + ".html"
 	if err := os.WriteFile(filepath.Join(site, page), []byte("<p>a page</p>"), 0o600); err != nil {
@@ -140,35 +146,69 @@ func TestTheAccessLogWritesWhatACallerSentAsOneLine(t *testing.T) {
 		if n := strings.Count(logged.String(), "\n"); n != 1 {
 			t.Fatalf("%s %.80s: %d lines logged:\n%s", method, path, n, logged.String())
 		}
-		return strings.SplitN(logged.String(), " ", 3)[2] // past the time
-	}
-
-	forged := "/v1/x%0A2026/10/13%2012:00:00%20store%20throttled:%20boom%0D%00%1B[2J%E2%80%AE"
-	if got, want := request("GET", forged), "GET "+strconv.Quote("/v1/x\n2026/10/13 12:00:00 store throttled: boom\r\x00\x1b[2J‮")+" 404 "; !strings.HasPrefix(got, want) {
-		t.Errorf("a path that would forge a line: %q, want it from %q", got, want)
+		line := strings.SplitN(logged.String(), " ", 3)[2] // past the time
+		if hexRun.MatchString(line) {
+			t.Errorf("%s %.80s: a run of hex in the line: %q", method, path, line)
+		}
+		return line
 	}
 	var a protocol.Address
 	a[0] = 1
-	box := string(redact([]byte(a.String())))
-	longest := "/v1/" + a.String() + "/messages/" + strings.Repeat("ab", 32)
-	if got, want := request("GET", longest), "GET "+strconv.Quote("/v1/"+box+"/messages/"+string(redact([]byte(strings.Repeat("ab", 32)))))+" "; !strings.HasPrefix(got, want) {
-		t.Errorf("the longest route's path: %q, want it from %q", got, want)
+	box := logName([]byte(a.String()))
+	id := strings.Repeat("ab", 32)
+	forged := "/v1/x%0A2026/10/13%2012:00:00%20store%20throttled:%20boom%0D%00%1B[2J%E2%80%AE"
+	for _, c := range []struct{ method, path, want string }{
+		{"GET", forged, fmt.Sprintf("GET (a path of %d bytes) 404 ", len(forged))},
+		{"GET", "/v1/" + a.String() + "/messages/" + id, "GET /v1/" + box + "/messages/" + logName([]byte(id)) + " "},
+		{"GET", "/v1/" + a.String()[:20] + "%" + fmt.Sprintf("%02x", a.String()[20]) + a.String()[21:] + "/messages", "GET /v1/" + box + "/messages "},
+		{"GET", "/v1/" + strings.ToUpper(a.String()) + "/acl", "GET /v1/" + box + "/acl "},
+		{"GET", "/v1/%2e%2e/x", "GET (a path of 12 bytes) 404 "},
+		{"GET", "/v1/x%2Fy", "GET /v1/" + logName([]byte("x/y")) + " "},
+		{"GET", "/v1/%41", "GET /v1/" + logName([]byte("A")) + " "},
+		{"GET", "/" + page, "GET / (a path of 206 bytes) 200 "},
+		{"GET", "/" + strings.Repeat("q", 300), "GET / (a path of 301 bytes) 404 "},
+		{"GET", "/v1/" + strings.Repeat(a.String(), 1<<12), fmt.Sprintf("GET /v1/%s ", logName([]byte(strings.Repeat(a.String(), 1<<12))))},
+		{strings.Repeat("A", 1<<16), "/v1/x", fmt.Sprintf("(a method of %d bytes) (a path of 5 bytes) ", 1<<16)},
+		{"PROPFIND", "/v1/x", "PROPFIND (a path of 5 bytes) 405 "},
+	} {
+		if got := request(c.method, c.path); !strings.HasPrefix(got, c.want) {
+			t.Errorf("%.20s %.80s: %q, want it from %q", c.method, c.path, got, c.want)
+		}
 	}
-	if got, want := request("GET", "/"+page), "GET "+strconv.Quote("/"+page)+" 200 "; !strings.HasPrefix(got, want) {
-		t.Errorf("the site's longest page: %q, want it from %q", got, want)
+}
+
+// The AWS SDK's own lines are written through the redaction
+// (IronGall-dev/irongall-server#72): serve and account both load their
+// configuration with AWSLogger.
+func TestTheAWSSDKsLinesAreRedacted(t *testing.T) {
+	var logged bytes.Buffer
+	run := strings.Repeat("ab", 32)
+	AWSLogger(&logged).Logf(logging.Warn, "a response's Date: %s", run)
+	if strings.Contains(logged.String(), run) || !strings.Contains(logged.String(), logName([]byte(run))) {
+		t.Errorf("the SDK's line: %q", logged.String())
 	}
-	over := "/" + strings.Repeat("q", len(page)+1)
-	if got, want := request("GET", over), fmt.Sprintf("GET (a path of %d bytes) ", len(over)); !strings.HasPrefix(got, want) {
-		t.Errorf("a path longer than any served: %q, want it from %q", got, want)
+}
+
+// panicStreams is a stream that panics, with a message id in its words.
+type panicStreams struct{ streamsAPI }
+
+func (panicStreams) DescribeStream(context.Context, *dynamodbstreams.DescribeStreamInput, ...func(*dynamodbstreams.Options)) (*dynamodbstreams.DescribeStreamOutput, error) {
+	panic("boom at " + strings.Repeat("cd", 32))
+}
+
+// A stream follower that panics is logged through the store's log, which
+// redacts, and ends the process as a lost place does, so a restart rebuilds
+// memory: never its words on stderr, past the redaction.
+func TestAFollowersPanicIsLoggedRedactedAndEndsTheProcess(t *testing.T) {
+	var logged bytes.Buffer
+	l := redacting(log.New(&logged, "", 0))
+	f := &feed{streams: panicStreams{}, interval: time.Hour, logf: l.Printf, shards: map[string]*shard{}}
+	var ended error
+	f.run(context.Background(), func(err error) { ended = err })
+	if ended == nil || !strings.Contains(ended.Error(), "panic") {
+		t.Fatalf("the follower's panic ended nothing: %v", ended)
 	}
-	if got, want := request("GET", "/v1/"+strings.Repeat(a.String(), 1<<12)), fmt.Sprintf("GET (a path of %d bytes) ", 4+64<<12); !strings.HasPrefix(got, want) {
-		t.Errorf("a long path of addresses: %q, want it from %q", got, want)
-	}
-	method := strings.Repeat("A", 1<<16)
-	if got, want := request(method, "/v1/x"), fmt.Sprintf("(a method of %d bytes) %q ", len(method), "/v1/x"); !strings.HasPrefix(got, want) {
-		t.Errorf("a method longer than any path served: %.100q, want it from %q", got, want)
-	}
-	if got, want := request("PROPFIND", "/v1/x"), `PROPFIND "/v1/x" 405 `; !strings.HasPrefix(got, want) {
-		t.Errorf("a method no route names: %q, want it from %q", got, want)
+	if !strings.Contains(logged.String(), "stream: panic") || strings.Contains(logged.String(), strings.Repeat("cd", 32)) {
+		t.Errorf("the panic's line: %q", logged.String())
 	}
 }

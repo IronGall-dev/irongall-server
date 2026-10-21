@@ -17,10 +17,11 @@ import (
 	"os"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aws/smithy-go/logging"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
@@ -74,7 +75,7 @@ type Server struct {
 	site          *Site
 	metrics       *Metrics
 	// longestPath is the longest path this server serves (served): the
-	// access log writes a method or a path any longer as its length alone.
+	// access log writes a method any longer as its length alone.
 	longestPath int
 
 	polls     *buckets // per box
@@ -979,10 +980,15 @@ var hexRun = regexp.MustCompile(`[0-9A-Fa-f]{64,}`)
 // carries an address or a message id, in a path, a store's error or
 // anywhere else (IronGall-dev/irongall-server#9).
 func redact(line []byte) []byte {
-	return hexRun.ReplaceAllFunc(line, func(run []byte) []byte {
-		h := sha256.Sum256(bytes.ToLower(run))
-		return []byte("#" + hex.EncodeToString(h[:8]))
-	})
+	return hexRun.ReplaceAllFunc(line, func(run []byte) []byte { return []byte(logName(run)) })
+}
+
+// logName is the name a log gives a value it never writes: "#" and the first
+// 16 hex characters of the SHA-256 of the value in lower case, the name
+// redact gives a run of hex.
+func logName(v []byte) string {
+	h := sha256.Sum256(bytes.ToLower(v))
+	return "#" + hex.EncodeToString(h[:8])
 }
 
 // redactor is a log's writer that redacts each line written to it: a
@@ -1005,6 +1011,11 @@ func Redacting(w io.Writer) io.Writer {
 	return redactor{w}
 }
 
+// AWSLogger is the logger for the AWS SDK's own lines, written to w through
+// Redacting: its default writes to stderr apart from the redaction
+// (IronGall-dev/irongall-server#72).
+func AWSLogger(w io.Writer) logging.Logger { return logging.NewStandardLogger(Redacting(w)) }
+
 // redacting is l writing through Redacting, so that every line logged
 // through a Config's Log is redacted whoever made it; nil if l is.
 func redacting(l *log.Logger) *log.Logger {
@@ -1017,21 +1028,40 @@ func redacting(l *log.Logger) *log.Logger {
 	return log.New(redactor{l.Writer()}, l.Prefix(), l.Flags())
 }
 
-// asSent is what the access log writes of a method or a path as the caller
-// sent it: its length alone when it is longer than the longest path this
-// server serves, so a caller makes no line longer, and never a part, which
-// could hold part of an address the redaction would not find; a path
-// otherwise quoted, so that no byte of it ends the line or passes for the
-// server's own words (IronGall-dev/irongall-server#11). A method is a token,
-// which net/http has checked, and needs no quotes.
-func asSent(what, s string, longest int) string {
-	switch {
-	case len(s) > longest:
-		return fmt.Sprintf("(a %s of %d bytes)", what, len(s))
-	case what == "path":
-		return strconv.Quote(s)
+// loggedMethod is what the access log writes of a request's method: a
+// token, which net/http has checked and which needs no quotes, or its length
+// alone when it is longer than the longest path this server serves, so a
+// caller makes no line longer (IronGall-dev/irongall-server#11).
+func loggedMethod(m string, longest int) string {
+	if len(m) > longest {
+		return fmt.Sprintf("(a method of %d bytes)", len(m))
 	}
-	return s
+	return m
+}
+
+// loggedPath is what the access log writes of a request's path, built from
+// what the routers matched and never from the path as sent or decoded: the
+// pattern of the route that answered it, each wildcard's value written as
+// logName names it, whatever the value holds, so no byte the caller sent is
+// written and an escaped character cannot split an address past the
+// redaction (IronGall-dev/irongall-server#62, #11); a site's page as the
+// site's pattern and the path's length; and a path no route answered by its
+// length alone.
+func loggedPath(r *http.Request) string {
+	sent, _, _ := strings.Cut(r.RequestURI, "?")
+	_, pattern, ok := strings.Cut(r.Pattern, " ")
+	if !ok {
+		pattern = r.Pattern
+	}
+	switch {
+	case pattern == "":
+		return fmt.Sprintf("(a path of %d bytes)", len(sent))
+	case !strings.Contains(pattern, "{"):
+		return fmt.Sprintf("%s (a path of %d bytes)", pattern, len(sent))
+	}
+	return wildcard.ReplaceAllStringFunc(pattern, func(w string) string {
+		return logName([]byte(r.PathValue(strings.TrimSuffix(strings.Trim(w, "{}"), "..."))))
+	})
 }
 
 type statusWriter struct {
@@ -1064,8 +1094,9 @@ func (w *statusWriter) WriteHeader(status int) {
 // Unwrap lets http.ResponseController reach the connection through the log.
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// observed logs each request (method, path, status and duration, as asSent
-// and redact write them; never a pass, never a body) and counts it by route,
+// observed logs each request (method, path, status and duration, as
+// loggedMethod, loggedPath and redact write them; never a pass, never a
+// body) and counts it by route,
 // status and code (Metrics). The route is the pattern the routers matched,
 // which each sets on the request as it routes it: never the path as sent.
 func (s *Server) observed(h http.Handler) http.Handler {
@@ -1078,7 +1109,7 @@ func (s *Server) observed(h http.Handler) http.Handler {
 		h.ServeHTTP(sw, r)
 		took := time.Since(start)
 		if s.log != nil {
-			s.log.Printf("%s %s %d %s", asSent("method", r.Method, s.longestPath), asSent("path", r.URL.Path, s.longestPath), sw.status, took.Round(time.Microsecond))
+			s.log.Printf("%s %s %d %s", loggedMethod(r.Method, s.longestPath), loggedPath(r), sw.status, took.Round(time.Microsecond))
 		}
 		s.metrics.answered(r.Pattern, sw.status, sw.code, took)
 	})

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"slices"
 	"time"
 
@@ -127,6 +128,15 @@ func (f *feed) list(ctx context.Context) ([]stypes.Shard, error) {
 // run reads every shard each interval until ctx ends, or the follower loses
 // its place, which it reports to fatal.
 func (f *feed) run(ctx context.Context, fatal func(error)) {
+	// A panic here would end the process with its words on stderr, past the
+	// redaction: it is logged through the store's log, which redacts, and
+	// ends the process as a lost place does, so a restart rebuilds memory.
+	defer func() {
+		if p := recover(); p != nil {
+			f.logf("stream: panic: %v\n%s", p, debug.Stack())
+			fatal(fmt.Errorf("stream: panic: %v", p))
+		}
+	}()
 	t := time.NewTicker(f.interval)
 	defer t.Stop()
 	for {

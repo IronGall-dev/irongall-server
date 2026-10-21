@@ -180,7 +180,7 @@ func serve(args []string) error {
 	case *boxes == "" || *msgs == "" || *accts == "" || *bucket == "" || len(cfg.Names) == 0:
 		return errors.New("name -boxes-table, -msgs-table, -accounts-table, -bucket and -names, or run --dev")
 	default:
-		awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(*region))
+		awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(*region), config.WithLogger(server.AWSLogger(os.Stderr)))
 		if err != nil {
 			return err
 		}

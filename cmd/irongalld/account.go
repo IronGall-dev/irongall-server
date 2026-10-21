@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
@@ -89,7 +90,7 @@ func account(cmd string, args []string) error {
 		return errors.New("name -accounts-table")
 	}
 	ctx := context.Background()
-	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(*region))
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(*region), config.WithLogger(server.AWSLogger(os.Stderr)))
 	if err != nil {
 		return err
 	}

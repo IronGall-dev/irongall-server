@@ -104,6 +104,81 @@ func TestAFirstPageIsNotModifiedWhileUnchanged(t *testing.T) {
 	}
 }
 
+// A poll's If-Match is evaluated first, as RFC 9110 §13.1.1 and §13.2.2 have
+// an origin server evaluate one, and compared strongly: a false one is 412
+// precondition_failed, before If-None-Match is read, and a page after the
+// first, which carries no tag, matches none but "*"
+// (IronGall-dev/irongall-server#71). It comes after the poll's count, as
+// If-None-Match does: a box past its poll rate is refused 429 whatever it
+// sends.
+func TestAPollsIfMatchIsEvaluatedFirst(t *testing.T) {
+	l := relaxed()
+	l.PairCap, l.BoxCap = 0, 0
+	e := newEnv(t, l)
+	from, to := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+	var ct bytes.Buffer
+	w, _ := age.Encrypt(&ct, to.keys[1].Recipient())
+	_, _ = io.WriteString(w, `{"v":1}`)
+	_ = w.Close()
+	e.want(e.do(http.MethodPost, to.path("/messages"), sealedTo(1, 1, ct.Bytes()), from.pass(1)), http.StatusCreated, "")
+	poll := func(e *env, query string, headers ...string) (int, string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, e.srv.URL+to.path("/messages")+query, nil)
+		req.Header.Set("Authorization", to.pass(1))
+		for i := 0; i+1 < len(headers); i += 2 {
+			req.Header.Set(headers[i], headers[i+1])
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		var p protocol.Problem
+		body, _ := io.ReadAll(resp.Body)
+		_ = json.Unmarshal(body, &p)
+		return resp.StatusCode, string(p.Code)
+	}
+	req, _ := http.NewRequest(http.MethodGet, e.srv.URL+to.path("/messages"), nil)
+	req.Header.Set("Authorization", to.pass(1))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	tag := resp.Header.Get("ETag")
+	last := formatCursor(Header{ReceivedAt: e.clock.Now().Add(time.Hour)})
+	for _, c := range []struct {
+		query   string
+		headers []string
+		status  int
+	}{
+		{"", []string{"If-Match", tag}, http.StatusOK},
+		{"", []string{"If-Match", "*"}, http.StatusOK},
+		{"", []string{"If-Match", `"other", ` + tag}, http.StatusOK},
+		{"", []string{"If-Match", `"other"`}, http.StatusPreconditionFailed},
+		{"", []string{"If-Match", "W/" + tag}, http.StatusPreconditionFailed},
+		{"", []string{"If-Match", "junk"}, http.StatusPreconditionFailed},
+		{"", []string{"If-Match", tag, "If-None-Match", tag}, http.StatusNotModified},
+		{"", []string{"If-Match", `"other"`, "If-None-Match", tag}, http.StatusPreconditionFailed},
+		{"?cursor=" + last, []string{"If-Match", tag}, http.StatusPreconditionFailed},
+		{"?cursor=" + last, []string{"If-Match", "*"}, http.StatusOK},
+	} {
+		status, code := poll(e, c.query, c.headers...)
+		if status != c.status || status == http.StatusPreconditionFailed && code != string(protocol.CodePreconditionFailed) {
+			t.Errorf("%s %q: %d %s, want %d", c.query, c.headers, status, code, c.status)
+		}
+	}
+	l.PollBurst, l.PollRefill = 1, time.Hour
+	past := newEnv(t, l)
+	to = past.raw().register(protocol.MaxPrekeyLifetime)
+	if status, _ := poll(past, ""); status != http.StatusOK {
+		t.Fatalf("the one poll: %d", status)
+	}
+	if status, code := poll(past, "", "If-Match", `"other"`); status != http.StatusTooManyRequests {
+		t.Errorf("past the poll rate, with a false If-Match: %d %s, want 429", status, code)
+	}
+}
+
 // A 304 is a poll: it takes from the poll rate, and a box that polls faster is
 // refused 429, never answered 304, whatever it sends (PROTOCOL.md §5.1).
 func TestA304IsAPoll(t *testing.T) {

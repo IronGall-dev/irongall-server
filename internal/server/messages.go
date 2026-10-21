@@ -109,18 +109,29 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 // 9110 §13.1.2 has a server evaluate one (protocol.IfNoneMatch: "*" only as
 // the whole value, each listed tag through its closing quote, compared
 // weakly), is answered 304 with no body: its ETag, its Retry-After and the
-// headers every answer carries (RFC 9110 §15.4.5).
+// headers every answer carries (RFC 9110 §15.4.5). An If-Match is evaluated
+// first, as RFC 9110 §13.1.1 and §13.2.2 have an origin server evaluate one
+// (protocol.IfMatch: strongly, against a page after the first, which has no
+// tag, as against one that matches none), and a false one is 412
+// (IronGall-dev/irongall-server#71). Both come after the poll's count.
 func (s *Server) writeList(w http.ResponseWriter, r *http.Request, l protocol.MessageList, first bool) {
 	body, err := jsonBytes(l)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	var tag string
+	if first {
+		sum := sha256.Sum256(body)
+		tag = `"` + hex.EncodeToString(sum[:16]) + `"`
+	}
+	if !protocol.IfMatch(r.Header.Values("If-Match"), tag) {
+		writeProblem(w, fail(protocol.CodePreconditionFailed, "list again without If-Match: irongall recv does", "the If-Match is false for this page"))
+		return
+	}
 	h := w.Header()
 	h.Set("Retry-After", strconv.Itoa(s.limits.PollAfter))
 	if first {
-		sum := sha256.Sum256(body)
-		tag := `"` + hex.EncodeToString(sum[:16]) + `"`
 		h.Set("ETag", tag)
 		if protocol.IfNoneMatch(r.Header.Values("If-None-Match"), tag) {
 			w.WriteHeader(http.StatusNotModified)
