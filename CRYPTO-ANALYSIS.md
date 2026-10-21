@@ -77,7 +77,7 @@ Every building block is a published standard with mature implementations, used u
 | Base64 in JSON | Transport of every byte field but a message's ciphertext | RFC 4648, RFC 7493 | The industry pattern for opaque bytes inside JSON. Every JSON text is I-JSON, read one way by every reader, and a byte field is base64 in its one encoding (`PROTOCOL.md` §0b) |
 | The HTTP body, raw | Transport of a message's ciphertext, on its send and its fetch, `application/octet-stream` | RFC 9110 | The plainest shape for bytes, as S3's `PutObject` and Matrix's media upload carry them: its overhead is fixed, never the third of the message base64 adds, on the send and again on the fetch. A send names its prekey's two serials in the query (`PROTOCOL.md` §4.5) |
 
-**Stock tools are enough for any client:** `age`/`age-keygen`, `ssh-keygen`, `sha256sum`, `base64`, `curl`, `jq`. The Go client is the one to run; `sh/irongall.sh` does the same steps in those tools, as the proof that nothing else is going on in it (2026-10-12).
+**Stock tools are enough for any client:** `age`/`age-keygen`, `ssh-keygen`, `sha256sum`, `base64`, `curl`, `jq`. The Go client is the one to run; `sh/irongall.sh` is a box of those tools alone that exchanges mail with a Go box, as the proof that nothing else is going on in it, and the crypto and container vectors are checked by `age` and `ssh-keygen` themselves (above).
 
 ## Identity, address and prekeys
 
