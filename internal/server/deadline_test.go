@@ -69,7 +69,8 @@ func closesWithin(conn net.Conn, d time.Duration) (bool, string) {
 // any answer: one a handler gives after it reads, and every one written
 // before the body is read, which net/http drains first (#77). Cut off where
 // a handler reads it, the answer is 408 request_timeout (RFC 9110 §15.5.9);
-// behind an answer written first, the peer gets the end of the connection.
+// behind an answer written first, the peer gets the end of the connection,
+// that answer before it or not.
 func TestABodyThatStopsIsCutBehindEveryAnswer(t *testing.T) {
 	nobody := strings.Repeat("ab", 32)
 	cases := []struct {
@@ -127,8 +128,8 @@ func TestABodyThatStopsIsCutBehindEveryAnswer(t *testing.T) {
 				t.Errorf("a 408 that is not request_timeout: %q", got)
 			}
 			// An answer written before the body is read follows net/http's
-			// drain of it, which the deadline ends, and a peer that stops
-			// gets none: what the refusal was, its count says.
+			// drain of it, which the deadline ends, and may not reach a peer
+			// that stops: what the refusal was, its count says.
 			if d := counts(t, reg, "irongalld_limit_requests_total")["decision=denied,limit=requests,subject=ip"]; c.limited && d != 1 {
 				t.Errorf("refused for the flood budget %v times, want 1", d)
 			}
