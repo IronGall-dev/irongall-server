@@ -127,7 +127,7 @@ func TestCursorIsNoWayAroundThePollRate(t *testing.T) {
 	}
 	r := list(start)
 	e2.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
-	if !strings.Contains(string(r.body), "poll at most once a minute") {
+	if q, _ := r.quota(); q != protocol.QuotaPolls {
 		t.Fatalf("a made-up cursor past the polls: %s", r.body)
 	}
 
@@ -175,7 +175,7 @@ func TestAContinuationIsTheCursorHandedOutLast(t *testing.T) {
 	e.want(page(c), http.StatusOK, "") // the same cursor again: the box's second poll
 	r := page(c)
 	e.want(r, http.StatusTooManyRequests, protocol.CodeRateLimited)
-	if !strings.Contains(string(r.body), "poll at most once a minute") {
+	if q, _ := r.quota(); q != protocol.QuotaPolls {
 		t.Fatalf("a replayed cursor past the polls: %s", r.body)
 	}
 }
@@ -492,5 +492,25 @@ func TestMissingBoxIsRememberedUntilItIsWritten(t *testing.T) {
 	e.want(e.do(http.MethodPut, r.path(""), r.registration(1), r.pass(1)), http.StatusCreated, "")
 	if b, err := s.Box(ctx, a); err != nil || b.Addr != a {
 		t.Fatalf("the box, once registered: %v", err)
+	}
+}
+
+// A refusal's detail names no value that no member carries (PROTOCOL.md §13):
+// the polls' refusal says no rate, which is the server's to set (-poll-after,
+// -poll-burst, -poll-refill), and the wait is in Retry-After (#65).
+func TestThePollsRefusalNamesNoRateItDoesNotCarry(t *testing.T) {
+	l := relaxed()
+	l.PollBurst, l.PollRefill, l.PollAfter = 1, 10*time.Second, 10 // a server that asks for a poll every 10 seconds
+	e := newEnv(t, l)
+	b := e.box(protocol.Classic)
+	path := "/v1/" + b.Address().String() + "/messages"
+	e.want(e.do("GET", path, nil, e.pass(b)), http.StatusOK, "")
+	got := e.do("GET", path, nil, e.pass(b))
+	e.want(got, http.StatusTooManyRequests, protocol.CodeRateLimited)
+	if q, _ := got.quota(); q != protocol.QuotaPolls {
+		t.Fatalf("the second poll: %s", got.body)
+	}
+	if d := got.problem().Detail; strings.Contains(d, "minute") || strings.Contains(d, "second") {
+		t.Errorf("the polls' refusal names a rate, which no member carries: %q", d)
 	}
 }

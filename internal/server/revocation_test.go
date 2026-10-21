@@ -399,7 +399,8 @@ func TestEveryMailboxServerIsARevocationServer(t *testing.T) {
 
 // A body that is not a revocation costs the server a signature check that
 // nothing has paid for, so it counts as a lookup of a box that does not
-// exist does. A revocation that verifies is never refused for that.
+// exist does, and a revocation that verifies is refused, 429, while the
+// caller's address has none left.
 func TestJunkRevocationsAreLimited(t *testing.T) {
 	l := relaxed()
 	l.MissesPerMinute = 2

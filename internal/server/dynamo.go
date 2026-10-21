@@ -707,8 +707,9 @@ func (s *DynamoStore) readBox(ctx context.Context, a protocol.Address) (boxRead,
 	return r, nil
 }
 
-// liveFrom is the lowest live key at now: received_at > now − TTL, so an
-// expired message the TTL has not yet deleted is never read.
+// liveFrom is the lowest live key at now: received_at > now − Retention
+// (ttlMs, protocol.Retention), so an expired message the TTL has not yet
+// deleted is never read.
 func (s *DynamoStore) liveFrom() []byte { return liveKey(s.nowMs()-ttlMs+1, [32]byte{}) }
 
 // liveQuery is a Query of a box's entries in the live index from lo.
@@ -1050,7 +1051,7 @@ func (s *DynamoStore) DeleteMessage(ctx context.Context, box protocol.Address, i
 	return s.retire(ctx, box, id)
 }
 
-// DeleteMessages implements Store (close): every live message in the box, as
+// DeleteMessages implements Store (a delete, a revocation): every live message in the box, as
 // acks: bodies first, then each item leaves the list.
 func (s *DynamoStore) DeleteMessages(ctx context.Context, box protocol.Address) error {
 	return s.DeleteFrom(ctx, box, func(protocol.Address) bool { return true })

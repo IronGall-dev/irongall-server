@@ -22,7 +22,7 @@ import (
 // since a new one costs more than the coding of a box's read. Each codes by
 // Huffman alone, with no search for repeats: base64 holds almost none, and
 // on reads of 1.6 KB and 4.1 KB the search took 1.5 to 1.7 times as long for
-// 2% of the read at most.
+// 1.4 to 3.8% of an X25519 read and nothing of a post-quantum one.
 var answerWriters = sync.Pool{New: func() any {
 	zw, _ := gzip.NewWriterLevel(nil, gzip.HuffmanOnly)
 	return zw
@@ -74,7 +74,8 @@ func gzipWith(zw *gzip.Writer, b []byte) []byte {
 // (RFC 9110 §12.5.3): gzip, or its alias x-gzip (§8.4.1.3), with a weight
 // above zero, or else "*" with one. A coding named outright outranks "*". No
 // field takes none here: a client that asks for no coding gets none, though
-// the RFC would allow any.
+// the RFC would allow any. Named more than once, gzip counts by its last
+// weight: the RFC gives such a list no meaning.
 func acceptsGzip(fields []string) bool {
 	named, gz, star := false, false, false
 	for _, f := range fields {
@@ -95,7 +96,9 @@ func acceptsGzip(fields []string) bool {
 }
 
 // weighted reports whether a coding's parameters give it a weight above
-// zero: none gives 1, and a weight that is not a number gives none.
+// zero: none gives 1, and a weight strconv.ParseFloat does not read gives
+// none. One it reads that is no qvalue by RFC 9110 §12.4.2 (1e-3, .5, 2, inf)
+// counts by its value, as §2.4 lets a recipient recover it.
 func weighted(params string) bool {
 	params = strings.TrimSpace(params)
 	if params == "" {

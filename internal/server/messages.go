@@ -59,7 +59,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 	// (IronGall-dev/irongall-server#5).
 	if more == 0 || !continues {
 		if ok, wait := s.polls.take(box.String(), s.now()); !ok {
-			return rateLimited(protocol.QuotaPolls, wait, "poll at most once a minute (Retry-After)")
+			return rateLimited(protocol.QuotaPolls, wait, "this box has polled as often as it may for now: poll again after Retry-After")
 		}
 		s.metrics.list(false)
 	} else if ok, wait := s.pages.take(box.String(), s.now()); !ok {
@@ -240,7 +240,7 @@ func (s *Server) fetch(w http.ResponseWriter, r *http.Request) error {
 		var ok bool
 		var wait time.Duration
 		if drain, ok, wait = s.drained.reserve(r.Context(), box.String(), s.now); !ok {
-			return spent(protocol.CodeFetchPaced, wait, "this box takes out at most so much new mail a minute: the rest waits on the server")
+			return spent(protocol.CodeFetchPaced, wait, "this box has taken out as much new mail as it may for now: the rest waits on the server")
 		}
 	}
 	defer func() { drain.release(s.now()) }() // settled below, but for a panic

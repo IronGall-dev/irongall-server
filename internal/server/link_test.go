@@ -14,9 +14,7 @@ import (
 	"github.com/IronGall-dev/irongall-client/client"
 )
 
-// Outside /v1/ the server has the link page and nothing else: a site's own
-// pages (a front page, llms.txt, docs) are served by whatever stands in
-// front of it.
+// With no site, outside /v1/ the server has the link page and nothing else.
 func TestNoPagesButTheLinkPage(t *testing.T) {
 	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: NewMemStore(time.Now), Limits: relaxed(), Ready: func() bool { return false }}).Handler()))
 	defer srv.Close()

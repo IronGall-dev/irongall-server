@@ -48,7 +48,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if sender == nil {
-		return fail(protocol.CodeUnknownSender, "register your own box first: irongall init", "the box the pass names is not registered, or is closed")
+		return fail(protocol.CodeUnknownSender, "register your own box first: irongall init", "the box the pass names is not registered")
 	}
 	lim, err := s.limitsFor(ctx, sender)
 	if err != nil {
@@ -219,7 +219,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	if rlim.ReceiveBurst > 0 {
 		recv, ok, wait := s.receives.reserve(ctx, to.String(), s.now)
 		if !ok {
-			p := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail a minute: post it again after Retry-After (irongall outbox flush does)", "the box has taken as much new mail as it takes for now")
+			p := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail at a time: post it again after Retry-After (irongall outbox flush does)", "the box has taken as much new mail as it takes for now")
 			p.retryAfter = wait
 			return p
 		}
