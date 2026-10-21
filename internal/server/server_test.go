@@ -182,11 +182,11 @@ func (e *env) numbers(a protocol.Address) (prekey, cert uint64) {
 // the one made with the prekey it published last.
 func worker(t *testing.T, b *client.Box) ssh.Signer {
 	t.Helper()
-	n, err := os.ReadFile(filepath.Join(b.Dir(), "serial"))
-	if err != nil {
-		t.Fatal(err)
+	st, err := b.Status()
+	if err != nil || st.PrekeySerial == 0 {
+		t.Fatalf("the box's status: %+v, %v", st, err)
 	}
-	stem := filepath.Join(b.Dir(), "work", strings.TrimSpace(string(n)))
+	stem := filepath.Join(b.Dir(), "work", strconv.FormatUint(st.PrekeySerial, 10))
 	k, err := os.ReadFile(stem)
 	if err != nil {
 		t.Fatal(err)
@@ -1157,13 +1157,13 @@ func TestRenewalLimits(t *testing.T) {
 	e := newEnv(t, l)
 	ctx := context.Background()
 	b := e.box(protocol.Classic)
-	var renewed []uint64
+	var renewed []*protocol.Prekey
 	for i := range 3 {
 		p, err := b.Rekey(ctx, "")
 		if err != nil {
 			t.Fatalf("renewal %d: %v", i+1, err)
 		}
-		renewed = append(renewed, p.Serial)
+		renewed = append(renewed, p)
 	}
 	_, err := b.Rekey(ctx, "")
 	var ae *client.APIError
@@ -1175,15 +1175,9 @@ func TestRenewalLimits(t *testing.T) {
 	if len(cur.Retired) != 2 {
 		t.Fatalf("the record keeps %d retired prekeys, want 2", len(cur.Retired))
 	}
-	for i, n := range renewed[:2] { // the first two renewals: the third is current
-		serial := strconv.FormatUint(n, 10)
-		st, err := os.ReadFile(filepath.Join(b.Dir(), "prekeys", serial+".txt"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		p, _ := protocol.ParsePrekey(st)
+	for i, p := range renewed[:2] { // the first two renewals: the third is current
 		if cur.Retired[i].KeyHash != sha256.Sum256([]byte(p.Key)) {
-			t.Fatalf("retired[%d] is not prekey %s: the newest are not the ones kept", i, serial)
+			t.Fatalf("retired[%d] is not prekey %d: the newest are not the ones kept", i, p.Serial)
 		}
 	}
 	e.clock.Add(8*time.Hour - time.Second)

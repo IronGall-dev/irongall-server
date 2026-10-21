@@ -3,9 +3,6 @@ package server
 import (
 	"context"
 	"net/http"
-	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -162,12 +159,11 @@ func TestABoxWhoseClockGoesBackFetchesNothing(t *testing.T) {
 	}
 	// Control: at that clock the mail would be refused, so the stop above is
 	// what kept it. The certificate it is signed under has not begun.
-	first, _ := e.numbers(sender.Address())
-	sig, rerr := os.ReadFile(filepath.Join(sender.Dir(), "prekeys", strconv.FormatUint(first, 10)+".txt.sig")) //nolint:gosec // a test's own file
-	if rerr != nil {
-		t.Fatal(rerr)
+	held, rerr := e.store.Box(ctx, sender.Address())
+	if rerr != nil || held == nil {
+		t.Fatalf("the sender's record: %v", rerr)
 	}
-	if began, err := protocol.CertificateBegan(sig); err != nil || !began.After(e.clock.Now().Add(off)) {
+	if began, err := protocol.CertificateBegan(held.Signature); err != nil || !began.After(e.clock.Now().Add(off)) {
 		t.Fatalf("the sender's certificate began %v, which is not after the reader's clock: the test does not reach the case", began)
 	}
 	off = 0

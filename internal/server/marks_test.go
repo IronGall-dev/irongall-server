@@ -11,8 +11,6 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -253,6 +251,7 @@ type tagFront struct {
 	mu     sync.Mutex
 	plant  string
 	status []int
+	asked  []string // each poll's If-None-Match
 }
 
 func (f *tagFront) serve(w http.ResponseWriter, r *http.Request, next http.Handler) {
@@ -264,6 +263,7 @@ func (f *tagFront) serve(w http.ResponseWriter, r *http.Request, next http.Handl
 	next.ServeHTTP(rec, r)
 	maps.Copy(w.Header(), rec.Header())
 	f.mu.Lock()
+	f.asked = append(f.asked, r.Header.Get("If-None-Match"))
 	if f.plant != "" && rec.Code == http.StatusOK {
 		w.Header().Set("ETag", f.plant)
 	} else {
@@ -292,9 +292,6 @@ func TestAPlantedTagHidesNoMailAtAnHonestServer(t *testing.T) {
 		e.setMiddle(f.serve)
 		receive(t, b) // the one hostile answer: the box is empty, and only the tag is the front's
 		f.honest()
-		if kept, _ := os.ReadFile(filepath.Join(b.Dir(), "etag")); string(kept) != plant {
-			t.Fatalf("the box keeps %q, want the planted %s", kept, plant)
-		}
 		send(t, a, b, "one")
 		send(t, a, b, "two")
 		got := 0
@@ -303,6 +300,9 @@ func TestAPlantedTagHidesNoMailAtAnHonestServer(t *testing.T) {
 			got += len(receive(t, b).Delivered)
 		}
 		n, _ := e.store.Count(context.Background(), b.Address())
+		if len(f.asked) < 2 || f.asked[1] != plant {
+			t.Fatalf("the poll after the planted tag sent %q, want the planted %s", f.asked, plant)
+		}
 		if got != 2 || f.status[0] != http.StatusOK || n != 0 {
 			t.Errorf("with %s kept: polls answered %v, delivered %d of 2, the server holds %d", plant, f.status, got, n)
 		}

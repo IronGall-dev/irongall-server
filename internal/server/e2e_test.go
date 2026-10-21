@@ -298,13 +298,8 @@ func TestPassRefusedAfterRekey(t *testing.T) {
 	e := newEnv(t, relaxed())
 	b := e.box(protocol.Classic)
 	receive(t, b)
-	pass := func() string {
-		p, err := os.ReadFile(filepath.Join(b.Dir(), "pass"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return strings.TrimSpace(string(p))
-	}
+	// A pass under the certificate in use, as the box signs one.
+	pass := func() string { return e.pass(b) }
 	old := pass()
 	messages := "/v1/" + b.Address().String() + "/messages"
 	e.want(e.do(http.MethodGet, messages, nil, old), http.StatusOK, "")
@@ -364,7 +359,7 @@ func TestRecoveryWithIdentityAlone(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.PostQuantum), e.box(protocol.PostQuantum)
 	// A restored machine: the identity, nothing else.
-	for _, g := range []string{"prekeys/*", "work/*", "pass"} {
+	for _, g := range []string{"prekeys/*", "work/*", "state"} {
 		names, _ := filepath.Glob(filepath.Join(b.Dir(), g))
 		for _, n := range names {
 			if err := os.Remove(n); err != nil {
