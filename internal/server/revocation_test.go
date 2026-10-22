@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -479,67 +479,45 @@ func TestARevocationOutlivesTheProcess(t *testing.T) {
 	e2.want(e2.do("PUT", revocationPath(a.Address()), rec, ""), 410, protocol.CodeRevoked) // and answers what is sent for it from that record
 }
 
-// countingDeletes wraps a Store and counts DeleteMessages, the read of the
-// messages table a revocation draws, and Count. Its next fail calls fail
-// before the store is asked, as a store that is down for a moment does.
-// While cold, Held knows no address, as in a process that has loaded none.
-type countingDeletes struct {
-	Store
-	mu     sync.Mutex
-	n      int
-	counts int
-	fail   int
-	cold   bool
+// watchedStore is a Store whose calls a test watches: each DeleteMessages,
+// the read of the messages table a revocation draws, and each Count. The next
+// failDeletes deletes fail before the store is asked, as a store down for a
+// moment fails, and while forgetful its Held knows no address, as a process
+// that has loaded none.
+type watchedStore struct {
+	Store            // beneath: what is not watched goes straight to it
+	deleted, counted atomic.Int32
+	failDeletes      atomic.Int32
+	forgetful        atomic.Bool
 }
 
-func (s *countingDeletes) Held(a protocol.Address) (Standing, bool) {
-	s.mu.Lock()
-	cold := s.cold
-	s.mu.Unlock()
-	if cold {
+// watching is an option of newEnv that puts w between the server and its
+// store. The env's own store stays the one beneath, so what a test reads
+// through it is not counted.
+func watching(w *watchedStore) func(*Config) {
+	return func(c *Config) { w.Store, c.Store = c.Store, w }
+}
+
+func (w *watchedStore) Held(a protocol.Address) (Standing, bool) {
+	if w.forgetful.Load() {
 		return Standing{}, false
 	}
-	return s.Store.Held(a)
+	return w.Store.Held(a)
 }
 
-func (s *countingDeletes) Count(ctx context.Context, a protocol.Address) (int, error) {
-	s.mu.Lock()
-	s.counts++
-	s.mu.Unlock()
-	return s.Store.Count(ctx, a)
+func (w *watchedStore) Count(ctx context.Context, a protocol.Address) (int, error) {
+	w.counted.Add(1)
+	return w.Store.Count(ctx, a)
 }
 
-func (s *countingDeletes) DeleteMessages(ctx context.Context, a protocol.Address) error {
-	s.mu.Lock()
-	s.n++
-	failing := s.fail > 0
-	if failing {
-		s.fail--
+func (w *watchedStore) DeleteMessages(ctx context.Context, a protocol.Address) error {
+	w.deleted.Add(1)
+	for n := w.failDeletes.Load(); n > 0; n = w.failDeletes.Load() {
+		if w.failDeletes.CompareAndSwap(n, n-1) {
+			return errors.New("the delete failed")
+		}
 	}
-	s.mu.Unlock()
-	if failing {
-		return errors.New("the delete failed")
-	}
-	return s.Store.DeleteMessages(ctx, a)
-}
-
-func (s *countingDeletes) deletes() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.n
-}
-
-// countingEnv is an env whose store counts DeleteMessages.
-func countingEnv(t *testing.T) (*env, *countingDeletes) {
-	t.Helper()
-	clk := &clock{t: time.Now().UTC().Truncate(time.Second)}
-	inner, ready := newTestStore(t, clk.Now)
-	cs := &countingDeletes{Store: inner}
-	e := &env{t: t, clock: clk, store: cs}
-	e.server = New(Config{Store: cs, Limits: relaxed(), Now: clk.Now, Ready: ready})
-	e.srv = httptest.NewServer(apitest.Handler(t, e.server.Handler()))
-	t.Cleanup(e.srv.Close)
-	return e, cs
+	return w.Store.DeleteMessages(ctx, a)
 }
 
 // A box's own revocation is public: whoever holds it may send it back, as it
@@ -547,28 +525,28 @@ func countingEnv(t *testing.T) (*env, *countingDeletes) {
 // nothing more, so each is answered 410 from its record with no check, and
 // none draws another read of the box's messages: the box holds none.
 func TestASecondRevocationReadsNoMail(t *testing.T) {
-	e, cs := countingEnv(t)
-	a := e.box(protocol.Classic)
-	rec := record(t, a)
-	path := revocationPath(a.Address())
-
-	// The first revocation ends the box and clears its mail: one read.
-	e.want(e.do("PUT", path, rec, ""), 201, "")
-	if n := cs.deletes(); n != 1 {
-		t.Fatalf("a revocation read the messages table %d times, want 1", n)
-	}
-	// The same revocation again changes nothing, and reads nothing.
-	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
-	if n := cs.deletes(); n != 1 {
-		t.Errorf("a resent revocation read the messages table %d times, want 1", n)
-	}
-	// Nor does the same signature in other bytes: a line feed after its
-	// armour, which anyone can add.
-	other := *rec
-	other.Revocation = append(bytes.Clone(rec.Revocation), '\n')
-	e.want(e.do("PUT", path, other, ""), 410, protocol.CodeRevoked)
-	if n := cs.deletes(); n != 1 {
-		t.Errorf("a revocation resent in other bytes read the messages table %d times, want 1", n)
+	w := &watchedStore{}
+	e := newEnv(t, relaxed(), watching(w))
+	owner := e.box(protocol.Classic)
+	signed := record(t, owner)
+	// The same signature with a line feed after its armour, which anyone can
+	// add.
+	rewrapped := *signed
+	rewrapped.Revocation = append(bytes.Clone(signed.Revocation), '\n')
+	for _, put := range []struct {
+		what   string
+		rec    *protocol.Revocations
+		status int
+		code   protocol.Code
+	}{
+		{"the revocation, which ends the box and deletes its mail", signed, 201, ""},
+		{"the same revocation again", signed, 410, protocol.CodeRevoked},
+		{"the same signature in other bytes", &rewrapped, 410, protocol.CodeRevoked},
+	} {
+		e.want(e.do("PUT", revocationPath(owner.Address()), put.rec, ""), put.status, put.code)
+		if n := w.deleted.Load(); n != 1 {
+			t.Fatalf("after %s, the box's messages were read %d times in all, want once", put.what, n)
+		}
 	}
 }
 
@@ -579,15 +557,14 @@ func TestASecondRevocationReadsNoMail(t *testing.T) {
 // is for.
 func TestARevocationRetriedAfterAFailedDeleteDeletes(t *testing.T) {
 	ctx := context.Background()
-	e, cs := countingEnv(t)
+	w := &watchedStore{}
+	e := newEnv(t, relaxed(), watching(w))
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	send(t, b, a, "waiting in A's box when it is revoked")
 	rec := record(t, a)
 	path := revocationPath(a.Address())
 
-	cs.mu.Lock()
-	cs.fail = 1
-	cs.mu.Unlock()
+	w.failDeletes.Store(1)
 	if r := e.do("PUT", path, rec, ""); r.status < 500 {
 		t.Fatalf("a revocation whose delete failed was answered %d: %s", r.status, r.body)
 	}
@@ -603,7 +580,7 @@ func TestARevocationRetriedAfterAFailedDeleteDeletes(t *testing.T) {
 	}
 	// With the box empty, one more reads nothing.
 	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
-	if n := cs.deletes(); n != 2 {
+	if n := w.deleted.Load(); n != 2 {
 		t.Errorf("a revocation, its retry and one more read the messages table %d times, want 2", n)
 	}
 }
@@ -615,39 +592,34 @@ func TestARevocationRetriedAfterAFailedDeleteDeletes(t *testing.T) {
 // (IronGall-dev/irongall-server#42).
 func TestAResentRevocationLoadsNothing(t *testing.T) {
 	ctx := context.Background()
-	e, cs := countingEnv(t)
+	w := &watchedStore{}
+	e := newEnv(t, relaxed(), watching(w))
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	send(t, b, a, "waiting in A's box when it is revoked")
 	rec := record(t, a)
 	path := revocationPath(a.Address())
 	left := func() (int, bool) {
 		t.Helper()
-		n, err := cs.Store.Count(ctx, a.Address())
+		n, err := e.store.Count(ctx, a.Address())
 		if err != nil {
 			t.Fatal(err)
 		}
-		stored, err := cs.Store.Box(ctx, a.Address())
+		stored, err := e.store.Box(ctx, a.Address())
 		if err != nil {
 			t.Fatal(err)
 		}
 		return n, stored.hasRecord()
 	}
 
-	cs.mu.Lock()
-	cs.fail = 1
-	cs.mu.Unlock()
+	w.failDeletes.Store(1)
 	if r := e.do("PUT", path, rec, ""); r.status < 500 {
 		t.Fatalf("a revocation whose delete failed was answered %d: %s", r.status, r.body)
 	}
-	cs.mu.Lock()
-	cs.cold, cs.counts = true, 0
-	cs.mu.Unlock()
+	w.forgetful.Store(true)
+	w.counted.Store(0)
 	e.want(e.do("PUT", path, rec, ""), 410, protocol.CodeRevoked)
-	cs.mu.Lock()
-	counts := cs.counts
-	cs.cold = false
-	cs.mu.Unlock()
-	if n := cs.deletes(); counts != 0 || n != 1 {
+	w.forgetful.Store(false)
+	if counts, n := w.counted.Load(), w.deleted.Load(); counts != 0 || n != 1 {
 		t.Errorf("a revocation sent again where memory holds nothing counted the mail %d times and deleted it %d times, want neither", counts, n-1)
 	}
 	if n, record := left(); n != 1 || !record {
