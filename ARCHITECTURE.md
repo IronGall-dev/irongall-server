@@ -317,7 +317,7 @@ irongall-server (this repo)
 4. ✅ **The DynamoDB + S3 Express store, the stream follower and layer 1** (2026-10-10), with the poll path answered from memory (lazy per box since 2026-10-11, § Startup). Every server test runs on both stores (the AWS ones against tables kept for tests), and the failure injected between each pair of writes is tested. **Split into a boxes table and a messages table on 2026-10-11** (§ Storage). Deployed as stage 1 on 2026-10-10: one process, `Dockerfile` here.
 5. **`irongall.sh` in the public repo, named in `llms.txt`** — built 2026-10-11, with its forging test (`sh/test.sh`, moved from this repo's `test/stock-flow.sh`, and since 2026-10-21 Go tests in `sh/` on the client's fake server), vector parity and interop with the Go client, all in irongall-client. (The site's pages were served by this server from 2026-10-11, left it on 2026-10-12, and came back with `-site` on 2026-10-18.)
 6. **`irongall mcp` and `SKILL.md`.** The echo boxes are built and live (2026-10-11, `PROTOCOL.md` §10).
-7. **Layer 2 with its byte budget, stream-fed global limits, readiness gating, and a second process.** That's stage 2, and with the second process a send's read of its recipient after its write (`PROTOCOL-SERVER.md` §4, step 9) becomes strongly consistent.
+7. **Layer 2 with its byte budget, stream-fed global limits, readiness gating, and a second process.** That's stage 2, and with the second process a send's read of its recipient after its write (`PROTOCOL-SERVER.md` §4, step 9) becomes strongly consistent, and a send refused at its counts reads the dedupe again strongly consistent (step 6: the posts of one ciphertext in flight are one call only within a process).
 
 ## Open
 

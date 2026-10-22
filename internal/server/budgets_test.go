@@ -689,11 +689,8 @@ func TestAPanicSettlesItsReservations(t *testing.T) {
 	}
 
 	call(http.MethodGet, victim.path(""), nil, "")
-	s.reads.mu.Lock()
-	inFlight := len(s.reads.in)
-	s.reads.mu.Unlock()
-	if n := held(s.misses); n != 0 || inFlight != 0 {
-		t.Errorf("after a panic in a lookup's read: %d miss reservations held, %d reads in flight", n, inFlight)
+	if n := held(s.misses); n != 0 {
+		t.Errorf("after a panic in a lookup's read: %d miss reservations held", n)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

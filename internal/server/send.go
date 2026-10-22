@@ -43,12 +43,23 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	}
 	// The pass showed the box exists, so reading its record is no guess at
 	// an address: it is not a read lookup would count or refuse.
+	// It is held to what the pass's check held the box to (sender), since
+	// the box can be deleted or revoked, or its certificate revoked, between
+	// the two reads.
 	sender, err := s.box(ctx, from)
 	if err != nil {
 		return err
 	}
-	if sender == nil {
+	switch {
+	case sender == nil, sender.State == Deleted, sender.State == NoBox:
 		return fail(protocol.CodeUnknownSender, "register your own box first: irongall init", "the box the pass names is not registered")
+	case sender.State == Revoked:
+		return fail(protocol.CodeSenderRevoked, "your box is revoked: make a new one, irongall init", "the sending box is revoked")
+	}
+	if listed, err := sender.listed(sender.CertSerial); err != nil {
+		return err
+	} else if listed {
+		return listedCertificate()
 	}
 	lim, err := s.limitsFor(ctx, sender)
 	if err != nil {
@@ -132,43 +143,92 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return noSuchMailbox
 	}
 
+	// 6 to 9, one call for the posts of this ciphertext to this box from
+	// this sender, naming the same serials, in flight at once
+	// (IronGall-dev/irongall-server#76, #16): one that arrives while the
+	// first is in them waits for it, and is answered as step 6 answers a
+	// post of bytes the box holds, or with the first's own refusal, which it
+	// would meet as well. The call runs apart from the request that leads
+	// it, so its caller going fails none of the others.
+	p := &post{from: from, to: to, id: sha256.Sum256(ciphertext), ciphertext: ciphertext, stanzas: stanzas, q: q, sender: sender, rcpt: rcpt, lim: lim, now: now}
+	led := false
+	v, err, _ := s.posts.Do(string(p.to[:])+string(p.id[:])+string(p.from[:])+p.q.Encode(), func() (any, error) {
+		led = true
+		return s.deliver(context.WithoutCancel(ctx), p)
+	})
+	if err != nil {
+		return err
+	}
+	d := v.(delivered)
+	if !d.fresh || !led {
+		return s.duplicate(w, d.h, from)
+	}
+	// The message made, which only its recipient may fetch (RFC 9110 §15.3.2).
+	w.Header().Set("Location", "/v1/"+to.String()+"/messages/"+hexID(d.h.ID))
+	writeJSON(w, http.StatusCreated, receipt(d.h))
+	return nil
+}
+
+// A post is a send past its step 5: what steps 6 to 9 read.
+type post struct {
+	from, to     protocol.Address
+	id           [32]byte
+	ciphertext   []byte
+	stanzas      []*age.Stanza
+	q            protocol.SendQuery
+	sender, rcpt *Box
+	lim          Limits
+	now          time.Time
+}
+
+// delivered is what steps 6 to 9 made of a post: the message's header, and
+// fresh if this post stored it, where a duplicate's is the original's.
+type delivered struct {
+	h     *Header
+	fresh bool
+}
+
+// deliver is steps 6 to 9 of a send (send): the dedupe, whether the box
+// takes new mail, the counts, the write.
+func (s *Server) deliver(ctx context.Context, p *post) (delivered, error) {
+	from, to, msgID, rcpt, now, q := p.from, p.to, p.id, p.rcpt, p.now, p.q
+
 	// 6. Dedupe, before anything asks whether the box takes new mail: a
 	// retry gets the original receipt, whatever has changed since it was
 	// stored, a renewal of the box's prekey included. What those checks
 	// keep from the box is new mail, and a retry is none.
-	msgID := sha256.Sum256(ciphertext)
 	if orig, err := s.store.Dedupe(ctx, to, msgID); err == nil {
-		return s.duplicate(w, orig, from)
+		return delivered{h: orig}, nil
 	} else if !errors.Is(err, ErrNotFound) {
-		return err
+		return delivered{}, err
 	}
 
 	// 7. The box takes new mail on this prekey, and from this sender.
 	if rcpt.Prekey.Expired(now) {
-		return fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall prekey renew); retry later", "this box's prekey has expired")
+		return delivered{}, fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall prekey renew); retry later", "this box's prekey has expired")
 	}
 	// A prekey under a certificate the box's identity has revoked is one
 	// nobody may encrypt to. The cure is an expired prekey's: the owner
 	// publishes a new one, under a new certificate.
 	if listed, err := rcpt.listed(rcpt.CertSerial); err != nil {
-		return err
+		return delivered{}, err
 	} else if listed {
-		return fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall prekey renew); retry later", "this box's prekey is signed under a certificate its identity revoked")
+		return delivered{}, fail(protocol.CodePrekeyExpired, "the box's owner must publish a new prekey (irongall prekey renew); retry later", "this box's prekey is signed under a certificate its identity revoked")
 	}
 	// A box takes mail from a sender whose identity its client can verify:
 	// one on an Ed25519 key always, and otherwise what it declared with its
 	// prekey. Refused here, the sender has an error and no receipt for mail
 	// the recipient would have refused on reading it.
-	if t := identityType(sender.Identity); !protocol.AcceptsSender(rcpt.SenderKeyTypes, t) {
-		return fail(protocol.CodeSenderKeyType, "a box whose identity is an ssh-ed25519 key, as irongall init makes one, can write to any box",
+	if t := identityType(p.sender.Identity); !protocol.AcceptsSender(rcpt.SenderKeyTypes, t) {
+		return delivered{}, fail(protocol.CodeSenderKeyType, "a box whose identity is an ssh-ed25519 key, as irongall init makes one, can write to any box",
 			"this box's client does not verify identities of your box's key type, %s", keyTypeValue(t))
 	}
 	// A prekey is named by both serials: its own, and its certificate's.
 	if q.PrekeySerial != rcpt.Prekey.Serial || q.CertificateSerial != rcpt.CertSerial {
-		return fail(protocol.CodeStalePrekey, "a newer prekey exists: read GET /v1/<address> again and re-encrypt the same envelope (irongall does this)", "the box's current prekey is serial %d, under certificate %d", prekeySerialValue(rcpt.Prekey.Serial), certificateSerialValue(rcpt.CertSerial))
+		return delivered{}, fail(protocol.CodeStalePrekey, "a newer prekey exists: read GET /v1/<address> again and re-encrypt the same envelope (irongall does this)", "the box's current prekey is serial %d, under certificate %d", prekeySerialValue(rcpt.Prekey.Serial), certificateSerialValue(rcpt.CertSerial))
 	}
-	if p := checkStanzas(stanzas, rcpt); p != nil {
-		return p
+	if refused := checkStanzas(p.stanzas, rcpt); refused != nil {
+		return delivered{}, refused
 	}
 
 	// 8. First the box's ACL (PROTOCOL.md §6.2): deny, then allow. It is
@@ -176,17 +236,17 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	// One code and one wording whether the sender was denied or is not on an
 	// allow list, so a sender cannot tell which.
 	if !rcpt.ACL.Admits(from) {
-		return fail(protocol.CodeSenderNotAllowed, "nothing the sender can change: its client moves the message to outbox/failed/", "this box's ACL does not let your box send to it")
+		return delivered{}, fail(protocol.CodeSenderNotAllowed, "nothing the sender can change: its client moves the message to outbox/failed/", "this box's ACL does not let your box send to it")
 	}
 	// Then quotas, counted only for sends that carried their sender's pass,
 	// each taken before the write and given back unless the send is stored,
 	// or may have been (mayHaveApplied): sends in flight at once cannot all
 	// pass on one count.
 	stored := false
-	for _, d := range s.sendsOf(lim) {
+	for _, d := range s.sendsOf(p.lim) {
 		sent, ok, wait := d.bs.reserve(ctx, from.String(), s.now)
 		if !ok {
-			return d.refusal(wait)
+			return delivered{}, d.refusal(wait)
 		}
 		defer func() {
 			if stored {
@@ -196,26 +256,26 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 			}
 		}()
 	}
-	release, p, err := s.reserveCaps(ctx, to, from)
+	release, refused, err := s.reserveCaps(ctx, to, from)
 	if err != nil {
-		return err
+		return delivered{}, err
 	}
-	if p != nil {
-		return p
+	if refused != nil {
+		return delivered{}, refused
 	}
 	defer release()
 	// The box's own budget for new mail, from every sender together: what
 	// keeps one box from taking mail at any rate however many boxes send.
 	rlim, err := s.limitsFor(ctx, rcpt)
 	if err != nil {
-		return err
+		return delivered{}, err
 	}
 	if rlim.ReceiveBurst > 0 {
 		recv, ok, wait := s.receives.reserve(ctx, to.String(), s.now)
 		if !ok {
-			p := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail at a time: post it again after Retry-After (irongall outbox flush does)", "the box has taken as much new mail as it takes for now")
-			p.retryAfter = wait
-			return p
+			busy := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail at a time: post it again after Retry-After (irongall outbox flush does)", "the box has taken as much new mail as it takes for now")
+			busy.retryAfter = wait
+			return delivered{}, busy
 		}
 		defer func() {
 			if stored {
@@ -230,18 +290,17 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	h := &Header{
 		ID:         msgID,
 		From:       from,
-		Size:       len(ciphertext),
+		Size:       len(p.ciphertext),
 		ReceivedAt: now.UTC().Truncate(time.Millisecond),
 		ExpiresAt:  now.UTC().Truncate(time.Millisecond).Add(protocol.Retention), // the TTL less the hour and a post's own time (PROTOCOL.md §0, §7)
 	}
-	wctx := detached(ctx)
-	orig, err := s.store.PutMessage(wctx, to, h, ciphertext)
+	orig, err := s.store.PutMessage(ctx, to, h, p.ciphertext)
 	if err != nil {
 		stored = mayHaveApplied(err)
-		return err
+		return delivered{}, err
 	}
 	if orig != nil {
-		return s.duplicate(w, orig, from) // a concurrent send won the dedupe record
+		return delivered{h: orig}, nil // a send of the same ciphertext from another process, or a stale dedupe read
 	}
 	stored = true
 	// The box may have been deleted or revoked since step 5 read it: then
@@ -249,22 +308,19 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	// send is answered as the box now stands (IronGall-dev/irongall-server#15).
 	// One process has the change in memory at once; with more, this is to be
 	// a strongly consistent read (ARCHITECTURE.md, stage 2).
-	if cur, err := s.box(wctx, to); err != nil {
-		return err
+	if cur, err := s.box(ctx, to); err != nil {
+		return delivered{}, err
 	} else if !cur.open() {
-		if err := s.store.DeleteMessage(wctx, to, msgID); err != nil && !errors.Is(err, ErrNotFound) {
-			return err
+		if err := s.store.DeleteMessage(ctx, to, msgID); err != nil && !errors.Is(err, ErrNotFound) {
+			return delivered{}, err
 		}
 		stored = false
 		if cur != nil && cur.State == Revoked {
-			return revoked()
+			return delivered{}, revoked()
 		}
-		return noSuchMailbox
+		return delivered{}, noSuchMailbox
 	}
-	// The message made, which only its recipient may fetch (RFC 9110 §15.3.2).
-	w.Header().Set("Location", "/v1/"+to.String()+"/messages/"+hexID(h.ID))
-	writeJSON(w, http.StatusCreated, receipt(h))
-	return nil
+	return delivered{h: h, fresh: true}, nil
 }
 
 // inFlight is, for each box, the sends this process has let past the pair

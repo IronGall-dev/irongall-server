@@ -1000,7 +1000,16 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 	})
 	if ccf, ok := isConditionFailed(err); ok {
-		orig, _, err := decodeMsg(ccf.Item) // a concurrent send of the same ciphertext
+		orig, live, err := decodeMsg(ccf.Item) // a send of the same ciphertext got there first
+		if err == nil && !live {
+			// Acked since this send's dedupe read missed it: the PUT above
+			// made its body again, which nothing would serve, and only the
+			// lifecycle rule would take (IronGall-dev/irongall-server#16).
+			// A live one's body is that message's, the same bytes.
+			if err := s.deleteBody(ctx, box, h.ID); err != nil {
+				s.logf("msgs: deleting a body put again after its message's ack: %v", err)
+			}
+		}
 		return orig, err
 	}
 	if err != nil {

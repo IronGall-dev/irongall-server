@@ -31,7 +31,7 @@ const hintDocument = "the identity document is \"irongall-v1\", LF, one SSH publ
 // A registration is held to what is kept of the address, box or none: 410
 // while the address is revoked, nothing under a certificate its identity
 // revoked, and, while a deleted box's record is kept, a later certificate
-// than its last and a key it never published, which undoes the delete.
+// than its last and a new key (take), which undoes the delete.
 func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	h, err := pathAddr(r)
 	if err != nil {
@@ -192,7 +192,7 @@ func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol
 // (PROTOCOL.md §3 step 5): it undoes the delete. The box comes back as it
 // was, its ACL and its account with it, under the new statement, which is
 // taken as a renewal's is: under a later certificate than the box's last
-// (register checked that), and with a key it never published. It comes back
+// (register checked that), and with a new key (take). It comes back
 // with no mail: what is left in it, a send that landed after the delete's
 // last pass or a pass that failed, is deleted first
 // (IronGall-dev/irongall-server#15).
@@ -661,11 +661,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	// never served, this deletes it sooner than its expiry would, and then
 	// the box's record goes.
 	if req.Revocation != nil && b.hasRecord() {
-		ctx := detached(r.Context())
-		if err := s.store.DeleteMessages(ctx, h); err != nil {
-			return err
-		}
-		if err := s.store.DeleteBox(ctx, h); err != nil {
+		if err := s.purge(detached(r.Context()), b); err != nil {
 			return err
 		}
 	}
@@ -674,9 +670,10 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 }
 
 // deleteHeld deletes what is left of revoked address b's box where memory
-// holds the address (Store.Held): its mail while memory shows the box holding
-// any, and a record left beside the revocation, by a delete that failed or a
-// registration that raced it. Its caller carries no pass, so elsewhere it
+// holds the address (Store.Held), while memory shows the box holding mail or
+// a record is left beside the revocation, by a delete that failed or a
+// registration that raced it: by the one purge of the address in flight
+// (purge). Its caller carries no pass, so elsewhere it
 // loads nothing and changes nothing, and what is left waits for its expiry,
 // served to nobody (ARCHITECTURE.md § Startup). The record stays there too:
 // a load reads an address's mail only while its record is left, so deleting
@@ -687,15 +684,31 @@ func (s *Server) deleteHeld(ctx context.Context, b *Box) error {
 	}
 	if n, err := s.store.Count(ctx, b.Addr); err != nil {
 		return err
-	} else if n > 0 {
+	} else if n == 0 && !b.hasRecord() {
+		return nil
+	}
+	return s.purge(ctx, b)
+}
+
+// purge deletes what is left of revoked address b's box: its mail, then its
+// record if one is left. One purge of an address is in flight at a time, on
+// a context apart from any one request, and a call that comes meanwhile
+// waits for it and gets its result, starting nothing
+// (IronGall-dev/irongall-server#29): a revocation sent for a revoked box
+// carries no pass and costs no signature check, so anyone can send one, and
+// each would otherwise start a whole delete of the box's mail of its own.
+func (s *Server) purge(ctx context.Context, b *Box) error {
+	_, err, _ := s.purges.Do(string(b.Addr[:]), func() (any, error) {
+		ctx := context.WithoutCancel(ctx)
 		if err := s.store.DeleteMessages(ctx, b.Addr); err != nil {
-			return err
+			return nil, err
 		}
-	}
-	if b.hasRecord() {
-		return s.store.DeleteBox(ctx, b.Addr)
-	}
-	return nil
+		if b.hasRecord() {
+			return nil, s.store.DeleteBox(ctx, b.Addr)
+		}
+		return nil, nil
+	})
+	return err
 }
 
 // deleteBox is DELETE /v1/<address> (with the pass), the owner's delete

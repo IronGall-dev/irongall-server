@@ -18,11 +18,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/logging"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
@@ -99,8 +99,18 @@ type Server struct {
 	inFlight [256]inFlight
 	// drains is the cursor each box was handed last (list).
 	drains drains
-	// reads are the reads of box records in flight (lookup).
-	reads reads
+	// purges are the deletes of what is left of revoked boxes in flight, one
+	// per address (purge). Never DoChan (reads).
+	purges singleflight.Group
+	// posts are the posts of one ciphertext to one box from one sender in
+	// flight at once (send): one call, which the others wait for. Never
+	// DoChan (reads).
+	posts singleflight.Group
+	// reads are the reads of box records in flight (lookup), one per
+	// address, which lookups of it made meanwhile share. Never DoChan: with
+	// a caller waiting on its channel, a panic in the shared function is
+	// raised again on a goroutine of its own, which ends the process.
+	reads singleflight.Group
 	// largeRead is the one allowance for reading a send past the free
 	// cap's size, held until the send is answered. Only a sender whose own
 	// cap is larger ever asks for it.
@@ -662,40 +672,49 @@ func (s *Server) box(ctx context.Context, a protocol.Address) (*Box, error) {
 // Limits.MissesPerMinute guards: the caller's address reserves a count before
 // it, and keeps it only if the read finds no box (s.miss). Lookups of one
 // address made while its read is in flight share that read, and are counted
-// for nothing: it costs no more for them.
+// for nothing: it costs no more for them (IronGall-dev/irongall-server#6).
+// Each gets a copy of its own, since its caller may change the one it has.
 func (s *Server) lookup(r *http.Request, a protocol.Address) (*Box, error) {
 	for {
 		if b, ok := s.store.Known(a); ok {
 			return b, nil
 		}
-		f, lead := s.reads.start(a)
-		if lead {
-			return s.lead(r, a, f)
-		}
-		b, err := f.wait(r.Context())
-		if errors.Is(err, errReadNotMade) {
+		led := false
+		v, err, _ := s.reads.Do(string(a[:]), func() (any, error) {
+			led = true
+			return s.lead(r, a)
+		})
+		var refused notRead
+		switch {
+		case errors.As(err, &refused) && !led:
 			continue // its caller was refused before reading: try for ourselves
+		case errors.As(err, &refused):
+			return nil, refused.err
+		case err != nil:
+			return nil, err
 		}
-		return b, err
+		if b, _ := v.(*Box); b != nil {
+			return cloneBox(b), nil
+		}
+		return nil, nil
 	}
 }
 
-// lead makes read f of a's record for lookup, the read every lookup of a
-// meanwhile waits on. It runs apart from its caller's request, bounded by
-// storeTimeout, so a caller who hangs up fails none of them
-// (IronGall-dev/irongall-server#32), and it finishes f and settles its
-// reservation however it ends, a panic included (#36).
-func (s *Server) lead(r *http.Request, a protocol.Address, f *read) (*Box, error) {
-	defer s.reads.finish(a, f, nil, errReadNotMade) // finished below, but for a refusal or a panic
+// lead makes the read of a's record that lookups of a meanwhile share. It
+// runs apart from its caller's request, bounded by storeTimeout, so a caller
+// who hangs up fails none of them (IronGall-dev/irongall-server#32), and it
+// settles its reservation however it ends, a panic included (#36). A caller
+// refused before reading makes no read, and those waiting on it ask for
+// themselves (notRead).
+func (s *Server) lead(r *http.Request, a protocol.Address) (*Box, error) {
 	m, err := s.miss(r)
 	if err != nil {
-		return nil, err
+		return nil, notRead{err}
 	}
 	defer func() { m.release(s.now()) }() // settled below, but for a panic
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), storeTimeout)
 	defer cancel()
 	b, err := s.box(ctx, a)
-	s.reads.finish(a, f, b, err)
 	if err == nil && b == nil {
 		m.keep()
 	} else {
@@ -704,73 +723,11 @@ func (s *Server) lead(r *http.Request, a protocol.Address, f *read) (*Box, error
 	return b, err
 }
 
-// errReadNotMade is what a shared read tells those waiting on it when its
-// caller was refused before reading, or its read ended in a panic: each then
-// asks for itself.
-var errReadNotMade = errors.New("the read was not made")
+// notRead is what a shared read gives when its caller was refused before
+// reading: the caller's own refusal, for it alone.
+type notRead struct{ err error }
 
-// reads are the reads of box records in flight, by address, so that lookups
-// of one address at once make one read (IronGall-dev/irongall-server#6).
-type reads struct {
-	mu sync.Mutex
-	in map[protocol.Address]*read
-}
-
-// read is one read of a box's record, and what it found.
-type read struct {
-	done chan struct{}
-	b    *Box
-	err  error
-}
-
-// start begins the read of a, or returns the one already in flight with
-// lead false.
-func (rs *reads) start(a protocol.Address) (f *read, lead bool) {
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	if f := rs.in[a]; f != nil {
-		return f, false
-	}
-	if rs.in == nil {
-		rs.in = map[protocol.Address]*read{}
-	}
-	f = &read{done: make(chan struct{})}
-	rs.in[a] = f
-	return f, true
-}
-
-// finish records what the read of a found, for those waiting on it: a copy
-// of its own, since the read's caller may change the one it has. A read
-// already finished is left as it is, so a finish deferred where the read
-// starts finishes it on every path.
-func (rs *reads) finish(a protocol.Address, f *read, b *Box, err error) {
-	rs.mu.Lock()
-	if rs.in[a] != f {
-		rs.mu.Unlock()
-		return
-	}
-	delete(rs.in, a)
-	rs.mu.Unlock()
-	if b != nil {
-		b = cloneBox(b)
-	}
-	f.b, f.err = b, err
-	close(f.done)
-}
-
-// wait returns what the read found, each waiter a copy of its own, or the
-// caller's context's end.
-func (f *read) wait(ctx context.Context) (*Box, error) {
-	select {
-	case <-f.done:
-		if f.b == nil {
-			return nil, f.err
-		}
-		return cloneBox(f.b), f.err
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
+func (n notRead) Error() string { return n.err.Error() }
 
 // miss reserves a count of the caller's address under Limits.MissesPerMinute,
 // before work that a caller who named no box, or brought nothing that
