@@ -131,7 +131,7 @@ func serve(args []string) error {
 	fs.IntVar(&l.CertificatesPerDay, "certificates-per-day", l.CertificatesPerDay, "per box a day, as -sends-per-day: renewals under a later certificate, but for one that replaces a revoked certificate (0: off)")
 	fs.IntVar(&l.CertificateRevocationsPerDay, "certificate-revocations-per-day", l.CertificateRevocationsPerDay, "per box a day, as -sends-per-day: raises of its revocation of certificates (0: off)")
 	fs.IntVar(&l.ACLEntries, "acl-entries", l.ACLEntries, "the most entries a box's ACL holds, its two lists together (0: off)")
-	fs.DurationVar(&l.BodyTimeout, "body-timeout", l.BodyTimeout, "how long a request body, or a response, may take before one more second for each -body-min-rate bytes moved; also the longest wait for the one large read (0: off)")
+	fs.DurationVar(&l.BodyTimeout, "body-timeout", l.BodyTimeout, "how long a request body, or a response, may take before one more second for each -body-min-rate bytes moved; a body net/http drains behind an answer written before it was read has this from its head, and the answer this from then; also the longest wait for the one large read (0: off)")
 	fs.IntVar(&l.BodyMinRate, "body-min-rate", l.BodyMinRate, "bytes a second a body must keep up, as Apache's RequestReadTimeout MinRate (0: off)")
 	fs.IntVar(&l.HeadBytes, "max-header-bytes", l.HeadBytes, "the most of a request's head, its request line and headers, the server reads: what the longest call needs, its pass at the longest a pass can be, and no more; net/http answers a longer one 431 (0: net/http's default)")
 	fs.DurationVar(&l.HeadTimeout, "header-timeout", l.HeadTimeout, "how long a request's head, its request line and headers, may take to arrive before any handler sees it (0: off)")

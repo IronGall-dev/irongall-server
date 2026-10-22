@@ -69,8 +69,9 @@ func closesWithin(conn net.Conn, d time.Duration) (bool, string) {
 // any answer: one a handler gives after it reads, and every one written
 // before the body is read, which net/http drains first (#77). Cut off where
 // a handler reads it, the answer is 408 request_timeout (RFC 9110 §15.5.9);
-// behind an answer written first, the peer gets the end of the connection,
-// that answer before it or not.
+// behind an answer written first, the drain is cut and that answer goes
+// out after it, under a write deadline from the read deadline (#82), then
+// the connection ends.
 func TestABodyThatStopsIsCutBehindEveryAnswer(t *testing.T) {
 	nobody := strings.Repeat("ab", 32)
 	cases := []struct {
@@ -79,16 +80,16 @@ func TestABodyThatStopsIsCutBehindEveryAnswer(t *testing.T) {
 		ready   bool
 		spend   bool // spend the address's one call first
 		head    string
-		status  string // the answer's status line, if one is checked
+		status  string // the answer's status
 		limited bool
 	}{
 		{"read by its handler", nil, true, false, "PUT /v1/" + nobody + " HTTP/1.1", "408", false},
-		{"the gate's refusal", func(l *Limits) { l.RequestBurst, l.RequestRefill = 1, time.Hour }, true, true, "POST /v1/" + nobody + "/messages HTTP/1.1", "", true},
-		{"unrouted's refusal", func(l *Limits) { l.RequestBurst, l.RequestRefill = 1, time.Hour }, true, true, "POST /nothing HTTP/1.1", "", true},
-		{"the router's 404", nil, true, false, "POST /v1/" + nobody + "/nothing/here HTTP/1.1", "", false},
-		{"the link page's 405", nil, true, false, "POST " + protocol.LinkPath + nobody + " HTTP/1.1", "", false},
-		{"OPTIONS *", nil, true, false, "OPTIONS * HTTP/1.1", "", false},
-		{"a server not ready", nil, false, false, "PUT /v1/" + nobody + " HTTP/1.1", "", false},
+		{"the gate's refusal", func(l *Limits) { l.RequestBurst, l.RequestRefill = 1, time.Hour }, true, true, "POST /v1/" + nobody + "/messages HTTP/1.1", "429", true},
+		{"unrouted's refusal", func(l *Limits) { l.RequestBurst, l.RequestRefill = 1, time.Hour }, true, true, "POST /nothing HTTP/1.1", "429", true},
+		{"the router's 404", nil, true, false, "POST /v1/" + nobody + "/nothing/here HTTP/1.1", "404", false},
+		{"the link page's 405", nil, true, false, "POST " + protocol.LinkPath + nobody + " HTTP/1.1", "405", false},
+		{"OPTIONS *", nil, true, false, "OPTIONS * HTTP/1.1", "400", false},
+		{"a server not ready", nil, false, false, "PUT /v1/" + nobody + " HTTP/1.1", "503", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -121,21 +122,109 @@ func TestABodyThatStopsIsCutBehindEveryAnswer(t *testing.T) {
 			if !ok {
 				t.Fatalf("a body that stopped after its head: the connection was held past %v", time.Since(start).Round(time.Millisecond))
 			}
-			if c.status != "" && !strings.HasPrefix(got, "HTTP/1.1 "+c.status+" ") {
+			if !strings.HasPrefix(got, "HTTP/1.1 "+c.status+" ") {
 				t.Errorf("answered %.40q, want %s", got, c.status)
 			}
 			if c.status == "408" && !strings.Contains(got, `"code":"request_timeout"`) {
 				t.Errorf("a 408 that is not request_timeout: %q", got)
 			}
-			// An answer written before the body is read follows net/http's
-			// drain of it, which the deadline ends, and may not reach a peer
-			// that stops: what the refusal was, its count says.
 			if d := counts(t, reg, "irongalld_limit_requests_total")["decision=denied,limit=requests,subject=ip"]; c.limited && d != 1 {
 				t.Errorf("refused for the flood budget %v times, want 1", d)
 			}
 			t.Logf("cut after %v", time.Since(start).Round(10*time.Millisecond))
 		})
 	}
+}
+
+// A body that keeps coming above -body-min-rate, behind an answer written
+// before it is read, gets that answer (#82): net/http drains the body with
+// its own reader, which no byte of moves the read deadline, so the drain is
+// cut at -body-timeout from the head, and the answer goes out after it,
+// under a write deadline from that read deadline. Each body is 3,000 bytes at
+// 2,000 a second, where a handler's reads would give it a second and three
+// more; the control is a body its handler reads, answered after the whole of
+// it.
+func TestAnAnswerWrittenFirstOutlivesTheDrainOfItsBody(t *testing.T) {
+	nobody := strings.Repeat("ab", 32)
+	cases := []struct {
+		name   string
+		limits func(*Limits)
+		spend  bool // spend the address's one call first
+		line   string
+		status string
+	}{
+		{"read by its handler (control)", nil, false, "PUT /v1/" + nobody, "400"},
+		{"the router's 404", nil, false, "POST /v1/" + nobody + "/nothing/here", "404"},
+		{"a request no route answers", nil, false, "POST /nothing", "404"},
+		{"the link page's 405", nil, false, "POST " + protocol.LinkPath + nobody, "405"},
+		{"the gate's refusal", func(l *Limits) { l.RequestBurst, l.RequestRefill = 1, time.Hour }, true, "POST /v1/" + nobody + "/messages", "429"},
+		{"a send refused for its pass (no pass)", nil, false, "POST /v1/" + nobody + "/messages", "401"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			l := relaxed()
+			l.BodyTimeout, l.BodyMinRate = time.Second, 1000
+			if c.limits != nil {
+				c.limits(&l)
+			}
+			s := New(Config{Store: NewMemStore(time.Now), Limits: l})
+			addr, _ := served(t, s, l)
+			if c.spend {
+				resp, err := http.Get("http://" + addr + protocol.LinkPath + nobody)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = resp.Body.Close()
+			}
+			status, at, sent := trickle(t, addr, c.line+" HTTP/1.1\r\nHost: "+addr+"\r\nContent-Type: application/json\r\n", 3000, 2000)
+			t.Logf("%q at %v, with %d of 3000 bytes sent", status, at.Round(10*time.Millisecond), sent)
+			if !strings.HasPrefix(status, "HTTP/1.1 "+c.status+" ") {
+				t.Errorf("a body moving at twice -body-min-rate: answered %q, want %s", status, c.status)
+			}
+		})
+	}
+}
+
+// trickle sends head and then size bytes of body at rate bytes a second, in
+// 100-byte pieces, reading the answer as it comes, as a client that reads
+// while it writes does. It returns the answer's status line ("" for none),
+// when it came, and how much of the body went before the server stopped
+// taking it.
+func trickle(t *testing.T, addr, head string, size, rate int) (status string, at time.Duration, sent int) {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := io.WriteString(conn, head+fmt.Sprintf("Content-Length: %d\r\n\r\n", size)); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err == nil {
+			status, at = resp.Proto+" "+resp.Status, time.Since(start)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+	}()
+	for sent < size {
+		n := min(100, size-sent)
+		if _, err := conn.Write([]byte(strings.Repeat(" ", n))); err != nil {
+			break
+		}
+		sent += n
+		time.Sleep(time.Duration(n) * time.Second / time.Duration(rate))
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the connection was held 5 s past the body's end")
+	}
+	return status, at, sent
 }
 
 // An answer its peer never reads is cut off at the write deadline, every

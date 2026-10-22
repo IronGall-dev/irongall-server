@@ -486,9 +486,16 @@ func (s *Server) handle(h func(http.ResponseWriter, *http.Request) error) http.H
 // stops is cut off. It is the outermost wrapper, so no answer goes without
 // it: a refusal at the gate, the router's own, the link page's, a site's
 // (IronGall-dev/irongall-server#31, #77). A body the handler leaves unread
-// is drained by net/http before the answer, under the read deadline, and an
-// answer with no body, or a body's last bytes, is written once the handler
-// returns, under a write deadline set then. Off when either is zero.
+// is drained by net/http before the answer is written, as go1.27's
+// chunkWriter.writeHeader does unless the connection is to close after the
+// answer, up to a bound of net/http's own. It reads with its own reader,
+// which pacedBody never sees, so no byte of the drain moves the read
+// deadline, and the drain is cut there. The answer then goes out, under a
+// write deadline that runs from the later of when it is written and that
+// read deadline (pacedBody.drained): it is set before each write the
+// handler makes, and once more as the handler returns, for an answer with
+// no body or a body's last bytes, which net/http writes then (#82). Off
+// when either is zero.
 func (s *Server) paced(h http.Handler) http.Handler {
 	if s.limits.BodyTimeout <= 0 || s.limits.BodyMinRate <= 0 {
 		return h
@@ -496,12 +503,14 @@ func (s *Server) paced(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rc := http.NewResponseController(w)
 		start := time.Now()
+		var body *pacedBody // nil for a request with no body
 		if r.Body != nil && r.Body != http.NoBody {
-			_ = rc.SetReadDeadline(start.Add(s.limits.BodyTimeout))
-			r.Body = &pacedBody{ReadCloser: r.Body, rc: rc, start: start, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate), m: s.metrics}
+			body = &pacedBody{ReadCloser: r.Body, rc: rc, start: start, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate), m: s.metrics, deadline: start.Add(s.limits.BodyTimeout)}
+			_ = rc.SetReadDeadline(body.deadline)
+			r.Body = body
 		}
-		h.ServeHTTP(&pacedWriter{ResponseWriter: w, rc: rc, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate)}, r)
-		_ = rc.SetWriteDeadline(time.Now().Add(s.limits.BodyTimeout))
+		h.ServeHTTP(&pacedWriter{ResponseWriter: w, rc: rc, body: body, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate)}, r)
+		_ = rc.SetWriteDeadline(body.drained(time.Now()).Add(s.limits.BodyTimeout))
 	})
 }
 
@@ -518,13 +527,22 @@ type pacedBody struct {
 	timeout time.Duration
 	rate    int64
 	m       *Metrics
+	// deadline is the read deadline set last, and ended whether a read has
+	// returned the body's end or an error: after that, net/http drains
+	// nothing of it.
+	deadline time.Time
+	ended    bool
 }
 
 func (p *pacedBody) Read(b []byte) (int, error) {
 	n, err := p.ReadCloser.Read(b)
 	p.got += int64(n)
 	if n > 0 && err == nil {
-		_ = p.rc.SetReadDeadline(p.start.Add(p.timeout + time.Duration(p.got/p.rate)*time.Second))
+		p.deadline = p.start.Add(p.timeout + time.Duration(p.got/p.rate)*time.Second)
+		_ = p.rc.SetReadDeadline(p.deadline)
+	}
+	if err != nil {
+		p.ended = true
 	}
 	if errors.Is(err, os.ErrDeadlineExceeded) {
 		p.m.bodyCut()
@@ -532,17 +550,31 @@ func (p *pacedBody) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// drained is when net/http's drain of what the handler left of the body ends
+// at the latest, for an answer written at now: the read deadline, if the
+// body is still open and that is later, and now otherwise. A write deadline
+// runs from it, so the drain takes none of the answer's time (#82).
+func (p *pacedBody) drained(now time.Time) time.Time {
+	if p == nil || p.ended || !p.deadline.After(now) {
+		return now
+	}
+	return p.deadline
+}
+
 // pacedWriter sets the write deadline before each write, for the bytes it
-// writes.
+// writes, from when net/http's drain of the body ends at the latest
+// (pacedBody.drained), which the first write that reaches the connection
+// waits for.
 type pacedWriter struct {
 	http.ResponseWriter
 	rc      *http.ResponseController
+	body    *pacedBody
 	timeout time.Duration
 	rate    int64
 }
 
 func (p *pacedWriter) Write(b []byte) (int, error) {
-	_ = p.rc.SetWriteDeadline(time.Now().Add(p.timeout + time.Duration(int64(len(b))/p.rate)*time.Second))
+	_ = p.rc.SetWriteDeadline(p.body.drained(time.Now()).Add(p.timeout + time.Duration(int64(len(b))/p.rate)*time.Second))
 	return p.ResponseWriter.Write(b)
 }
 
