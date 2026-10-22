@@ -138,7 +138,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	}
 	switch {
 	case rcpt != nil && rcpt.State == Revoked:
-		return revoked()
+		return revokedWith(rcpt)
 	case !rcpt.open():
 		return noSuchMailbox
 	}
@@ -316,7 +316,7 @@ func (s *Server) deliver(ctx context.Context, p *post) (delivered, error) {
 		}
 		stored = false
 		if cur != nil && cur.State == Revoked {
-			return delivered{}, revoked()
+			return delivered{}, revokedWith(cur)
 		}
 		return delivered{}, noSuchMailbox
 	}

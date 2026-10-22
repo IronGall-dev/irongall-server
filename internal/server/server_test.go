@@ -633,7 +633,8 @@ func TestACursorIsReadBeforeThePass(t *testing.T) {
 
 // A call with two Authorization lines carries no pass, whatever each holds:
 // which of them is the pass is not the server's to choose. It is refused as
-// a call that carries no pass is, and a lookup with two is not one with none.
+// a call that carries no pass is. The read of a box reads none, so it is
+// answered with two as with none (IronGall-dev/irongall-client#352).
 func TestTwoAuthorizationLinesAreNoPass(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
@@ -663,7 +664,7 @@ func TestTwoAuthorizationLinesAreNoPass(t *testing.T) {
 	}
 	seal := e.sealTo(b)
 	e.want(twice("POST", messages+"?"+seal.Encode(), seal.ciphertext, e.pass(a), e.pass(a)), 401, protocol.CodeUnauthorized)
-	e.want(twice("GET", "/v1/"+b.Address().String(), nil, e.pass(a), e.pass(a)), 401, protocol.CodeUnauthorized)
+	e.want(twice("GET", "/v1/"+b.Address().String(), nil, e.pass(a), e.pass(a)), 200, "")
 	e.want(e.do("POST", messages, seal, e.pass(a)), 201, "")
 	e.want(e.do("GET", messages, nil, pass), 200, "")
 }

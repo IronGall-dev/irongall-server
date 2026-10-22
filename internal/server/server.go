@@ -195,10 +195,10 @@ type passRule int
 
 const (
 	// passNone: none. The route reads its pass, if it takes one, after its
-	// body, or takes none.
+	// body, or takes none: the read of a box, which is public, among them.
 	passNone passRule = iota
-	// passAnyBox: the pass's own box's, whichever box the path names: the
-	// read of a box and a send, which a box makes to another.
+	// passAnyBox: the pass's own box's, whichever box the path names: a
+	// send, which a box makes to another.
 	passAnyBox
 	// passPathBox: only the pass of the box the path names: the calls a box
 	// makes about itself, which answer that box's state before they look at
@@ -210,7 +210,7 @@ const (
 // (TestTheRoutesAreTheDescriptions).
 func (s *Server) routes() []route {
 	return []route{
-		{"GET /v1/{addr}", s.getBox, passAnyBox},
+		{"GET /v1/{addr}", s.getBox, passNone},        // it takes no pass
 		{"PUT /v1/{addr}", s.register, passNone},      // its pass is read after its body
 		{"PUT /v1/{addr}/prekey", s.prekey, passNone}, // its pass is read after its body
 		{"PUT /v1/{addr}/revocations", s.revoke, passNone},
@@ -874,33 +874,19 @@ func (s *Server) spendOwner(ctx context.Context, a protocol.Address, also ...per
 	return s.spendCall(a, lim, also...)
 }
 
-// spendLookup spends a call that may carry its caller's pass, a GET of what
-// is public about a box (PROTOCOL.md §4.1): with a pass it is the calling
-// box's, once the pass is checked. With none, its address's flood budget is
-// all it spends, at the gate, and a read that finds no box counts as a miss
-// (lookup).
-func (s *Server) spendLookup(r *http.Request) error {
-	if auth, one := authorization(r); one && auth == "" {
-		return nil
-	}
-	from, err := s.sender(r)
-	if err != nil {
-		return err
-	}
-	return s.spendOwner(r.Context(), from)
-}
-
 var noSuchMailbox = fail(protocol.CodeNoSuchMailbox, "check the address", "no box has this address")
 
 func revoked() *problem {
 	return fail(protocol.CodeRevoked, "the box you named is revoked, forever: ask its owner for their new address", "this box is revoked")
 }
 
-// revokedWith is revoked carrying the record this server holds, as the read
-// of a box answers it (getBox).
-func revokedWith(rec *protocol.Revocations) *problem {
+// revokedWith is revoked carrying the record b holds of the revoked
+// address, its identity with what the identity revoked: every 410 revoked
+// answered from what is held of an address carries it, so a client checks
+// it with no second call (PROTOCOL.md §6.3; IronGall-dev/irongall-client#353).
+func revokedWith(b *Box) *problem {
 	p := revoked()
-	p.record = rec
+	p.record = b.record()
 	return p
 }
 

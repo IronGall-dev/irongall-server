@@ -136,28 +136,49 @@ func errorsAs(err error, ae **client.APIError) bool {
 	return false
 }
 
-// A lookup, the read of a box, is its caller's to pay for, once for each
-// read: with a pass, the box's calls (Limits.CallBurst). With none it spends
-// nothing, as the page a link opens spends nothing: memory answers both, and
-// only a read that finds no box counts, as a miss. A pass that does not
-// verify is refused, not taken as none.
+// A lookup, the read of a box, is its caller's address's to pay for: it
+// takes no pass (PROTOCOL.md §4.1; IronGall-dev/irongall-client#352). Past
+// the gate, where it spends its address's flood budget whatever it carries,
+// a pass this process has checked among them, it spends nothing, as the
+// page a link opens spends nothing: memory answers both, and only a read
+// that finds no box counts, as a miss. Whatever Authorization it carries,
+// no pass is parsed or checked, and none of a box's calls is spent.
 func TestLookupsArePaidByTheirCaller(t *testing.T) {
-	t.Run("with a pass", func(t *testing.T) {
+	t.Run("whatever it carries", func(t *testing.T) {
 		l := relaxed()
-		e := newEnv(t, l)
+		l.CallBurst, l.CallRefill = 1, time.Hour
+		e, _, reg := metered(t, l)
 		a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-		l.CallBurst, l.CallRefill = 2, time.Minute
-		e2, _ := counted(t, e, l)
-		pass := e2.pass(a)
+		e.clock.Add(time.Second) // past the passes the registrations showed
+		pass := e.pass(a)
+		e.want(e.do(http.MethodGet, "/v1/"+a.Address().String()+"/acl", nil, pass), http.StatusOK, "") // a's one call, which checks its pass
+		before := counts(t, reg, "irongalld_passes_total")
 		read := "/v1/" + b.Address().String()
-		for i := range l.CallBurst {
-			if r := e2.do(http.MethodGet, read, nil, pass); r.status != http.StatusOK {
-				t.Fatalf("read %d of %d: refused within the box's calls: %d %s", i+1, l.CallBurst, r.status, r.body)
+		for _, auth := range []string{pass, e.pass(b), "irongall-pass nonsense", "Bearer x", ""} {
+			for range 3 {
+				e.want(e.do(http.MethodGet, read, nil, auth), http.StatusOK, "")
 			}
 		}
-		e2.want(e2.do(http.MethodGet, read, nil, pass), http.StatusTooManyRequests, protocol.CodeRateLimited)
-		e2.want(e2.do(http.MethodGet, read, nil, ""), http.StatusOK, "") // the address's calls are its own
-		e2.want(e2.do(http.MethodGet, read, nil, "irongall-pass nonsense"), http.StatusUnauthorized, protocol.CodeUnauthorized)
+		if d := moved(before, counts(t, reg, "irongalld_passes_total")); len(d) != 0 {
+			t.Errorf("reads of a box looked at passes: %v", d)
+		}
+		e.limited(e.do(http.MethodGet, "/v1/"+a.Address().String()+"/acl", nil, pass), protocol.QuotaCalls) // the one it spent, and none by the reads
+	})
+	t.Run("its address's flood budget, with a pass checked", func(t *testing.T) {
+		l := relaxed()
+		l.RequestBurst, l.RequestRefill = 2, time.Hour
+		e := newEnv(t, l)
+		call := e.caller()
+		r := e.raw()
+		r.prekey(1, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+		e.want(call("10.0.0.1", "PUT", r.path(""), r.registration(1), r.pass(1)), http.StatusCreated, "")
+		pass := r.pass(1)
+		e.want(call("10.0.0.2", "GET", r.path("/messages"), nil, pass), http.StatusOK, "") // checked, of a box live in memory
+		for range l.RequestBurst {
+			e.want(call("10.0.0.3", "GET", r.path(""), nil, pass), http.StatusOK, "")
+		}
+		e.limited(call("10.0.0.3", "GET", r.path(""), nil, pass), protocol.QuotaRequests)
+		e.want(call("10.0.0.3", "GET", r.path("/messages"), nil, pass), http.StatusOK, "") // a call that takes the pass is its box's
 	})
 	t.Run("with none", func(t *testing.T) {
 		l := relaxed()
@@ -301,17 +322,17 @@ func TestATakerCannotHoldTheRemedyBack(t *testing.T) {
 	l.CallBurst, l.CallRefill = DefaultLimits().CallBurst, DefaultLimits().CallRefill
 	l.CertificatesPerDay, l.CertificateRevocationsPerDay = 1, 1
 	e := newEnv(t, l)
-	r, other := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+	r := e.raw().register(protocol.MaxPrekeyLifetime)
 	until := e.clock.Now().Add(protocol.PrekeyLifetime)
 	r.prekey(1000, until, nil)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(1000), r.pass(1000)), http.StatusOK, "") // the day's one certificate
 	taken := r.pass(1000)
-	for e.do("GET", other.path(""), nil, taken).status == http.StatusOK {
+	for e.do("GET", r.path("/acl"), nil, taken).status == http.StatusOK {
 	}
 	r.prekey(2000, until, nil)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(2000), r.pass(2000)), http.StatusTooManyRequests, protocol.CodeRateLimited) // held back by the taker
 	e.want(e.do("PUT", r.path("/revocations"), r.certs(1000), ""), http.StatusOK, "")
-	e.want(e.do("GET", other.path(""), nil, taken), http.StatusUnauthorized, protocol.CodeCertificateRevoked)
+	e.want(e.do("GET", r.path("/acl"), nil, taken), http.StatusUnauthorized, protocol.CodeCertificateRevoked)
 	e.clock.Add(l.CallRefill)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(2000), r.pass(2000)), http.StatusOK, "")
 }

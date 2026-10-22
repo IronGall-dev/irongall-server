@@ -28,7 +28,7 @@ type problem struct {
 	hint       string
 	retryAfter time.Duration // 429 and 503
 	values     []value
-	record     *protocol.Revocations // revoked, on the read of a box
+	record     *protocol.Revocations // revoked: the record held of the address (revokedWith)
 	quota      protocol.Quota        // rate_limited: the limit, and from it whom it was counted against
 }
 

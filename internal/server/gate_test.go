@@ -92,10 +92,11 @@ func respelled(t *testing.T, pass string) string {
 // carries, with nothing else done: no other count of any limit taken, no
 // pass parsed or checked, no box looked up, no body read. The one call that
 // goes on is a box's: a pass this process has checked, of a box that is
-// live, to a route that takes that box's pass (a read of a box and a send
-// take any box's, a call about a box only its own). Its answer moves a count
-// of its box's, whatever it is. A new route is held to this by being one of
-// routes(), and a new state by being one of these.
+// live, to a route that takes that box's pass (a send takes any box's, a
+// call about a box only its own, and the read of a box none:
+// IronGall-dev/irongall-client#352). Its answer moves a count of its box's,
+// whatever it is. A new route is held to this by being one of routes(), and
+// a new state by being one of these.
 func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 	l := relaxed()
 	l.RequestBurst, l.RequestRefill = 1, time.Hour
@@ -129,13 +130,14 @@ func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 	}
 	live, livePass := checked()
 	other, otherPass := checked()
-	// A box whose pass was checked by a read of another box, which loads
+	// A box whose pass was checked by a send to another box, which loads
 	// nothing into memory but its record: a box that sends and never polls.
+	// The send names no prekey, so it is refused once the pass is checked.
 	sender := e.raw()
 	sender.prekey(1, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
 	e.want(call(fresh(), "PUT", sender.path(""), sender.registration(1), sender.pass(1)), http.StatusCreated, "")
 	senderPass := sender.pass(1)
-	e.want(call(fresh(), "GET", other.path(""), nil, senderPass), http.StatusOK, "")
+	e.want(call(fresh(), "POST", other.path("/messages"), nil, senderPass), http.StatusBadRequest, protocol.CodeBadRequest)
 	revoked, revokedPass := checked()
 	rev, err := protocol.SignRevocation(revoked.signer, revoked.id.Address())
 	if err != nil {

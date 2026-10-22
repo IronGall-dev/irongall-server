@@ -112,17 +112,33 @@ func (ps *passes) forget(a protocol.Address, p seenPass) {
 
 // standingOf returns what checking box a's pass needs: from memory when this
 // process holds the box, so that a poll never leaves it, and otherwise from
-// what is held of the address (lookup). ok is false for an address with no
-// box.
-func (s *Server) standingOf(r *http.Request, a protocol.Address) (st Standing, ok bool, err error) {
+// what is held of the address (lookup), which it returns as b. ok is false
+// for an address with no box.
+func (s *Server) standingOf(r *http.Request, a protocol.Address) (st Standing, b *Box, ok bool, err error) {
 	if st, ok := s.store.Held(a); ok {
-		return st, true, nil
+		return st, nil, true, nil
 	}
-	b, err := s.lookup(r, a)
-	if err != nil || b == nil {
-		return Standing{}, false, err
+	if b, err = s.lookup(r, a); err != nil || b == nil {
+		return Standing{}, nil, false, err
 	}
-	return b.standing()
+	st, ok, err = b.standing()
+	return st, b, ok, err
+}
+
+// revokedAt is revoked for a call about revoked address a, which carries
+// the record where it is at hand: in b, what standingOf read, or in memory
+// (Known). A standing in memory alone holds no record, and a call that has
+// shown no pass is never made to read one, so that a poll never leaves the
+// process: then the answer carries none, and its client reads the box
+// (PROTOCOL.md §6.3).
+func (s *Server) revokedAt(a protocol.Address, b *Box) *problem {
+	if b == nil {
+		b, _ = s.store.Known(a)
+	}
+	if b == nil || b.State != Revoked {
+		return revoked()
+	}
+	return revokedWith(b)
 }
 
 // serverName is the name the caller called this server by, if it is one of
@@ -353,12 +369,12 @@ func (s *Server) owner(r *http.Request, params ...string) (protocol.Address, err
 	if err != nil {
 		return a, err
 	}
-	st, ok, err := s.standingOf(r, a)
+	st, b, ok, err := s.standingOf(r, a)
 	switch {
 	case err != nil:
 		return a, err
 	case st.State == Revoked:
-		return a, revoked()
+		return a, s.revokedAt(a, b)
 	case !ok, st.State != Active: // no box, or none in the state that takes calls
 		return a, noSuchMailbox
 	case st.Listed:
@@ -376,7 +392,7 @@ func (s *Server) sender(r *http.Request) (protocol.Address, error) {
 		return protocol.Address{}, s.notAPass(r)
 	}
 	a := p.Address
-	st, ok, err := s.standingOf(r, a)
+	st, _, ok, err := s.standingOf(r, a)
 	switch {
 	case err != nil:
 		return a, err

@@ -150,6 +150,13 @@ func (r *Revocations) merge(o *Revocations) {
 	}
 }
 
+// record is the revocation record of what b holds of its identity's
+// revocations, as a client reads one (PROTOCOL.md §6.3): served by
+// GET …/revocations, and carried by a 410 revoked (revokedWith).
+func (b *Box) record() *protocol.Revocations {
+	return &protocol.Revocations{Identity: b.Identity, Revocation: b.Revocation, RevokedCertificates: b.RevokedCerts, RevokedCertificatesSignature: b.RevokedCertsSig}
+}
+
 // revocations returns what b holds of its identity's revocations, or nil.
 func (b *Box) revocations() (*Revocations, error) {
 	if len(b.Revocation) == 0 && len(b.RevokedCerts) == 0 {

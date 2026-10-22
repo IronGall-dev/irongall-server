@@ -154,7 +154,7 @@ func settled(b *Box) bool { return b.open() || b != nil && b.State == Revoked }
 func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol.Identity, cur *Box, req *protocol.RegisterRequest, bounded bool) error {
 	switch {
 	case cur.State == Revoked:
-		return revoked()
+		return revokedWith(cur)
 	case !bytes.Equal(cur.Identity, req.Identity) || !bytes.Equal(cur.Statement, req.Prekey) || !bytes.Equal(cur.Signature, req.PrekeySignature):
 		return fail(protocol.CodeConflict, "registered: to replace its prekey, irongall prekey renew", "this address is registered with another prekey")
 	}
@@ -287,7 +287,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	case err != nil:
 		return err
 	case b != nil && b.State == Revoked:
-		return revoked()
+		return revokedWith(b)
 	case !b.open(): // a box the server forgot comes back by a registration (PROTOCOL.md §6.4)
 		return noSuchMailbox
 	}
@@ -419,12 +419,11 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 // address is 410 with its record, which proves itself: a client takes
 // "revoked" on nothing less, and needs no second call for it. An address
 // with no box is 404, whatever its identity revoked of its certificates.
-// Like every lookup it takes a pass or none (spendLookup). It is the one
+// It takes no pass: it is public, and the gate counts it by the address it
+// comes from, whatever Authorization it carries, which nothing here reads
+// (PROTOCOL.md §4.1, §8; IronGall-dev/irongall-client#352). It is the one
 // answer of the API that is gzipped, to a request that takes it.
 func (s *Server) getBox(w http.ResponseWriter, r *http.Request) error {
-	if err := s.spendLookup(r); err != nil {
-		return err
-	}
 	h, err := pathAddr(r)
 	if err != nil {
 		return err
@@ -434,7 +433,7 @@ func (s *Server) getBox(w http.ResponseWriter, r *http.Request) error {
 	case err != nil:
 		return err
 	case b != nil && b.State == Revoked:
-		return revokedWith(&protocol.Revocations{Identity: b.Identity, Revocation: b.Revocation, RevokedCertificates: b.RevokedCerts, RevokedCertificatesSignature: b.RevokedCertsSig})
+		return revokedWith(b)
 	case !b.open():
 		return noSuchMailbox
 	}
@@ -462,7 +461,7 @@ func (s *Server) getRevocations(w http.ResponseWriter, r *http.Request) error {
 	case b == nil || len(b.Revocation) == 0 && len(b.RevokedCerts) == 0:
 		return fail(protocol.CodeNotRevoked, "nothing to do: this server holds no revocation of that address. That is its word, and another server or the box's owner may hold one", "no revocation of this address is held here")
 	}
-	writeJSON(w, http.StatusOK, &protocol.Revocations{Identity: b.Identity, Revocation: b.Revocation, RevokedCertificates: b.RevokedCerts, RevokedCertificatesSignature: b.RevokedCertsSig})
+	writeJSON(w, http.StatusOK, b.record())
 	return nil
 }
 
@@ -545,7 +544,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 		if err := s.deleteHeld(detached(r.Context()), b); err != nil {
 			return err
 		}
-		return revoked()
+		return revokedWith(b)
 	}
 	var held *protocol.RevokedCertificates
 	if b != nil && len(b.RevokedCerts) > 0 {
