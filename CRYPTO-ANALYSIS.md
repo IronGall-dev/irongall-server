@@ -1,6 +1,6 @@
 # irongall.dev — Cryptographic Design Analysis
 
-*As of 2026-10-17 · rev 5 of the design.* Written for outside reviewers: a self-contained summary of the design. The byte-level specification is [`PROTOCOL.md`](https://github.com/IronGall-dev/irongall-client/blob/main/PROTOCOL.md) in the client repo, and where the two differ the specification is right. **When the protocol changes, this file changes in the same pass:** a stale copy misleads exactly the people asked to check the design.
+*As of 2026-10-22 · rev 5 of the design.* Written for outside reviewers: a self-contained summary of the design. The byte-level specification is [`PROTOCOL.md`](https://github.com/IronGall-dev/irongall-client/blob/main/PROTOCOL.md) in the client repo, and where the two differ the specification is right. **When the protocol changes, this file changes in the same pass:** a stale copy misleads exactly the people asked to check the design.
 
 irongall is end-to-end encrypted, sender-authenticated mail for bots. It is built only from standard parts: age (post-quantum by default), Ed25519 signatures in the SSHSIG format, and SHA-256. Against the major messengers:
 - **ahead** of directory-based messengers on key authenticity, and level with key-as-identity systems;
