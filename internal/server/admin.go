@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The operator's interface: commands for whoever runs this server, never
@@ -69,17 +70,28 @@ func (s *Server) Top(name string, n int) (top []Indebted, ok bool) {
 	if !ok {
 		return nil, false
 	}
+	type debt struct {
+		key string
+		in  time.Duration // until the key's bucket is full again
+	}
+	var debts []debt
 	now := s.now()
 	bs.mu.Lock()
 	for k, full := range bs.full {
 		if full.After(now) {
-			top = append(top, Indebted{k, int64(retrySeconds(full.Sub(now)))})
+			debts = append(debts, debt{k, full.Sub(now)})
 		}
 	}
 	bs.mu.Unlock()
-	slices.SortFunc(top, func(a, b Indebted) int { return cmp.Or(cmp.Compare(b.FullIn, a.FullIn), cmp.Compare(a.Key, b.Key)) })
-	if len(top) > n {
-		top = top[:n]
+	// By the exact time, and only what is shown rounded: rounded first, keys
+	// within a second of each other would be listed by name
+	// (IronGall-dev/irongall-server#63).
+	slices.SortFunc(debts, func(a, b debt) int { return cmp.Or(cmp.Compare(b.in, a.in), cmp.Compare(a.key, b.key)) })
+	if len(debts) > n {
+		debts = debts[:n]
+	}
+	for _, d := range debts {
+		top = append(top, Indebted{d.key, int64(retrySeconds(d.in))})
 	}
 	return top, true
 }

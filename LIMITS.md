@@ -72,6 +72,7 @@ Every route begins at its gate: a call that is its box's (rule 1) goes on to the
 5. **A pass is checked once in each process,** at two signature checks; after that it is a lookup in memory.
 6. **The one large read can still be held for as long as a body takes at the minimum rate:** for a body of the largest cap, hours. Only a box whose account lifts its cap can take it, and a send waiting for it gives up after `-body-timeout`.
 7. **Nothing bounds how many sends wait for the large read,** and each holds the free size it has read while it waits.
+8. **A count given back after its key's refill caught up returns a token a later call took** (#37): a count is given back as Let's Encrypt's limiter refunds one, one interval off its key's time and never before now, so each reservation held while its key's bucket refilled, then given back, lets one call more through than the bucket held.
 
 ## The operator: clearing an address, and who spends a limit most
 

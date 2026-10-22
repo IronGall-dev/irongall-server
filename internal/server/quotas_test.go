@@ -359,3 +359,37 @@ func TestLimitsTop(t *testing.T) {
 		t.Fatal("limits top knows a limit that is none")
 	}
 }
+
+// limits top orders by the exact time to full, not by the seconds it shows
+// (IronGall-dev/irongall-server#63). With the flood budget at its defaults,
+// 100 at once and one back each 20 ms, an address that spent 100 of 100 is
+// deeper in debt than one that spent 51, though both show 2 s, and is the
+// one -n 1 lists.
+func TestLimitsTopListsTheDeepestInDebtFirst(t *testing.T) {
+	l := relaxed()
+	l.RequestBurst, l.RequestRefill = DefaultLimits().RequestBurst, DefaultLimits().RequestRefill
+	e := newEnv(t, l)
+	call := e.caller()
+	const deep, shallow = "198.51.100.9", "198.51.100.10" // as strings, the shallow one sorts first
+	for range 100 {
+		call(deep, "GET", "/nothing", nil, "")
+	}
+	for range 51 {
+		call(shallow, "GET", "/nothing", nil, "")
+	}
+	full := func(key string) time.Duration {
+		bs := e.server.requests
+		bs.mu.Lock()
+		defer bs.mu.Unlock()
+		return bs.full[key].Sub(e.clock.Now())
+	}
+	if full(deep) <= full(shallow) {
+		t.Fatalf("the setup: %s full in %s, %s in %s", deep, full(deep), shallow, full(shallow))
+	}
+	two, _ := e.server.Top(string(protocol.QuotaRequests), 2)
+	one, _ := e.server.Top(string(protocol.QuotaRequests), 1)
+	if len(one) != 1 || one[0].Key != deep || len(two) != 2 || two[1].Key != shallow || two[0].FullIn != two[1].FullIn {
+		t.Fatalf("limits top -limit requests -n 1 lists %+v and -n 2 %+v, want %s (full in %s) before %s (full in %s), both shown as the same second",
+			one, two, deep, full(deep), shallow, full(shallow))
+	}
+}

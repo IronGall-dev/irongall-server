@@ -275,8 +275,11 @@ func (bs *buckets) take(key string, now time.Time) (ok bool, wait time.Duration)
 }
 
 // giveLocked puts back a token taken for key, for a call that turned out not
-// to count: a reservation released. It never fills a bucket past full. The
-// caller holds bs.mu.
+// to count: a reservation released. It never fills a bucket past full. It is
+// Let's Encrypt's refund (Boulder's maybeRefund): one interval off the key's
+// time, never before now, so a release after the key's refill caught up gives
+// back a token a later call took (LIMITS.md § Known weaknesses). The caller
+// holds bs.mu.
 func (bs *buckets) giveLocked(key string, now time.Time) {
 	full, ok := bs.full[key]
 	if !ok {
