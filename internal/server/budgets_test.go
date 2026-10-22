@@ -314,9 +314,10 @@ func TestTheIdentitysActsAreCountedApart(t *testing.T) {
 // pass, and so hold back a renewal (this repo's #35). It cannot hold back the
 // identity's raise of the revocation of certificates, which carries no pass
 // and spends a count no renewal spends. Once that is taken, the taken pass is
-// refused, the box's calls come back, and the renewal that replaces the
-// revoked certificate is taken, with the identity's certificates for the day
-// spent.
+// refused, and the renewal that replaces the revoked certificate is taken at
+// once, with the box's calls and the identity's certificates for the day
+// spent: it spends none of the box's counts (#84). The calls are still
+// spent after it.
 func TestATakerCannotHoldTheRemedyBack(t *testing.T) {
 	l := relaxed()
 	l.CallBurst, l.CallRefill = DefaultLimits().CallBurst, DefaultLimits().CallRefill
@@ -333,8 +334,8 @@ func TestATakerCannotHoldTheRemedyBack(t *testing.T) {
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(2000), r.pass(2000)), http.StatusTooManyRequests, protocol.CodeRateLimited) // held back by the taker
 	e.want(e.do("PUT", r.path("/revocations"), r.certs(1000), ""), http.StatusOK, "")
 	e.want(e.do("GET", r.path("/acl"), nil, taken), http.StatusUnauthorized, protocol.CodeCertificateRevoked)
-	e.clock.Add(l.CallRefill)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(2000), r.pass(2000)), http.StatusOK, "")
+	e.limited(e.do("GET", r.path("/acl"), nil, r.pass(2000)), protocol.QuotaCalls)
 }
 
 // A pass that fails costs signature checks that nothing paid for, so it is

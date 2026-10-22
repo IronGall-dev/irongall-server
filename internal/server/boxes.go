@@ -360,25 +360,31 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	// A renewal under the box's current certificate counts against the
 	// box's renewals; one under a later certificate is its identity's act,
 	// counted apart, so whoever holds the current working key and spends the
-	// renewals does not hold back the identity's. One while the box's current
-	// certificate is revoked is not counted: it replaces what the identity
-	// revoked, each raise of which is counted (revoke). Let's Encrypt's
-	// exemption is broader: PRECEDENTS.md in the client repo. The count is
-	// read with the box's calls, so a refusal of either gives the longer wait
-	// (longest).
+	// renewals does not hold back the identity's. The count is read with the
+	// box's calls, so a refusal of either gives the longer wait (longest).
+	// One while the box's current certificate is revoked spends none of the
+	// box's counts, its calls among them: it replaces what the identity
+	// revoked, each raise of which is counted (revoke), and whoever held the
+	// taken working key may have spent the calls before the raise (#84). It
+	// was counted at the gate, against its address's flood budget, as every
+	// renewal is. Let's Encrypt exempts more renewals than this, from every
+	// limit: why ours differs is PRECEDENTS.md in the client repo.
 	var count []perDay
+	replaces := false
 	switch {
 	case cert.Serial() == b.CertSerial:
 		count = []perDay{s.renewalsADay()}
 	default:
-		if replaces, err := b.listed(b.CertSerial); err != nil {
+		if replaces, err = b.listed(b.CertSerial); err != nil {
 			return err
 		} else if !replaces {
 			count = []perDay{s.certificatesADay()}
 		}
 	}
-	if err := s.spendOwner(r.Context(), h, count...); err != nil {
-		return err
+	if !replaces {
+		if err := s.spendOwner(r.Context(), h, count...); err != nil {
+			return err
+		}
 	}
 	now := s.now()
 	var counted *reservation // nil, so kept and given back as nothing, when the renewal is not counted
