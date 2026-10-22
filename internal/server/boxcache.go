@@ -74,6 +74,11 @@ func (c *recCache[K, V]) put(v V) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.putLocked(v)
+}
+
+// putLocked is put under c.mu. It reports whether the cache held v's key.
+func (c *recCache[K, V]) putLocked(v V) (held bool) {
 	k := c.key(v)
 	if e, ok := c.m[k]; ok {
 		switch {
@@ -83,7 +88,7 @@ func (c *recCache[K, V]) put(v V) {
 			e.Value = c.clone(v)
 		}
 		c.ll.MoveToFront(e)
-		return
+		return true
 	}
 	c.m[k] = c.ll.PushFront(c.clone(v))
 	for c.ll.Len() > c.max {
@@ -91,6 +96,26 @@ func (c *recCache[K, V]) put(v V) {
 		c.ll.Remove(old)
 		delete(c.m, c.key(old.Value.(V)))
 		c.noted("eviction")
+	}
+	return false
+}
+
+// fill caches v, a view made from a read, or from one before a write, as put
+// does, but for a key the cache did not hold only while fresh reports that no
+// write to it was seen since that read began: refresh and modify act only on
+// a key held, so the image of a change made meanwhile was dropped, and v may
+// be older than it (IronGall-dev/irongall-server#12, #41). A key held has had
+// every image applied, and the merge keeps what each copy holds. fresh is
+// asked after the put, so an image that lands later applies to the entry.
+func (c *recCache[K, V]) fill(v V, fresh func() bool) {
+	if c.max == 0 {
+		return
+	}
+	c.mu.Lock()
+	held := c.putLocked(v)
+	c.mu.Unlock()
+	if !held && !fresh() {
+		c.evict(c.key(v))
 	}
 }
 
@@ -210,6 +235,23 @@ func (c *missCache) missed(a protocol.Address, seq uint64, now time.Time) {
 		}
 	}
 	c.until[a] = now.Add(missTTL)
+}
+
+// seqOf returns the write count of a's shard: a read begun at it is fresh
+// while it is unchanged.
+func (c *missCache) seqOf(a protocol.Address) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.seq[a[0]]
+}
+
+// remembered reports whether a is remembered as missing, expired or not: no
+// write to it was seen since the read that found it missing.
+func (c *missCache) remembered(a protocol.Address) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.until[a]
+	return ok
 }
 
 // wrote records that box a has a record.

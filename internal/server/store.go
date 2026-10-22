@@ -218,21 +218,50 @@ func (b *Box) withRevocations(rv *Revocations) (*Box, error) {
 
 // mergeViews is what two reads of one address hold together: the record of
 // the higher rev, and every revocation either holds, since none is ever
-// taken away.
+// taken away: the revocation of the address if either holds it, and the
+// higher revocation of its certificates (higherCerts). Nothing is dropped
+// for a list that does not parse (IronGall-dev/irongall-server#64).
 func mergeViews(old, cur *Box) *Box {
 	base, other := cur, old
 	if old.Rev > cur.Rev {
 		base, other = old, cur
 	}
-	rv, err := other.revocations()
-	if err != nil {
-		return cloneBox(base)
+	m := cloneBox(base)
+	if len(m.Identity) == 0 {
+		m.Identity = other.Identity
 	}
-	m, err := base.withRevocations(rv)
-	if err != nil {
-		return cloneBox(base)
+	if len(m.Revocation) == 0 {
+		m.Revocation = other.Revocation
+	}
+	if len(m.Revocation) > 0 {
+		m.State = Revoked
+	}
+	if higherCerts(other, m) {
+		m.RevokedCerts, m.RevokedCertsSig = slices.Clone(other.RevokedCerts), slices.Clone(other.RevokedCertsSig)
 	}
 	return m
+}
+
+// higherCerts reports whether o's revocation of certificates is to stand in
+// place of b's: o holds one and b none, or o's reaches higher. One that does
+// not parse stands in place of one that does, so that its next use fails as
+// listNames does, closed.
+func higherCerts(o, b *Box) bool {
+	switch {
+	case len(o.RevokedCerts) == 0:
+		return false
+	case len(b.RevokedCerts) == 0:
+		return true
+	}
+	oc, oerr := protocol.ParseRevokedCertificates(o.RevokedCerts)
+	bc, berr := protocol.ParseRevokedCertificates(b.RevokedCerts)
+	switch {
+	case berr != nil:
+		return false
+	case oerr != nil:
+		return true
+	}
+	return oc.Through > bc.Through
 }
 
 // listNames reports whether a stored revocation of certificates covers a

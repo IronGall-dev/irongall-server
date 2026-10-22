@@ -49,8 +49,8 @@ type DynamoStore struct {
 	now    func() time.Time
 	log    *log.Logger
 
-	// consistent makes every read strongly consistent; otherwise only a
-	// box's load into memory is (DynamoConfig.ConsistentReads).
+	// consistent makes every read strongly consistent; otherwise only the
+	// reads that fill memory are (DynamoConfig.ConsistentReads).
 	consistent bool
 	// loads counts boxes read into memory, for tests.
 	loads atomic.Int64
@@ -65,8 +65,13 @@ type DynamoStore struct {
 	fatal    func(error)
 	ready    atomic.Bool
 
+	// accWrites counts the changes to account records seen on the stream: an
+	// account's read begun at one count fills the cache only while it stands
+	// (recCache.fill). Accounts change seldom, so one count serves them all.
+	accWrites atomic.Uint64
+
 	// fault, in tests, fails a write sequence at a named point, as a crash
-	// there would leave it.
+	// there would leave it, or does there what a test needs to happen then.
 	fault func(point string) error
 }
 
@@ -82,8 +87,10 @@ type DynamoConfig struct {
 	Log            *log.Logger   // nil: no log
 	// ConsistentReads makes every read strongly consistent, at twice the
 	// read units: for tests, which read back what they wrote within
-	// milliseconds. Otherwise only a box's load into memory is: a strongly
-	// consistent read costs twice the read units, and polls are the load. A
+	// milliseconds. Otherwise only the reads that fill memory are, a box's
+	// load and a read of what is held of an address, since a stale copy
+	// there would decide later answers: a strongly consistent read costs
+	// twice the read units, and polls are the load, which never fill. A
 	// stale read elsewhere costs a retry or one poll; the conditional writes
 	// keep the data right.
 	ConsistentReads bool
@@ -556,6 +563,9 @@ func (s *DynamoStore) readAddress(ctx context.Context, a protocol.Address, consi
 			}
 		}
 	}
+	if err := s.failAt("address: after the read"); err != nil {
+		return nil, nil, err
+	}
 	return rec, rv, nil
 }
 
@@ -673,12 +683,13 @@ func (s *DynamoStore) ensure(ctx context.Context, a protocol.Address) error {
 func (s *DynamoStore) readBox(ctx context.Context, a protocol.Address) (boxRead, error) {
 	s.loads.Add(1)
 	var r boxRead
+	seq := s.misses.seqOf(a)
 	rec, rv, err := s.readAddress(ctx, a, true)
 	if err != nil {
 		return r, err
 	}
 	if b := view(a, rec, rv); b != nil {
-		s.cache.put(b)
+		s.cache.fill(b, func() bool { return s.misses.seqOf(a) == seq })
 	}
 	if rv != nil {
 		r.revoked, r.through = len(rv.Address) > 0, rv.Through
@@ -729,10 +740,14 @@ func (s *DynamoStore) liveQuery(box protocol.Address, lo []byte, consistent bool
 func (s *DynamoStore) Held(a protocol.Address) (Standing, bool) { return s.idx.standing(a) }
 
 // applyBox records a box record this process wrote: b is what is held of
-// its address, the record and the revocations read with it.
+// its address, the record and the revocations read with it. Those were read
+// before the write, so b joins the cache only where the cache holds the
+// address, every image since applied to it, or where the read before a
+// registration found it missing and no write to it has been seen since
+// (recCache.fill). The write is recorded after, so that it ends that miss.
 func (s *DynamoStore) applyBox(b *Box) {
+	s.cache.fill(b, func() bool { return s.misses.remembered(b.Addr) })
 	s.misses.wrote(b.Addr)
-	s.cache.put(b)
 	st, _, err := storedRecord(b).standing()
 	if err != nil { // a record this process just checked and wrote
 		s.logf("boxes: a record written with a bad identity: %v", err)
@@ -764,7 +779,10 @@ func (s *DynamoStore) forget(a protocol.Address) {
 
 // Box implements Store: the cache, or a read. An address the read finds
 // nothing of is remembered as missing for a while (missCache), so naming it
-// again costs no read.
+// again costs no read. The read fills the cache, so it is strongly
+// consistent, as a box's load is: a write made before it is in it, and one
+// made after reaches the cache by the stream, or, where its image came
+// before the fill, keeps the fill out (recCache.fill).
 func (s *DynamoStore) Box(ctx context.Context, a protocol.Address) (*Box, error) {
 	if b, ok := s.cache.get(a); ok {
 		return b, nil
@@ -773,7 +791,7 @@ func (s *DynamoStore) Box(ctx context.Context, a protocol.Address) (*Box, error)
 	if missing {
 		return nil, ErrNotFound
 	}
-	rec, rv, err := s.readAddress(ctx, a, s.consistent)
+	rec, rv, err := s.readAddress(ctx, a, true)
 	if err != nil {
 		return nil, err
 	}
@@ -782,7 +800,7 @@ func (s *DynamoStore) Box(ctx context.Context, a protocol.Address) (*Box, error)
 		s.misses.missed(a, seq, s.now())
 		return nil, ErrNotFound
 	}
-	s.cache.put(b)
+	s.cache.fill(b, func() bool { return s.misses.seqOf(a) == seq })
 	return b, nil
 }
 

@@ -77,8 +77,12 @@ func (s *DynamoStore) Account(ctx context.Context, id string) (*Account, error) 
 	if a, ok := s.accCache.get(id); ok {
 		return a, nil
 	}
+	seq := s.accWrites.Load()
 	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.accts, Key: accountKey(id, skAccount), ConsistentRead: aws.Bool(true)})
 	if err != nil {
+		return nil, err
+	}
+	if err := s.failAt("account: after the read"); err != nil {
 		return nil, err
 	}
 	if out.Item == nil {
@@ -88,7 +92,7 @@ func (s *DynamoStore) Account(ctx context.Context, id string) (*Account, error) 
 	if err != nil {
 		return nil, err
 	}
-	s.accCache.put(a)
+	s.accCache.fill(a, func() bool { return s.accWrites.Load() == seq })
 	return a, nil
 }
 
@@ -281,6 +285,7 @@ func (s *DynamoStore) applyAccountRecord(r stypes.Record) {
 			return
 		}
 		if rec {
+			s.accWrites.Add(1)
 			s.accCache.evict(id)
 		}
 		return
@@ -294,6 +299,7 @@ func (s *DynamoStore) applyAccountRecord(r stypes.Record) {
 	if !rec {
 		return
 	}
+	s.accWrites.Add(1)
 	rev, err := it.uint("rev")
 	if err != nil {
 		s.logf("accounts: skipping an account record: %v", err)
