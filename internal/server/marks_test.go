@@ -27,8 +27,9 @@ import (
 // alike, with no key, and an empty box's is the same on every server. A tag
 // of the page before, the old "<count>-<version>" form among them, is not
 // the page's. Weak comparison: W/ is read past, and * names any page. A page
-// after the first carries none and is never 304. Every answer carries the
-// poll interval in Retry-After, a 304's too.
+// after the first carries none, so no tag names it, and only * makes it 304
+// (IronGall-dev/irongall-server#86). Every answer carries the poll interval
+// in Retry-After, a 304's too.
 func TestAFirstPageIsNotModifiedWhileUnchanged(t *testing.T) {
 	l := relaxed()
 	l.PairCap, l.BoxCap = 0, 0
@@ -93,11 +94,11 @@ func TestAFirstPageIsNotModifiedWhileUnchanged(t *testing.T) {
 		t.Errorf("a box holding %d, sent its own page's tag: %d, want 304", n, resp.StatusCode)
 	}
 	// A cursor after every message: a poll, answered with an empty page that
-	// is not the first, so neither tagged nor 304, whatever it sends.
+	// is not the first, so untagged, and 304 only to *, which names any page.
 	last := formatCursor(Header{ReceivedAt: e.clock.Now().Add(time.Hour)})
-	for _, tag := range []string{"", "*", held} {
-		if resp, _ := poll("?cursor="+last, tag); resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != "" {
-			t.Errorf("a page after the first, If-None-Match %q: %d, ETag %q, want 200 and none", tag, resp.StatusCode, resp.Header.Get("ETag"))
+	for tag, status := range map[string]int{"": http.StatusOK, "*": http.StatusNotModified, held: http.StatusOK} {
+		if resp, _ := poll("?cursor="+last, tag); resp.StatusCode != status || resp.Header.Get("ETag") != "" {
+			t.Errorf("a page after the first, If-None-Match %q: %d, ETag %q, want %d and none", tag, resp.StatusCode, resp.Header.Get("ETag"), status)
 		}
 	}
 }

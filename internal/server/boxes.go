@@ -92,6 +92,12 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	if err := s.checkPassBounded(r, h, string(id.PublicKey().Marshal()), certHash(cert), cert.Serial()); err != nil {
 		return err
 	}
+	// No box is registered here: an If-Match is false, and If-None-Match: *
+	// holds (conditions). One registered meanwhile answers from its record,
+	// below, where If-None-Match: * is false.
+	if err := conditions(r, false, "", hintConditions); err != nil {
+		return err
+	}
 	now := s.now()
 	b := &Box{
 		Addr:           h,
@@ -175,6 +181,9 @@ func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol
 		if err := s.spendOwner(r.Context(), cur.Addr); err != nil {
 			return err
 		}
+	}
+	if err := conditions(r, true, "", hintConditions); err != nil {
+		return err
 	}
 	writeJSON(w, http.StatusOK, struct{}{}) // an identical retry
 	return nil
@@ -313,6 +322,9 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 		if err := s.spendOwner(r.Context(), h); err != nil {
 			return err
 		}
+		if err := conditions(r, true, "", hintConditions); err != nil {
+			return err
+		}
 		writeJSON(w, http.StatusOK, struct{}{})
 		return nil
 	}
@@ -386,6 +398,9 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 	}
+	if err := conditions(r, true, "", hintConditions); err != nil {
+		return err
+	}
 	now := s.now()
 	var counted *reservation // nil, so kept and given back as nothing, when the renewal is not counted
 	if len(count) > 0 {
@@ -443,6 +458,9 @@ func (s *Server) getBox(w http.ResponseWriter, r *http.Request) error {
 	case !b.open():
 		return noSuchMailbox
 	}
+	if err := conditions(r, true, "", hintConditions, "Vary", "Accept-Encoding"); err != nil {
+		return err
+	}
 	writeJSONCompressed(w, r, protocol.BoxResponse{
 		Identity: b.Identity, Prekey: b.Statement, PrekeySignature: b.Signature, SenderKeyTypes: b.SenderKeyTypes,
 		RevokedCertificates: b.RevokedCerts, RevokedCertificatesSignature: b.RevokedCertsSig,
@@ -464,8 +482,11 @@ func (s *Server) getRevocations(w http.ResponseWriter, r *http.Request) error {
 	switch {
 	case err != nil:
 		return err
-	case b == nil || len(b.Revocation) == 0 && len(b.RevokedCerts) == 0:
+	case !b.holdsRevocations():
 		return fail(protocol.CodeNotRevoked, "nothing to do: this server holds no revocation of that address. That is its word, and another server or the box's owner may hold one", "no revocation of this address is held here")
+	}
+	if err := conditions(r, true, "", hintConditions); err != nil {
+		return err
 	}
 	writeJSON(w, http.StatusOK, b.record())
 	return nil
@@ -566,12 +587,20 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 			case req.Revocation != nil:
 				hasCerts = false // the revocation of the address is the body's one change
 			case f.Through == held.Through:
+				if err := conditions(r, true, "", hintConditions); err != nil {
+					return err
+				}
 				writeJSON(w, http.StatusOK, struct{}{})
 				return nil
 			default:
 				return fail(protocol.CodeConflict, "GET the same path for the one held: it covers every certificate yours does", "a revocation of this address's certificates through serial %d is held, and nothing revokes fewer", throughValue(held.Through))
 			}
 		}
+	}
+	// What is held of the address is known here, before the counts and the
+	// signatures: the revocations GET …/revocations would answer, or none.
+	if err := conditions(r, b.holdsRevocations(), "", hintConditions); err != nil {
+		return err
 	}
 	if b == nil {
 		if err := s.spendRegistration(r, ": keeping a revocation of an address this server holds nothing of is counted as one"); err != nil {

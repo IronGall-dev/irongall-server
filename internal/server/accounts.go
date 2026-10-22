@@ -84,6 +84,11 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
 	if b == nil {
 		return noSuchMailbox
 	}
+	// The target is the box's place in an account: there is one once it is
+	// in any (conditions).
+	if err := conditions(r, b.Account != "", "", hintConditions); err != nil {
+		return err
+	}
 	if b.Account != account {
 		if !k.good(s.now()) {
 			return keyRefused()
@@ -118,6 +123,9 @@ func (s *Server) leave(w http.ResponseWriter, r *http.Request) error {
 	}
 	if b == nil {
 		return noSuchMailbox
+	}
+	if err := conditions(r, b.Account != "", "", hintConditions); err != nil {
+		return err
 	}
 	if b.Account != "" {
 		switch err := s.store.Leave(detached(r.Context()), b); {

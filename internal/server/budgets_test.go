@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -674,7 +676,8 @@ func (s panicStore) Revoke(context.Context, protocol.Address, *Revocations) erro
 
 // A reservation is settled, and a shared read finished, however its call
 // ends, a panic included (IronGall-dev/irongall-server#36): after a panic in
-// a lookup's read, a fetch and a raise of a revocation of certificates, no
+// a lookup's read, a fetch of a held message, which counts it once memory
+// shows it held (#86), and a raise of a revocation of certificates, no
 // reservation is held and no read is in flight, and the next lookup of the
 // address is answered.
 func TestAPanicSettlesItsReservations(t *testing.T) {
@@ -723,7 +726,10 @@ func TestAPanicSettlesItsReservations(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	call(http.MethodGet, owner.path("/messages/"+strings.Repeat("ab", 32)), nil, api.passFor(owner.work[1], owner.id.Address(), api.name()))
+	ct := ciphertextTo(t, owner)
+	e.want(e.do(http.MethodPost, owner.path("/messages"), sealedTo(1, 1, ct), victim.pass(1)), http.StatusCreated, "")
+	id := sha256.Sum256(ct)
+	call(http.MethodGet, owner.path("/messages/"+hex.EncodeToString(id[:])), nil, api.passFor(owner.work[1], owner.id.Address(), api.name()))
 	if n := held(s.drained); n != 0 {
 		t.Errorf("after a panic in a fetch: %d drain reservations held", n)
 	}

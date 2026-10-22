@@ -36,6 +36,12 @@ func (s *Server) linkPage() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		// The page exists for every address and carries no tag (conditions);
+		// a 304 carries how long a cache may keep it (RFC 9110 §15.4.5).
+		if err := conditions(r, true, "", hintConditions, "Cache-Control", pageMaxAge); err != nil {
+			writeConditions(w, err)
+			return
+		}
 		var b bytes.Buffer
 		if err := t.Execute(&b, struct{ Addr, Link string }{a.String(), s.linkBase(r) + protocol.LinkPath + a.String()}); err != nil {
 			http.Error(w, "the page did not render", http.StatusInternalServerError)

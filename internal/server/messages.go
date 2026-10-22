@@ -105,15 +105,14 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) error {
 // every process computes alike with no key, and it changes with any message
 // that enters or leaves the page or the count. A page that holds mail cannot
 // be made to share an empty box's tag, the one a client keeps: that is a
-// second preimage of 128 bits. An If-None-Match that names it, read as RFC
-// 9110 §13.1.2 has a server evaluate one (protocol.IfNoneMatch: "*" only as
-// the whole value, each listed tag through its closing quote, compared
-// weakly), is answered 304 with no body: its ETag, its Retry-After and the
-// headers every answer carries (RFC 9110 §15.4.5). An If-Match is evaluated
-// first, as RFC 9110 §13.1.1 and §13.2.2 have an origin server evaluate one
-// (protocol.IfMatch: strongly, against a page after the first, which has no
-// tag, as against one that matches none), and a false one is 412
-// (IronGall-dev/irongall-server#71). Both come after the poll's count.
+// second preimage of 128 bits. Its preconditions are evaluated as every
+// route's are (conditions), after the poll's count: an If-Match first,
+// compared strongly, against a page after the first, which has no tag, as
+// against one that matches none, and a false one is 412
+// (IronGall-dev/irongall-server#71); then an If-None-Match that names the
+// tag, compared weakly, or is "*", which a page after the first meets too,
+// is 304 with no body: its ETag, if it has one, its Retry-After and the
+// headers every answer carries (RFC 9110 §15.4.5).
 func (s *Server) writeList(w http.ResponseWriter, r *http.Request, l protocol.MessageList, first bool) {
 	body, err := jsonBytes(l)
 	if err != nil {
@@ -125,18 +124,15 @@ func (s *Server) writeList(w http.ResponseWriter, r *http.Request, l protocol.Me
 		sum := sha256.Sum256(body)
 		tag = `"` + hex.EncodeToString(sum[:16]) + `"`
 	}
-	if !protocol.IfMatch(r.Header.Values("If-Match"), tag) {
-		writeProblem(w, fail(protocol.CodePreconditionFailed, "list again without If-Match: irongall recv does", "the If-Match is false for this page"))
+	poll := strconv.Itoa(s.limits.PollAfter)
+	if err := conditions(r, true, tag, "list again without If-Match: irongall recv does", "Retry-After", poll); err != nil {
+		writeConditions(w, err)
 		return
 	}
 	h := w.Header()
-	h.Set("Retry-After", strconv.Itoa(s.limits.PollAfter))
+	h.Set("Retry-After", poll)
 	if first {
 		h.Set("ETag", tag)
-		if protocol.IfNoneMatch(r.Header.Values("If-None-Match"), tag) {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
 	}
 	h.Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -255,6 +251,19 @@ func (s *Server) fetch(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	defer func() { drain.release(s.now()) }() // settled below, but for a panic
+	// Whether the box holds it, from memory, before memory counts the
+	// fetch: its preconditions are evaluated for a message it holds
+	// (conditions), and a false one leaves it unfetched, the reservation
+	// given back.
+	if ok, err := s.store.Holds(r.Context(), box, id); err != nil {
+		return err
+	} else if !ok {
+		drain.release(s.now())
+		return s.notHeld(r, box)
+	}
+	if err := conditions(r, true, "", hintConditions); err != nil {
+		return err
+	}
 	held, again, err := s.store.Fetched(r.Context(), box, id)
 	if err != nil || !held || again {
 		drain.release(s.now())
@@ -303,6 +312,9 @@ func (s *Server) ack(w http.ResponseWriter, r *http.Request) error {
 		return s.notHeld(r, box)
 	}
 	if err := s.held(r, box, id); err != nil {
+		return err
+	}
+	if err := conditions(r, true, "", hintConditions); err != nil {
 		return err
 	}
 	err = s.store.DeleteMessage(detached(r.Context()), box, id)

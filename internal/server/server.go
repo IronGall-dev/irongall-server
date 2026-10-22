@@ -453,11 +453,16 @@ func peerHost(r *http.Request) string {
 // retryLater is the Retry-After of a 503.
 const retryLater = time.Minute
 
-// handle adapts a handler that returns its error as a problem.
+// handle adapts a handler that returns its error as a problem, or as a GET's
+// 304 (notModified, from conditions).
 func (s *Server) handle(h func(http.ResponseWriter, *http.Request) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		err := h(w, r)
 		if err == nil {
+			return
+		}
+		if n, ok := errors.AsType[*notModified](err); ok {
+			n.write(w)
 			return
 		}
 		var p *problem

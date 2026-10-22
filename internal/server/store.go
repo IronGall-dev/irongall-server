@@ -109,6 +109,13 @@ func (b *Box) writable() error {
 // hasRecord reports whether b's box has a record, whatever its state.
 func (b *Box) hasRecord() bool { return b != nil && b.Rev > 0 }
 
+// holdsRevocations reports whether what is held of an address carries a
+// revocation of it or of its certificates: what GET …/revocations answers,
+// and the target a PUT there changes (conditions).
+func (b *Box) holdsRevocations() bool {
+	return b != nil && (len(b.Revocation) > 0 || len(b.RevokedCerts) > 0)
+}
+
 // listed reports whether the box's identity has revoked the certificate of
 // this serial, by the revocation on record. A box with none has revoked none.
 func (b *Box) listed(serial uint64) (bool, error) {
