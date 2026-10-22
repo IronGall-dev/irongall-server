@@ -993,16 +993,24 @@ func redacting(l *log.Logger) *log.Logger {
 	return log.New(redactor{l.Writer()}, l.Prefix(), l.Flags())
 }
 
-// loggedMethod is what the access log writes of a request's method: a
-// token, which net/http has checked and which needs no quotes, or its length
-// alone when it is longer than the longest path this server serves, so a
-// caller makes no line longer (IronGall-dev/irongall-server#11).
+// loggedMethod is what the access log writes of a request's method: one of
+// the form methodName reads, or its length alone, as it is when it is longer
+// than the longest path this server serves, so a caller makes no line longer
+// (IronGall-dev/irongall-server#11). A token may hold digits and "-._!~|#",
+// and redact finds only an unbroken run of hex, so a method written as it
+// came could carry an address split by one character, or a name that reads
+// as one redact gives (#79).
 func loggedMethod(m string, longest int) string {
-	if len(m) > longest {
+	if len(m) > longest || !methodName.MatchString(m) {
 		return fmt.Sprintf("(a method of %d bytes)", len(m))
 	}
 	return m
 }
+
+// methodName is the form of every method the IANA HTTP Method Registry
+// lists (read 2026-10-22), "*", which it reserves, aside: capitals and
+// hyphens, which spell no address in lower case and no name redact gives.
+var methodName = regexp.MustCompile(`\A[A-Z][A-Z-]*\z`)
 
 // loggedPath is what the access log writes of a request's path, built from
 // what the routers matched and never from the path as sent or decoded: the

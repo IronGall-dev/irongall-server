@@ -109,8 +109,12 @@ func TestNoLogLineCarriesAnAddress(t *testing.T) {
 // nothing a caller sent can end a line, pass for the server's own words,
 // make it longer, or put an address in it past the redaction, an address
 // with one character escaped among them, which the router decodes and a
-// run of hex in the path as sent would split. A method longer than the
-// longest path this server serves is written as its length alone.
+// run of hex in the path as sent would split. A method is written as it
+// came only in the form of the IANA method registry's, capitals and
+// hyphens, and no longer than the longest path this server serves; any
+// other is written as its length alone, so it can carry no address split
+// by a character a token may hold, no run of 63 hex, and no name that
+// reads as one redact gives (#79).
 // The server is not wrapped in apitest: a site's pages are a deployment's,
 // which api/openapi.yaml does not describe (site_test.go's are not either).
 func TestTheAccessLogWritesWhatTheRoutersMatched(t *testing.T) {
@@ -170,6 +174,13 @@ func TestTheAccessLogWritesWhatTheRoutersMatched(t *testing.T) {
 		{"GET", "/v1/" + strings.Repeat(a.String(), 1<<12), fmt.Sprintf("GET /v1/%s ", logName([]byte(strings.Repeat(a.String(), 1<<12))))},
 		{strings.Repeat("A", 1<<16), "/v1/x", fmt.Sprintf("(a method of %d bytes) (a path of 5 bytes) ", 1<<16)},
 		{"PROPFIND", "/v1/x", "PROPFIND (a path of 5 bytes) 405 "},
+		{"VERSION-CONTROL", "/v1/x", "VERSION-CONTROL (a path of 5 bytes) 405 "},
+		{a.String()[:32] + "-" + a.String()[32:], "/v1/x", "(a method of 65 bytes) (a path of 5 bytes) 405 "},
+		{a.String()[:32] + "." + a.String()[32:], "/v1/x", "(a method of 65 bytes) (a path of 5 bytes) 405 "},
+		{a.String()[:32] + "_" + a.String()[32:], "/v1/x", "(a method of 65 bytes) (a path of 5 bytes) 405 "},
+		{a.String()[:63], "/v1/x", "(a method of 63 bytes) (a path of 5 bytes) 405 "},
+		{box, "/v1/x", "(a method of 17 bytes) (a path of 5 bytes) 405 "},
+		{"get", "/v1/x", "(a method of 3 bytes) (a path of 5 bytes) 405 "},
 	} {
 		if got := request(c.method, c.path); !strings.HasPrefix(got, c.want) {
 			t.Errorf("%.20s %.80s: %q, want it from %q", c.method, c.path, got, c.want)
