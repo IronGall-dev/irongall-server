@@ -144,10 +144,11 @@ func (s *Server) revokedAt(a protocol.Address, b *Box) *problem {
 // serverName is the name the caller called this server by, if it is one of
 // the server's own: the request's Host, lowercase, written as an origin is
 // (PROTOCOL.md §6.1b), with its port as a number and none at all when it is
-// 443 or 80. TLS ends in front of this server, so it cannot tell which scheme
-// a client called it by, and takes either's default as left unwritten: a
-// client that calls https on port 80, or http on 443, names a port this
-// drops, and its pass is refused. A pass names the server it was made for,
+// 443 or 80, either default taken as left unwritten, so that checking a pass
+// never rests on which scheme a request came by: a server may learn that
+// only from a forwarded header, and an authentication check does not hang
+// on one. A client that calls https on port 80, or http on 443, names a port
+// this drops, and its pass is refused. A pass names the server it was made for,
 // and the name is not sent with it: checked against a name that is not ours,
 // a pass made for another server would pass here.
 func (s *Server) serverName(r *http.Request) (string, bool) {
