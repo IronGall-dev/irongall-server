@@ -100,8 +100,15 @@ func (e *env) do(method, path string, body any, pass string) reply {
 	return e.doAs("", method, path, body, pass)
 }
 
-// doAs is do, calling the server by the name host when one is given.
-func (e *env) doAs(host, method, path string, body any, pass string) reply {
+// doWith is do with header fields of its own, as name and value pairs.
+func (e *env) doWith(method, path string, body any, pass string, headers ...string) reply {
+	e.t.Helper()
+	return e.doAs("", method, path, body, pass, headers...)
+}
+
+// doAs is do, calling the server by the name host when one is given, with
+// any header fields as name and value pairs.
+func (e *env) doAs(host, method, path string, body any, pass string, headers ...string) reply {
 	e.t.Helper()
 	var rd io.Reader
 	ctype := ""
@@ -124,6 +131,9 @@ func (e *env) doAs(host, method, path string, body any, pass string) reply {
 	}
 	if pass != "" {
 		req.Header.Set("Authorization", pass)
+	}
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Add(headers[i], headers[i+1])
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

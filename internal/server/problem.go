@@ -55,10 +55,6 @@ func countValue(n int) value {
 	return value{n, func(p *protocol.Problem) { p.Count = u64(uint64(max(n, 0))) }}
 }
 
-func versionValue(v uint64) value {
-	return value{v, func(p *protocol.Problem) { p.Version = u64(v) }}
-}
-
 func prekeySerialValue(v uint64) value {
 	return value{v, func(p *protocol.Problem) { p.PrekeySerial = u64(v) }}
 }

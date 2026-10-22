@@ -86,8 +86,8 @@ type Box struct {
 	RevokedCertsSig []byte
 	// ACL is the box's sender ACL (PROTOCOL.md §6.2): who may send to it,
 	// deny read first and then allow. nil until the box puts one, and a box
-	// with none takes mail from everyone. It is replaced whole, only by one
-	// of a higher version, and never removed.
+	// with none takes mail from everyone. It is replaced whole, and never
+	// removed.
 	ACL *protocol.ACL
 }
 

@@ -835,8 +835,8 @@ func TestRetryAfterAPauseIsNotRedelivered(t *testing.T) {
 	sent := capture(e, to)
 	send(t, a, b, "deleted unread")
 	e.setMiddle(nil)
-	e.want(e.do("PUT", to+"/acl", aclOf(1, []string{}, []string{"*"}), e.pass(b)), 200, "")
-	e.want(e.do("PUT", to+"/acl", aclOf(2, []string{"*"}, nil), e.pass(b)), 200, "")
+	e.want(e.do("PUT", to+"/acl", aclOf([]string{}, []string{"*"}), e.pass(b)), 200, "")
+	e.want(e.do("PUT", to+"/acl", aclOf([]string{"*"}, nil), e.pass(b)), 200, "")
 	// A retry of the same bytes is answered as the first send was, from the
 	// dedupe record (PROTOCOL.md §4.5 step 6): it stores nothing, and what the
 	// pause deleted stays deleted.

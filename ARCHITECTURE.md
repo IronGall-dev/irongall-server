@@ -130,8 +130,8 @@ That base was estimated at 0.3–1.3 GiB per process at 1M polling boxes (Go map
 | Register `PUT /v1/<addr>` | Four signature checks (the certificate and the statement under it, then the pass under it and the certificate again), then DynamoDB PutItem | The box is in use from this one write |
 | New prekey `PUT …/prekey` | The record (the LRU, or one GetItem), the same four checks, DynamoDB UpdateItem | The authority is the statement's own certificate and a pass under it: no pass under the box's current certificate is needed |
 | Read a box `GET /v1/<addr>` | The LRU; DynamoDB on a miss. A revoked box is `410` with the record it keeps | Never cached in front of the server: every API answer says `no-store` (`PROTOCOL-SERVER.md` §6.3, §12). The one API answer gzipped, to a request that takes it (below) |
-| ACL `PUT …/acl` | The pass, the record (the LRU, or one GetItem), one conditional UpdateItem; then, only if memory shows the box holding mail and the deny list is not empty, one Query of the live index and the deletes of what it denies | Replaced whole, only by a higher version (`PROTOCOL-SERVER.md` §6.2) |
-| ACL `GET …/acl` | The pass, the record (the LRU, or one GetItem) | The record's ACL, or the open one of a box with none |
+| ACL `PUT …/acl` | The pass, the record (the LRU, or one GetItem), one conditional UpdateItem; then, only if memory shows the box holding mail and the deny list is not empty, one Query of the live index and the deletes of what it denies | Replaced whole, with an `If-Match` held to the ACL held when one is sent (`PROTOCOL-SERVER.md` §6.2) |
+| ACL `GET …/acl` | The pass, the record (the LRU, or one GetItem) | The record's ACL, or the open one of a box with none, with its `ETag`; `304` to an `If-None-Match` that names it |
 
 ```mermaid
 sequenceDiagram

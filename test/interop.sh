@@ -279,7 +279,7 @@ out=$(gocli "$X6" revocation publish "$X6A" 2>&1) && [ "$out" = "$(revoked_line 
 
 # --- 9. the sender ACL: a Go box that blocks a recipe box, and a recipe send that the server then refuses ---
 XB="$work/xb"; XBL=$(recipe "$XB" "ig_init" | linkof) && XBA=${XBL##*/} || bad "recipe init for the ACL: $XBL"
-out=$(gocli "$G" peer block "$XBL" 2>&1) && curl -s -H "Authorization: $(passof "$G")" "$IG_BASE/v1/$GA/acl" | jq -e --arg x "$XBA" '.allow == ["*"] and .deny == [$x] and .version > 0' > /dev/null \
+out=$(gocli "$G" peer block "$XBL" 2>&1) && curl -s -H "Authorization: $(passof "$G")" "$IG_BASE/v1/$GA/acl" | jq -e --arg x "$XBA" 'keys == ["allow","deny"] and .allow == ["*"] and .deny == [$x]' > /dev/null \
   && out=$(recipe "$XB" "ig_send $GL '$work/body'" 2>&1); [ $? -ne 0 ] && grep -q 'ERROR 403 sender_not_allowed' <<< "$out" && grep -q 'nothing is sent' <<< "$out" && [ ! -e "$XB/outbox" ] \
   && ok "a Go box's block reaches the server as its ACL, which refuses the recipe box's send: nothing is sent or kept" || bad "the ACL: $out"
 

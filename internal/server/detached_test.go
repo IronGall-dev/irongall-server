@@ -138,7 +138,7 @@ func TestAWriteOutlivesItsCallersHangUp(t *testing.T) {
 	// the mail its deny list matches, which comes after the write.
 	denied := e.raw().register(protocol.MaxPrekeyLifetime)
 	e.want(e.sendTo(r, 2, 1, denied, 1), http.StatusCreated, "")
-	acl, _ := json.Marshal(aclOf(1, []string{"*"}, []string{denied.id.Address().String()}))
+	acl, _ := json.Marshal(aclOf([]string{"*"}, []string{denied.id.Address().String()}))
 	hangUp("PUT", r.path("/acl"), "application/json", acl, r.pass(1))
 	if n, _ := e.store.Count(ctx0, r.id.Address()); n != 0 {
 		t.Errorf("an ACL put whose caller hung up mid-write left %d messages from the sender it denies", n)

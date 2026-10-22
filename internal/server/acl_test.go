@@ -16,9 +16,9 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
-// aclOf is an ACL document: the version, and the lists as given.
-func aclOf(version uint64, allow, deny []string) protocol.ACLDocument {
-	return protocol.ACLDocument{Version: &version, Allow: allow, Deny: deny}
+// aclOf is an ACL document: the lists as given.
+func aclOf(allow, deny []string) protocol.ACLDocument {
+	return protocol.ACLDocument{Allow: allow, Deny: deny}
 }
 
 // aclReply reads an ACL document out of an answer.
@@ -55,9 +55,10 @@ func (e *env) sealTo(to *client.Box) sealed {
 	return sealedTo(serial, under, ct.Bytes())
 }
 
-// A box's ACL is the box's own to read and replace, whole and only upward;
-// one that is not an ACL, or holds more entries than the server takes, is
-// refused before anything is stored.
+// A box's ACL is the box's own to read and replace, whole; one that is not
+// an ACL, or holds more entries than the server takes, is refused before
+// anything is stored. A GET carries the ETag of the ACL held, and a PUT,
+// whose ACL may not be what was sent, carries none (RFC 9110 §9.3.4).
 func TestACLRoute(t *testing.T) {
 	l := relaxed()
 	l.ACLEntries = 3
@@ -66,76 +67,83 @@ func TestACLRoute(t *testing.T) {
 	path := "/v1/" + b.Address().String() + "/acl"
 	pass := e.pass(b)
 	x, y := other.Address().String(), strings.Repeat("ab", 32)
+	const open = `{"allow":["*"],"deny":[]}`
 
 	// The box's own pass, and only that.
 	e.want(e.do("GET", path, nil, ""), 401, protocol.CodeUnauthorized)
-	e.want(e.do("PUT", path, aclOf(1, []string{"*"}, nil), ""), 401, protocol.CodeUnauthorized)
+	e.want(e.do("PUT", path, aclOf([]string{"*"}, nil), ""), 401, protocol.CodeUnauthorized)
 	e.want(e.do("GET", path, nil, e.pass(other)), 401, protocol.CodeUnauthorized)
-	e.want(e.do("PUT", path, aclOf(1, []string{"*"}, nil), e.pass(other)), 401, protocol.CodeUnauthorized)
+	e.want(e.do("PUT", path, aclOf([]string{"*"}, nil), e.pass(other)), 401, protocol.CodeUnauthorized)
 
-	// A box that has put none lets everyone in, at version 0.
+	// A box that has put none lets everyone in, and has a tag for that.
 	got := e.do("GET", path, nil, pass)
 	e.want(got, 200, "")
-	if string(bytes.TrimSpace(got.body)) != `{"version":0,"allow":["*"],"deny":[]}` {
-		t.Fatalf("no ACL: %s", got.body)
+	if string(bytes.TrimSpace(got.body)) != open || got.header.Get("ETag") != entityTag(got.body) {
+		t.Fatalf("no ACL: %s, ETag %q", got.body, got.header.Get("ETag"))
 	}
 
 	for name, body := range map[string]any{
-		"no allow list":      []byte(`{"version":1,"deny":[]}`),
-		"allow null":         []byte(`{"version":1,"allow":null}`),
-		"no version":         []byte(`{"allow":["*"]}`),
-		"version 0":          aclOf(0, []string{"*"}, nil),
-		"an uppercase entry": aclOf(1, []string{strings.ToUpper(y)}, nil),
-		"a partial pattern":  aclOf(1, []string{"*" + y[1:]}, nil),
-		"a member it lacks":  []byte(`{"version":1,"allow":["*"],"block":[]}`),
+		"no allow list":      []byte(`{"deny":[]}`),
+		"allow null":         []byte(`{"allow":null}`),
+		"a version":          []byte(`{"version":1,"allow":["*"]}`),
+		"an uppercase entry": aclOf([]string{strings.ToUpper(y)}, nil),
+		"a partial pattern":  aclOf([]string{"*" + y[1:]}, nil),
+		"a member it lacks":  []byte(`{"allow":["*"],"block":[]}`),
 		"not JSON":           []byte(`allow everyone`),
 	} {
 		if r := e.do("PUT", path, body, pass); r.status != 400 || r.code() != protocol.CodeBadRequest {
 			t.Errorf("%s: %d %s, want 400 %s: %s", name, r.status, r.code(), protocol.CodeBadRequest, r.body)
 		}
 	}
+	if r := e.do("PUT", path, []byte(`{"version":1,"allow":["*"]}`), pass); r.problem().Member != "version" {
+		t.Errorf("a document with a version names no member version: %s", r.body)
+	}
 	// Over the entries, and over the body's bound drawn from them, which is
 	// refused before it is parsed: the limit is the entries either way
 	// (PROTOCOL.md §13: a too_large on an ACL is entries).
-	huge := aclOf(1, []string{"*"}, []string{strings.Repeat(" ", int(e.server.aclBodyLimit()))})
-	for _, body := range []any{aclOf(1, []string{"*", x}, []string{y, x}), huge} {
+	huge := aclOf([]string{"*"}, []string{strings.Repeat(" ", int(e.server.aclBodyLimit()))})
+	for _, body := range []any{aclOf([]string{"*", x}, []string{y, x}), huge} {
 		r := e.do("PUT", path, body, pass)
 		e.want(r, 413, protocol.CodeTooLarge)
 		if p := r.problem(); p.Limit == nil || *p.Limit != 3 {
 			t.Errorf("an ACL over 3 entries is told the limit %v, want its 3 entries: %s", p.Limit, r.body)
 		}
 	}
-	if r := e.do("GET", path, nil, pass); !bytes.Contains(r.body, []byte(`"version":0`)) {
+	if r := e.do("GET", path, nil, pass); string(bytes.TrimSpace(r.body)) != open {
 		t.Fatalf("a refused ACL was stored: %s", r.body)
 	}
 
-	// Taken: stored and answered in its one form, sorted and each once.
-	put := e.do("PUT", path, aclOf(2, []string{y, x, y}, []string{}), pass)
+	// Taken: stored and answered in its one form, sorted and each once, with
+	// no tag; a GET then answers the tag of that form.
+	put := e.do("PUT", path, aclOf([]string{y, x, y}, []string{}), pass)
 	e.want(put, 200, "")
 	lo, hi := min(x, y), max(x, y)
-	want := `{"version":2,"allow":["` + lo + `","` + hi + `"],"deny":[]}`
-	if string(bytes.TrimSpace(put.body)) != want {
-		t.Fatalf("PUT answered %s, want %s", put.body, want)
+	want := `{"allow":["` + lo + `","` + hi + `"],"deny":[]}`
+	if string(bytes.TrimSpace(put.body)) != want || put.header.Values("ETag") != nil {
+		t.Fatalf("PUT answered %s with ETag %q, want %s and none", put.body, put.header.Values("ETag"), want)
 	}
-	if r := e.do("GET", path, nil, pass); string(bytes.TrimSpace(r.body)) != want {
-		t.Fatalf("GET answered %s, want %s", r.body, want)
+	r := e.do("GET", path, nil, pass)
+	tag := r.header.Get("ETag")
+	if string(bytes.TrimSpace(r.body)) != want || tag != entityTag([]byte(want+"\n")) || tag == got.header.Get("ETag") {
+		t.Fatalf("GET answered %s with ETag %q", r.body, tag)
 	}
-	// Only upward.
-	e.want(e.do("PUT", path, aclOf(2, []string{"*"}, nil), pass), 409, protocol.CodeConflict)
-	e.want(e.do("PUT", path, aclOf(1, []string{"*"}, nil), pass), 409, protocol.CodeConflict)
-	e.want(e.do("PUT", path, aclOf(3, []string{"*"}, nil), pass), 200, "")
-	if d := aclReply(t, e.do("GET", path, nil, pass)); *d.Version != 3 || len(d.Allow) != 1 || d.Allow[0] != "*" || d.Deny == nil {
-		t.Fatalf("after version 3: %+v", d)
+	// The same ACL put again has the same tag: the tag is of the ACL.
+	e.want(e.do("PUT", path, aclOf([]string{x, y}, nil), pass), 200, "")
+	if r := e.do("GET", path, nil, pass); r.header.Get("ETag") != tag {
+		t.Fatalf("the same ACL put again: ETag %q, want %q", r.header.Get("ETag"), tag)
 	}
 
 	// The record carries it, as the store writes it and reads it back.
 	stored, err := e.store.Box(context.Background(), b.Address())
-	if err != nil || stored.ACL == nil || stored.ACL.Version != 3 || !stored.ACL.Allow.Any {
+	if err != nil || stored.ACL == nil || stored.ACL.Allow.Any || stored.ACL.Allow.Len() != 2 {
 		t.Fatalf("the stored ACL: %+v, %v", stored.ACL, err)
 	}
 	back, err := decodeBox(item(boxItem(stored)))
-	if err != nil || back.ACL == nil || back.ACL.Version != 3 || !back.ACL.SameLists(stored.ACL) {
+	if err != nil || back.ACL == nil || !back.ACL.SameLists(stored.ACL) {
 		t.Fatalf("the ACL does not come back from the record as it went in: %+v, %v", back.ACL, err)
+	}
+	if doc, err := item(boxItem(stored)).bytes("acl"); err != nil || string(doc) != want {
+		t.Fatalf("the record holds the ACL as %s, %v; want %s", doc, err, want)
 	}
 	none, err := e.store.Box(context.Background(), other.Address())
 	if err != nil {
@@ -149,6 +157,132 @@ func TestACLRoute(t *testing.T) {
 	}
 }
 
+// A PUT with If-Match replaces only the ACL it names, compared strongly, as
+// RFC 9110 §13.1.1 has an origin server evaluate one, a box with no ACL
+// included; a false one is 412, changes nothing, and is answered before the
+// body is read (RFC 9110 §13.2.1). One without If-Match replaces whatever is
+// held, so no ACL is the last the server takes (IronGall-dev/irongall-client#360).
+func TestAnACLsIfMatch(t *testing.T) {
+	l := relaxed()
+	l.ACLEntries = 3
+	e := newEnv(t, l)
+	b, c := e.box(protocol.Classic), e.box(protocol.Classic)
+	path := "/v1/" + b.Address().String() + "/acl"
+	pass := e.pass(b)
+	pause, open := aclOf([]string{}, []string{"*"}), aclOf([]string{"*"}, nil)
+	tagOf := func() (string, string) {
+		t.Helper()
+		r := e.do("GET", path, nil, pass)
+		e.want(r, 200, "")
+		return r.header.Get("ETag"), string(r.body)
+	}
+
+	// A box with none: its tag is that of the ACL it answers.
+	none, _ := tagOf()
+	e.want(e.doWith("PUT", path, open, pass, "If-Match", `"other"`), 412, protocol.CodePreconditionFailed)
+	e.want(e.doWith("PUT", path, pause, pass, "If-Match", none), 200, "")
+	paused, body := tagOf()
+	if paused == none {
+		t.Fatalf("the pause has the tag %q of the open ACL before it", paused)
+	}
+
+	for _, c := range []struct {
+		name   string
+		lines  []string
+		status int
+	}{
+		{"the tag held", []string{paused}, 200},
+		{"*", []string{"*"}, 200},
+		{"a list holding it", []string{`"other", ` + paused}, 200},
+		{"two lines, one holding it", []string{`"other"`, paused}, 200},
+		{"the tag before", []string{none}, 412},
+		{"it marked weak", []string{"W/" + paused}, 412},
+		{"its value unquoted", []string{strings.Trim(paused, `"`)}, 412},
+		{"not a tag", []string{"junk"}, 412},
+	} {
+		var hdr []string
+		for _, v := range c.lines {
+			hdr = append(hdr, "If-Match", v)
+		}
+		r := e.doWith("PUT", path, pause, pass, hdr...)
+		if r.status != c.status || c.status == 412 && r.code() != protocol.CodePreconditionFailed {
+			t.Errorf("If-Match %s %q: %d %s, want %d", c.name, c.lines, r.status, r.code(), c.status)
+		}
+	}
+	if tag, now := tagOf(); tag != paused || now != body {
+		t.Fatalf("a false If-Match changed the ACL: %s, ETag %q", now, tag)
+	}
+
+	// A false one is answered before the body: one that is not an ACL, or is
+	// over the bound, is 412 all the same.
+	huge := aclOf([]string{"*"}, []string{strings.Repeat(" ", int(e.server.aclBodyLimit()))})
+	for _, body := range []any{[]byte(`allow everyone`), huge} {
+		e.want(e.doWith("PUT", path, body, pass, "If-Match", none), 412, protocol.CodePreconditionFailed)
+	}
+
+	// Mail waits refused while the pause holds, and a PUT with no If-Match,
+	// or with the pause's tag, lets senders in again: nothing a writer once
+	// wrote stops the next.
+	e.want(e.do("POST", "/v1/"+b.Address().String()+"/messages", e.sealTo(b), e.pass(c)), 403, protocol.CodeSenderNotAllowed)
+	e.want(e.do("PUT", path, open, pass), 200, "")
+	e.want(e.do("POST", "/v1/"+b.Address().String()+"/messages", e.sealTo(b), e.pass(c)), 201, "")
+	e.want(e.doWith("PUT", path, pause, pass, "If-Match", paused), 412, protocol.CodePreconditionFailed)
+	opened, _ := tagOf()
+	e.want(e.doWith("PUT", path, pause, pass, "If-Match", opened), 200, "")
+	if tag, _ := tagOf(); tag != paused {
+		t.Fatalf("the pause put again has the tag %q, want its own %q", tag, paused)
+	}
+}
+
+// A GET of the ACL reads its preconditions as a list does, in RFC 9110
+// §13.2.2's order and only where its answer would be 200 (§13.2.1): a false
+// If-Match, compared strongly, is 412, and then an If-None-Match that names
+// the tag, compared weakly, is 304 with the tag and no body.
+func TestAnACLsGETReadsItsPreconditions(t *testing.T) {
+	e := newEnv(t, relaxed())
+	b, other := e.box(protocol.Classic), e.box(protocol.Classic)
+	path := "/v1/" + b.Address().String() + "/acl"
+	pass := e.pass(b)
+	e.want(e.do("PUT", path, aclOf([]string{"*"}, []string{other.Address().String()}), pass), 200, "")
+	full := e.do("GET", path, nil, pass)
+	e.want(full, 200, "")
+	tag := full.header.Get("ETag")
+	for _, c := range []struct {
+		name    string
+		headers []string
+		status  int
+	}{
+		{"If-Match the tag", []string{"If-Match", tag}, 200},
+		{"If-Match *", []string{"If-Match", "*"}, 200},
+		{"If-Match another", []string{"If-Match", `"other"`}, 412},
+		{"If-Match it weak", []string{"If-Match", "W/" + tag}, 412},
+		{"If-None-Match the tag", []string{"If-None-Match", tag}, 304},
+		{"If-None-Match it weak", []string{"If-None-Match", "W/" + tag}, 304},
+		{"If-None-Match *", []string{"If-None-Match", "*"}, 304},
+		{"If-None-Match a list holding it", []string{"If-None-Match", `"other", ` + tag}, 304},
+		{"If-None-Match another", []string{"If-None-Match", `"other"`}, 200},
+		{"If-None-Match * among tags", []string{"If-None-Match", `"other", *`}, 200},
+		{"both true", []string{"If-Match", tag, "If-None-Match", tag}, 304},
+		{"If-Match false first", []string{"If-Match", `"other"`, "If-None-Match", tag}, 412},
+	} {
+		r := e.doWith("GET", path, nil, pass, c.headers...)
+		switch {
+		case r.status != c.status:
+			t.Errorf("%s: %d %s, want %d", c.name, r.status, r.code(), c.status)
+		case c.status == 412 && r.code() != protocol.CodePreconditionFailed:
+			t.Errorf("%s: %s", c.name, r.body)
+		case c.status == 304 && (len(r.body) != 0 || r.header.Get("ETag") != tag):
+			t.Errorf("%s: 304 with ETag %q and %d bytes", c.name, r.header.Get("ETag"), len(r.body))
+		case c.status == 200 && (!bytes.Equal(r.body, full.body) || r.header.Get("ETag") != tag):
+			t.Errorf("%s: 200 with ETag %q: %s", c.name, r.header.Get("ETag"), r.body)
+		}
+	}
+	// Only where the answer would be 200: no pass, or no box, is answered as
+	// it is without them.
+	e.want(e.doWith("GET", path, nil, "", "If-Match", `"other"`), 401, protocol.CodeUnauthorized)
+	e.want(e.doWith("GET", path, nil, e.pass(other), "If-None-Match", tag), 401, protocol.CodeUnauthorized)
+}
+
 // With no bound on its entries, an ACL's body is still bounded, to keep the
 // record one item: a body over that is too_large with the body's bytes as
 // its limit, the one limit there is (PROTOCOL.md §13).
@@ -157,7 +291,7 @@ func TestAnUnboundedACLNamesItsBodysBytes(t *testing.T) {
 	l.ACLEntries = 0
 	e := newEnv(t, l)
 	b := e.box(protocol.Classic)
-	huge := aclOf(1, []string{"*"}, []string{strings.Repeat(" ", int(e.server.aclBodyLimit()))})
+	huge := aclOf([]string{"*"}, []string{strings.Repeat(" ", int(e.server.aclBodyLimit()))})
 	r := e.do("PUT", "/v1/"+b.Address().String()+"/acl", huge, e.pass(b))
 	e.want(r, 413, protocol.CodeTooLarge)
 	if p := r.problem(); p.Limit == nil || *p.Limit != uint64(aclBodyUnbounded) {
@@ -174,18 +308,18 @@ func TestACLRefusesSends(t *testing.T) {
 	e := newEnv(t, l)
 	a, b, c := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic)
 	to := "/v1/" + b.Address().String()
-	acl := func(v uint64, allow, deny []string) {
+	acl := func(allow, deny []string) {
 		t.Helper()
-		e.want(e.do("PUT", to+"/acl", aclOf(v, allow, deny), e.pass(b)), 200, "")
+		e.want(e.do("PUT", to+"/acl", aclOf(allow, deny), e.pass(b)), 200, "")
 	}
 
-	acl(1, []string{a.Address().String()}, nil)
+	acl([]string{a.Address().String()}, nil)
 	notAllowed := e.do("POST", to+"/messages", e.sealTo(b), e.pass(c))
 	e.want(notAllowed, 403, protocol.CodeSenderNotAllowed)
 	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(c)), 403, protocol.CodeSenderNotAllowed)
 	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(a)), 201, "")
 
-	acl(2, []string{"*"}, []string{a.Address().String()})
+	acl([]string{"*"}, []string{a.Address().String()})
 	denied := e.do("POST", to+"/messages", e.sealTo(b), e.pass(a))
 	e.want(denied, 403, protocol.CodeSenderNotAllowed)
 	var p, q protocol.Problem
@@ -226,7 +360,7 @@ func TestACLDenyPurges(t *testing.T) {
 		t.Fatalf("before: %d from a, %d from c", count(a), count(c))
 	}
 
-	e.want(e.do("PUT", to+"/acl", aclOf(1, []string{"*"}, []string{a.Address().String()}), e.pass(b)), 200, "")
+	e.want(e.do("PUT", to+"/acl", aclOf([]string{"*"}, []string{a.Address().String()}), e.pass(b)), 200, "")
 	if count(a) != 0 || count(c) != 1 {
 		t.Fatalf("after denying a: %d from a, %d from c", count(a), count(c))
 	}
@@ -243,12 +377,12 @@ func TestACLDenyPurges(t *testing.T) {
 	// The pause (PROTOCOL.md §6.2), nobody allowed and everyone denied:
 	// everything goes, and nothing more comes until a later ACL undoes it.
 	// What the pause deleted stays deleted.
-	e.want(e.do("PUT", to+"/acl", aclOf(2, []string{}, []string{"*"}), e.pass(b)), 200, "")
+	e.want(e.do("PUT", to+"/acl", aclOf([]string{}, []string{"*"}), e.pass(b)), 200, "")
 	if n, err := e.store.Count(ctx, b.Address()); err != nil || n != 0 {
 		t.Fatalf("after denying everyone the box holds %d, %v", n, err)
 	}
 	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(c)), 403, protocol.CodeSenderNotAllowed)
-	e.want(e.do("PUT", to+"/acl", aclOf(3, []string{"*"}, nil), e.pass(b)), 200, "")
+	e.want(e.do("PUT", to+"/acl", aclOf([]string{"*"}, nil), e.pass(b)), 200, "")
 	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(c)), 201, "")
 	if n, err := e.store.Count(ctx, b.Address()); err != nil || n != 1 {
 		t.Fatalf("after the pause is undone the box holds %d, %v; want the one sent since", n, err)
@@ -268,7 +402,7 @@ func TestACLReachesAnotherProcess(t *testing.T) {
 
 	// The other process holds b's record, with no ACL in it.
 	e2.want(e2.do("POST", to+"/messages", e2.sealTo(b), e2.pass(a)), 201, "")
-	e.want(e.do("PUT", to+"/acl", aclOf(1, []string{"*"}, []string{a.Address().String()}), e.pass(b)), 200, "")
+	e.want(e.do("PUT", to+"/acl", aclOf([]string{"*"}, []string{a.Address().String()}), e.pass(b)), 200, "")
 	start := time.Now()
 	for {
 		if rec, ok := other.Known(b.Address()); ok && rec != nil && rec.ACL != nil {
@@ -281,7 +415,8 @@ func TestACLReachesAnotherProcess(t *testing.T) {
 	}
 	t.Logf("an ACL put on one process reached the other in %s", time.Since(start))
 	e2.want(e2.do("POST", to+"/messages", e2.sealTo(b), e2.pass(a)), 403, protocol.CodeSenderNotAllowed)
-	if d := aclReply(t, e2.do("GET", to+"/acl", nil, e2.pass(b))); *d.Version != 1 || len(d.Deny) != 1 {
-		t.Fatalf("the other process answers %+v", d)
+	there, here := e2.do("GET", to+"/acl", nil, e2.pass(b)), e.do("GET", to+"/acl", nil, e.pass(b))
+	if d := aclReply(t, there); len(d.Deny) != 1 || there.header.Get("ETag") != here.header.Get("ETag") {
+		t.Fatalf("the other process answers %+v with ETag %q, this one ETag %q", d, there.header.Get("ETag"), here.header.Get("ETag"))
 	}
 }

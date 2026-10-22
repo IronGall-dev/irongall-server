@@ -512,7 +512,7 @@ func TestTheGoClientsACL(t *testing.T) {
 		t.Fatalf("b received %+v", res)
 	}
 	rec, err := e.store.Box(ctx, b.Address())
-	if err != nil || rec.ACL == nil || rec.ACL.Allow.Any || !rec.ACL.Allow.Has(c.Address()) || !rec.ACL.Deny.Has(a.Address()) || rec.ACL.Version != 2 {
+	if err != nil || rec.ACL == nil || rec.ACL.Allow.Any || !rec.ACL.Allow.Has(c.Address()) || !rec.ACL.Deny.Has(a.Address()) || rec.ACL.Allow.Len() != 1 {
 		t.Fatalf("the record holds %+v, %v", rec.ACL, err)
 	}
 }

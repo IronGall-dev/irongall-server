@@ -35,9 +35,16 @@ func (s *Server) aclTooLarge() *problem {
 }
 
 // putACL is PUT /v1/<address>/acl (with the pass): the box's sender ACL,
-// replaced whole by one of a higher version (PROTOCOL.md §6.2). Then the
-// box's unacked mail from every sender its deny list matches is deleted, as
-// acks delete it.
+// replaced whole (PROTOCOL.md §6.2). An If-Match is evaluated against the
+// ACL held, a box with none included, after the call's other checks and
+// before its body is read, as RFC 9110 §13.2.1 has an origin server evaluate
+// one: a false one is 412, and nothing changes. The write is conditional on
+// the record's revision, so the ACL the If-Match was held to is the one
+// replaced. Then the box's unacked mail from every sender its deny list
+// matches is deleted, as acks delete it. It answers the ACL as held with no
+// ETag: the lists are sorted and each entry kept once, so what is held may
+// not be what was sent, and RFC 9110 §9.3.4 lets a PUT's answer carry a
+// validator only for content saved as it came.
 func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 	a, err := s.owner(r)
 	if err != nil {
@@ -45,6 +52,20 @@ func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 	}
 	if err := s.spendOwner(r.Context(), a); err != nil {
 		return err
+	}
+	b, err := s.box(r.Context(), a)
+	if err != nil {
+		return err
+	}
+	if b == nil {
+		return noSuchMailbox
+	}
+	held, err := answerACL(b.ACL)
+	if err != nil {
+		return err
+	}
+	if !protocol.IfMatch(r.Header.Values("If-Match"), held.tag) {
+		return fail(protocol.CodePreconditionFailed, "GET the same path for the ACL held and its ETag, or PUT without If-Match: "+hintACL, "the If-Match is false for the ACL this box holds")
 	}
 	var doc protocol.ACLDocument
 	if err := decodeBody(w, r, s.aclBodyLimit(), &doc); err != nil {
@@ -64,15 +85,9 @@ func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 	case err != nil:
 		return failErr(protocol.CodeBadRequest, hintACL, err)
 	}
-	b, err := s.box(r.Context(), a)
+	body, err := jsonBytes(acl.Document())
 	if err != nil {
 		return err
-	}
-	if b == nil {
-		return noSuchMailbox
-	}
-	if held := b.ACL.Document(); acl.Version <= *held.Version {
-		return fail(protocol.CodeConflict, "GET the same path for the version held, and send above it", "this box's ACL is at version %d, and a new one must be above it", versionValue(*held.Version))
 	}
 	b.ACL = acl
 	ctx := detached(r.Context())
@@ -93,12 +108,20 @@ func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 	}
-	writeJSON(w, http.StatusOK, acl.Document())
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 	return nil
 }
 
 // getACL is GET /v1/<address>/acl (with the pass): the box's ACL as it was
-// put, or, for a box that has put none, version 0 allowing everyone.
+// put, or, for a box that has put none, the one allowing everyone, with its
+// ETag. Its preconditions are evaluated as a list's are (writeList), once
+// the answer without them would be 200 (RFC 9110 §13.2.1), and in §13.2.2's
+// order: an If-Match, compared strongly, that is false is 412; then an
+// If-None-Match that names the tag, compared weakly, is 304 with the ETag and
+// no body.
 func (s *Server) getACL(w http.ResponseWriter, r *http.Request) error {
 	a, err := s.owner(r)
 	if err != nil {
@@ -114,6 +137,41 @@ func (s *Server) getACL(w http.ResponseWriter, r *http.Request) error {
 	if b == nil {
 		return noSuchMailbox
 	}
-	writeJSON(w, http.StatusOK, b.ACL.Document())
+	got, err := answerACL(b.ACL)
+	if err != nil {
+		return err
+	}
+	if !protocol.IfMatch(r.Header.Values("If-Match"), got.tag) {
+		return fail(protocol.CodePreconditionFailed, "GET the same path without If-Match: "+hintACL, "the If-Match is false for the ACL this box holds")
+	}
+	h := w.Header()
+	h.Set("ETag", got.tag)
+	if protocol.IfNoneMatch(r.Header.Values("If-None-Match"), got.tag) {
+		w.WriteHeader(http.StatusNotModified)
+		return nil
+	}
+	h.Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(got.body)
 	return nil
+}
+
+// aclAnswer is the ACL's document as GET and PUT …/acl answer it, and its
+// ETag, entityTag of those bytes, so the tag is a strong validator of what
+// GET answers (RFC 9110 §8.8.1). It changes whenever the lists do, needs
+// nothing stored, and every process makes the same one; an ACL put back as
+// it was has its old tag again, and a box with none has the tag of the ACL
+// it answers.
+type aclAnswer struct {
+	body []byte
+	tag  string
+}
+
+// answerACL is the answer for an ACL held, nil for none.
+func answerACL(acl *protocol.ACL) (aclAnswer, error) {
+	body, err := jsonBytes(acl.Document())
+	if err != nil {
+		return aclAnswer{}, err
+	}
+	return aclAnswer{body: body, tag: entityTag(body)}, nil
 }

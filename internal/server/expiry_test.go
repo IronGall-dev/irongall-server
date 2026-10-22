@@ -67,7 +67,7 @@ func TestAForgottenBoxRegistersAnew(t *testing.T) {
 	e := newEnv(t, relaxed())
 	now := e.clock.Now()
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
-	e.want(e.do("PUT", r.path("/acl"), aclOf(1, []string{"*"}, nil), r.pass(1)), 200, "")
+	e.want(e.do("PUT", r.path("/acl"), aclOf([]string{"*"}, nil), r.pass(1)), 200, "")
 	e.want(e.do("PUT", r.path("/revocations"), r.certs(1), ""), 200, "")
 	r.prekey(2, now.Add(protocol.MaxPrekeyLifetime), nil)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(2), r.pass(2)), 200, "")
@@ -80,7 +80,7 @@ func TestAForgottenBoxRegistersAnew(t *testing.T) {
 	r.prekey(1, now.Add(protocol.MaxPrekeyLifetime), nil)
 	e.want(e.do("PUT", r.path(""), r.registration(1), r.pass(1)), 401, protocol.CodeCertificateRevoked) // still held to what its identity revoked
 	e.want(e.do("PUT", r.path(""), r.registration(3), r.pass(3)), 201, "")
-	if got := e.do("GET", r.path("/acl"), nil, r.pass(3)); got.status != 200 || string(got.body) != `{"version":0,"allow":["*"],"deny":[]}`+"\n" {
+	if got := e.do("GET", r.path("/acl"), nil, r.pass(3)); got.status != 200 || string(got.body) != `{"allow":["*"],"deny":[]}`+"\n" {
 		t.Fatalf("a box registered anew has an ACL: %d %s", got.status, got.body)
 	}
 	if b := held(t, e.do("GET", r.path(""), nil, "")); b == nil || len(b.RevokedCertificates) == 0 {

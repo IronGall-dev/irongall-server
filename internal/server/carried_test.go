@@ -104,7 +104,7 @@ func TestEvery410CarriesTheRecord(t *testing.T) {
 			"a fetch":              e.do("GET", c.box.path("/messages/"+id), nil, pass),
 			"an ack":               e.do("DELETE", c.box.path("/messages/"+id), nil, pass),
 			"a read of its ACL":    e.do("GET", c.box.path("/acl"), nil, pass),
-			"an ACL":               e.do("PUT", c.box.path("/acl"), []byte(`{"version":1,"allow":["*"]}`), pass),
+			"an ACL":               e.do("PUT", c.box.path("/acl"), []byte(`{"allow":["*"]}`), pass),
 			"an adopt":             e.do("PUT", c.box.path("/account"), protocol.AdoptRequest{Key: "iga1_AAAA"}, pass),
 			"a leave":              e.do("DELETE", c.box.path("/account"), nil, pass),
 		}

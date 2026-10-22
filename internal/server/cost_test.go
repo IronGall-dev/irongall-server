@@ -289,7 +289,7 @@ func TestCostItemSizes(t *testing.T) {
 	// An ACL is part of the record, so every write of it costs its size.
 	for _, entries := range []int{1, 50, DefaultLimits().ACLEntries} {
 		b, _ := costBox(t, true, 10)
-		b.ACL = &protocol.ACL{Version: 1, Allow: protocol.NewACLList(false, costAddrs(entries))}
+		b.ACL = &protocol.ACL{Allow: protocol.NewACLList(false, costAddrs(entries))}
 		n := itemSize(boxItem(b))
 		t.Logf("box record, pq, 10 retired, an ACL of %3d entries: %5d B = %d write units", entries, n, wcu(n))
 	}
