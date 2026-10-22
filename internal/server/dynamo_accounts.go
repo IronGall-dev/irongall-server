@@ -190,6 +190,8 @@ func (s *DynamoStore) Adopt(ctx context.Context, b *Box, account string, key [32
 // Leave implements Store: the box record names no account.
 func (s *DynamoStore) Leave(ctx context.Context, b *Box) error {
 	upd := boxRevCheck(b, "REMOVE #acct SET #rev = :new", map[string]string{"#acct": "account"}, map[string]types.AttributeValue{})
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	_, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.boxes,
 		Key:                       upd.Key,
@@ -228,7 +230,9 @@ const (
 // A conflict that lasts every try is ErrStale, and evicts it too.
 func (s *DynamoStore) transact(ctx context.Context, b *Box, items []types.TransactWriteItem, failed map[int]error) error {
 	for try := 1; ; try++ {
-		_, err := s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+		call, cancel := bounded(ctx)
+		_, err := s.db.TransactWriteItems(call, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+		cancel()
 		var tc *types.TransactionCanceledException
 		if !errors.As(err, &tc) {
 			return err

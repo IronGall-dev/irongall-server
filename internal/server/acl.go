@@ -75,7 +75,8 @@ func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 		return fail(protocol.CodeConflict, "GET the same path for the version held, and send above it", "this box's ACL is at version %d, and a new one must be above it", versionValue(*held.Version))
 	}
 	b.ACL = acl
-	if err := s.store.UpdateBox(r.Context(), b); err != nil {
+	ctx := detached(r.Context())
+	if err := s.store.UpdateBox(ctx, b); err != nil {
 		if errors.Is(err, ErrStale) {
 			return fail(protocol.CodeBoxChanged, "retry", "the box changed during the request")
 		}
@@ -84,10 +85,10 @@ func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 	// After the record holds the ACL, so the sends it refuses are refused
 	// from here on. Memory says first whether the box holds any mail.
 	if acl.Deny.Len() > 0 {
-		if n, err := s.store.Count(r.Context(), a); err != nil {
+		if n, err := s.store.Count(ctx, a); err != nil {
 			return err
 		} else if n > 0 {
-			if err := s.store.DeleteFrom(r.Context(), a, acl.Deny.Has); err != nil {
+			if err := s.store.DeleteFrom(ctx, a, acl.Deny.Has); err != nil {
 				return err
 			}
 		}

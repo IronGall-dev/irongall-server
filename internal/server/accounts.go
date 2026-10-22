@@ -88,7 +88,7 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
 		if !k.good(s.now()) {
 			return keyRefused()
 		}
-		switch err := s.store.Adopt(r.Context(), b, account, hash); {
+		switch err := s.store.Adopt(detached(r.Context()), b, account, hash); {
 		case errors.Is(err, ErrKeyRefused):
 			return keyRefused()
 		case errors.Is(err, ErrStale):
@@ -120,7 +120,7 @@ func (s *Server) leave(w http.ResponseWriter, r *http.Request) error {
 		return noSuchMailbox
 	}
 	if b.Account != "" {
-		switch err := s.store.Leave(r.Context(), b); {
+		switch err := s.store.Leave(detached(r.Context()), b); {
 		case errors.Is(err, ErrStale):
 			return fail(protocol.CodeBoxChanged, "retry: irongall account leave", "the box changed during the request")
 		case err != nil:

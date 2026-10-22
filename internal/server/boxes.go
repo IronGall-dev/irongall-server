@@ -117,7 +117,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	if cur != nil { // an address whose identity revoked certificates: what it revoked is kept with the box
 		b.RevokedCerts, b.RevokedCertsSig = cur.RevokedCerts, cur.RevokedCertsSig
 	}
-	err = s.store.CreateBox(r.Context(), b)
+	err = s.store.CreateBox(detached(r.Context()), b)
 	if err == nil {
 		writeJSON(w, http.StatusCreated, struct{}{})
 		return nil
@@ -192,13 +192,20 @@ func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol
 // (PROTOCOL.md §3 step 5): it undoes the delete. The box comes back as it
 // was, its ACL and its account with it, under the new statement, which is
 // taken as a renewal's is: under a later certificate than the box's last
-// (register checked that), and with a key it never published.
+// (register checked that), and with a key it never published. It comes back
+// with no mail: what is left in it, a send that landed after the delete's
+// last pass or a pass that failed, is deleted first
+// (IronGall-dev/irongall-server#15).
 func (s *Server) undelete(w http.ResponseWriter, r *http.Request, b *Box, req *protocol.RegisterRequest, p *protocol.Prekey, cert *protocol.Certificate, now time.Time) error {
 	if err := s.take(b, req.Prekey, req.PrekeySignature, p, cert, req.SenderKeyTypes, now); err != nil {
 		return err
 	}
+	ctx := detached(r.Context())
+	if err := s.store.DeleteMessages(ctx, b.Addr); err != nil {
+		return err
+	}
 	b.State = Active
-	if err := s.store.UpdateBox(r.Context(), b); err != nil {
+	if err := s.store.UpdateBox(ctx, b); err != nil {
 		if errors.Is(err, ErrStale) {
 			return fail(protocol.CodeBoxChanged, "retry: irongall init", "the box changed during the request")
 		}
@@ -417,7 +424,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 			return count[0].refusal(wait)
 		}
 	}
-	stored := false
+	stored := false // or may have been: the count is kept then (mayHaveApplied)
 	defer func() {
 		if stored {
 			counted.keep()
@@ -428,7 +435,8 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	if err := s.take(b, req.Prekey, req.PrekeySignature, p, cert, req.SenderKeyTypes, now); err != nil {
 		return err
 	}
-	if err := s.store.UpdateBox(r.Context(), b); err != nil {
+	if err := s.store.UpdateBox(detached(r.Context()), b); err != nil {
+		stored = mayHaveApplied(err)
 		if errors.Is(err, ErrStale) {
 			return fail(protocol.CodeBoxChanged, "retry: irongall prekey renew", "the box changed during the request")
 		}
@@ -569,7 +577,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	// failed: a revocation sent back must not draw a read of the messages
 	// table each time.
 	if b != nil && b.State == Revoked {
-		if err := s.deleteHeld(r.Context(), b); err != nil {
+		if err := s.deleteHeld(detached(r.Context()), b); err != nil {
 			return err
 		}
 		return revoked()
@@ -636,8 +644,12 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	}
 	defer func() { raise.release(s.now()) }() // settled below, but for a panic
 	if raised || req.Revocation != nil {
-		if err := s.store.Revoke(r.Context(), h, rv); err != nil {
-			raise.release(s.now())
+		if err := s.store.Revoke(detached(r.Context()), h, rv); err != nil {
+			if mayHaveApplied(err) {
+				raise.keep()
+			} else {
+				raise.release(s.now())
+			}
 			if errors.Is(err, ErrStale) {
 				return fail(protocol.CodeBoxChanged, "retry", "the box changed during the request")
 			}
@@ -649,10 +661,11 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	// never served, this deletes it sooner than its expiry would, and then
 	// the box's record goes.
 	if req.Revocation != nil && b.hasRecord() {
-		if err := s.store.DeleteMessages(r.Context(), h); err != nil {
+		ctx := detached(r.Context())
+		if err := s.store.DeleteMessages(ctx, h); err != nil {
 			return err
 		}
-		if err := s.store.DeleteBox(r.Context(), h); err != nil {
+		if err := s.store.DeleteBox(ctx, h); err != nil {
 			return err
 		}
 	}
@@ -691,6 +704,15 @@ func (s *Server) deleteHeld(ctx context.Context, b *Box) error {
 // marked, until its newest certificate ends, so that a registration until
 // then is held to it; DynamoDB's TTL takes it after. A registration while it
 // is kept undoes the delete (undelete).
+//
+// The mail is deleted, then the box marked, then the mail deleted again, so
+// that a send that passed its check of the box before the mark and wrote
+// after the first pass is deleted too (IronGall-dev/irongall-server#15); one
+// that writes after the mark finds the box deleted and deletes what it wrote
+// (send). Not the mark first: a deleted box answers its DELETE 404, so a
+// delete that failed after its mark could not be retried. The second pass is
+// answered 204 whether or not it fails: the box is deleted, what is left in
+// it is served to nobody, and its undoing deletes it.
 func (s *Server) deleteBox(w http.ResponseWriter, r *http.Request) error {
 	a, err := s.owner(r)
 	if err != nil {
@@ -716,15 +738,19 @@ func (s *Server) deleteBox(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return fmt.Errorf("the stored prekey: %w", err)
 	}
-	if err := s.store.DeleteMessages(r.Context(), a); err != nil {
+	ctx := detached(r.Context())
+	if err := s.store.DeleteMessages(ctx, a); err != nil {
 		return err
 	}
 	b.State, b.Expires = Deleted, cert.NotAfter()
-	if err := s.store.UpdateBox(r.Context(), b); err != nil {
+	if err := s.store.UpdateBox(ctx, b); err != nil {
 		if errors.Is(err, ErrStale) {
 			return fail(protocol.CodeBoxChanged, "retry", "the box changed during the request")
 		}
 		return err
+	}
+	if err := s.store.DeleteMessages(ctx, a); err != nil && s.log != nil {
+		s.log.Printf("a delete's second pass over the box's mail: %v", err)
 	}
 	w.WriteHeader(http.StatusNoContent)
 	return nil

@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/logging"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
@@ -454,8 +455,11 @@ func (s *Server) handle(h func(http.ResponseWriter, *http.Request) error) http.H
 		var p *problem
 		if !errors.As(err, &p) {
 			what := "internal error"
-			if IsThrottle(err) {
+			switch {
+			case IsThrottle(err):
 				what = "store throttled" // provisioned capacity, or the SDK's retry quota
+			case r.Context().Err() != nil && errors.Is(err, r.Context().Err()):
+				what = "the caller went away" // a read on its request's context; its writes are detached
 			}
 			if s.log != nil {
 				s.log.Printf("%s: %v", what, err)
@@ -622,6 +626,26 @@ func required(fields ...any) error {
 	return nil
 }
 
+// detached is ctx apart from its request's end, for a store write a request
+// makes once its work is done: the write runs to its end however its caller
+// goes, so that what it changed is counted and reaches memory, and the store
+// bounds each of its calls (bounded; IronGall-dev/irongall-server#14).
+func detached(ctx context.Context) context.Context { return context.WithoutCancel(ctx) }
+
+// mayHaveApplied reports whether a store write that returned err may have
+// been applied all the same: anything but a refusal the store stated, its
+// own (ErrStale, ErrExists, ErrNotFound, ErrKeyRefused) or AWS's to the call
+// itself (a throttle, or another fault of the caller's side). A count
+// reserved for the write is kept then, never given back
+// (IronGall-dev/irongall-server#14).
+func mayHaveApplied(err error) bool {
+	if errors.Is(err, ErrStale) || errors.Is(err, ErrExists) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrKeyRefused) || IsThrottle(err) {
+		return false
+	}
+	var api smithy.APIError
+	return !errors.As(err, &api) || api.ErrorFault() != smithy.FaultClient
+}
+
 // box reads a box's record; a box that does not exist is nil, not an error.
 func (s *Server) box(ctx context.Context, a protocol.Address) (*Box, error) {
 	b, err := s.store.Box(ctx, a)
@@ -658,7 +682,7 @@ func (s *Server) lookup(r *http.Request, a protocol.Address) (*Box, error) {
 
 // lead makes read f of a's record for lookup, the read every lookup of a
 // meanwhile waits on. It runs apart from its caller's request, bounded by
-// loadTimeout, so a caller who hangs up fails none of them
+// storeTimeout, so a caller who hangs up fails none of them
 // (IronGall-dev/irongall-server#32), and it finishes f and settles its
 // reservation however it ends, a panic included (#36).
 func (s *Server) lead(r *http.Request, a protocol.Address, f *read) (*Box, error) {
@@ -668,7 +692,7 @@ func (s *Server) lead(r *http.Request, a protocol.Address, f *read) (*Box, error
 		return nil, err
 	}
 	defer func() { m.release(s.now()) }() // settled below, but for a panic
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), loadTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), storeTimeout)
 	defer cancel()
 	b, err := s.box(ctx, a)
 	s.reads.finish(a, f, b, err)

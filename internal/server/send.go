@@ -179,8 +179,9 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return fail(protocol.CodeSenderNotAllowed, "nothing the sender can change: its client moves the message to outbox/failed/", "this box's ACL does not let your box send to it")
 	}
 	// Then quotas, counted only for sends that carried their sender's pass,
-	// each taken before the write and given back unless the send is stored:
-	// sends in flight at once cannot all pass on one count.
+	// each taken before the write and given back unless the send is stored,
+	// or may have been (mayHaveApplied): sends in flight at once cannot all
+	// pass on one count.
 	stored := false
 	for _, d := range s.sendsOf(lim) {
 		sent, ok, wait := d.bs.reserve(ctx, from.String(), s.now)
@@ -233,14 +234,33 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		ReceivedAt: now.UTC().Truncate(time.Millisecond),
 		ExpiresAt:  now.UTC().Truncate(time.Millisecond).Add(protocol.Retention), // the TTL less the hour and a post's own time (PROTOCOL.md §0, §7)
 	}
-	orig, err := s.store.PutMessage(ctx, to, h, ciphertext)
+	wctx := detached(ctx)
+	orig, err := s.store.PutMessage(wctx, to, h, ciphertext)
 	if err != nil {
+		stored = mayHaveApplied(err)
 		return err
 	}
 	if orig != nil {
 		return s.duplicate(w, orig, from) // a concurrent send won the dedupe record
 	}
 	stored = true
+	// The box may have been deleted or revoked since step 5 read it: then
+	// what this wrote is deleted, as the delete deleted the rest, and the
+	// send is answered as the box now stands (IronGall-dev/irongall-server#15).
+	// One process has the change in memory at once; with more, this is to be
+	// a strongly consistent read (ARCHITECTURE.md, stage 2).
+	if cur, err := s.box(wctx, to); err != nil {
+		return err
+	} else if !cur.open() {
+		if err := s.store.DeleteMessage(wctx, to, msgID); err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		stored = false
+		if cur != nil && cur.State == Revoked {
+			return revoked()
+		}
+		return noSuchMailbox
+	}
 	// The message made, which only its recipient may fetch (RFC 9110 §15.3.2).
 	w.Header().Set("Location", "/v1/"+to.String()+"/messages/"+hexID(h.ID))
 	writeJSON(w, http.StatusCreated, receipt(h))

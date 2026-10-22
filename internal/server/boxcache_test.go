@@ -151,12 +151,22 @@ func TestAnImageDuringAReadKeepsItsFillOut(t *testing.T) {
 			t.Errorf("%s: the cache keeps a copy from before an image applied during the read", c.name)
 		}
 	}
-	s.cache.evict(a)
-	if _, err := s.Box(ctx, a); err != nil {
-		t.Fatal(err)
+	// A read with no write during it is kept. The stream's echo of the
+	// box's own registration, or of another test's write to its shard, can
+	// land during one and rightly keep it out, so a few are allowed.
+	kept := false
+	for range 20 {
+		s.cache.evict(a)
+		if _, err := s.Box(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+		if _, kept = s.cache.get(a); kept {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	if _, ok := s.cache.get(a); !ok {
-		t.Error("a read with no write during it is not kept")
+	if !kept {
+		t.Error("no read of the address in two seconds is kept")
 	}
 }
 
@@ -181,10 +191,21 @@ func TestAnAccountChangeDuringItsReadKeepsTheFillOut(t *testing.T) {
 	if _, ok := s.accCache.get(acc.ID); ok {
 		t.Error("the account cache keeps a copy read before a change seen during the read")
 	}
-	if _, err := s.Account(ctx, acc.ID); err != nil {
-		t.Fatal(err)
+	// One with no change during it is kept. The stream brings every
+	// account's changes, other tests' among them, and one landing during a
+	// read rightly keeps it out, so a few are allowed.
+	kept := false
+	for range 20 {
+		s.accCache.evict(acc.ID)
+		if _, err := s.Account(ctx, acc.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, kept = s.accCache.get(acc.ID); kept {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	if _, ok := s.accCache.get(acc.ID); !ok {
-		t.Error("an account read with no change during it is not kept")
+	if !kept {
+		t.Error("no read of the account in two seconds is kept")
 	}
 }

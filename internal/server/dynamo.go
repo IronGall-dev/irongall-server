@@ -662,15 +662,25 @@ func IsThrottle(err error) bool {
 	return false
 }
 
-// loadTimeout bounds a read that callers share, which runs apart from the
-// request that started it: a box's load into memory (ensure), and a lookup's
-// read of a box's record (Server.lead).
-const loadTimeout = 10 * time.Second
+// storeTimeout bounds what runs apart from the request that started it: a
+// read that callers share, a box's load into memory (ensure) and a lookup's
+// read of a box's record (Server.lead), and each call to AWS of a write,
+// which runs to its end however its caller goes (bounded).
+const storeTimeout = 10 * time.Second
+
+// bounded is ctx bounded by storeTimeout, for one call to AWS of a write. A
+// handler hands every store write a context apart from its request
+// (detached), so that what a write changed is counted and reaches memory
+// whenever the write was made (IronGall-dev/irongall-server#14); this bounds
+// each call, not a whole delete of a box's mail, which is many.
+func bounded(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, storeTimeout)
+}
 
 // ensure loads box a into memory on its first use by this process.
 func (s *DynamoStore) ensure(ctx context.Context, a protocol.Address) error {
 	return s.idx.ensure(ctx, a, func() (boxRead, error) {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), loadTimeout)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeTimeout)
 		defer cancel()
 		return s.readBox(ctx, a)
 	})
@@ -820,6 +830,8 @@ func (s *DynamoStore) CreateBox(ctx context.Context, b *Box) error {
 		return err
 	}
 	b.Rev = 1
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	_, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                &s.boxes,
 		Item:                     boxItem(b),
@@ -855,6 +867,8 @@ func (s *DynamoStore) UpdateBox(ctx context.Context, b *Box) error {
 		sets = append(sets, "#"+k+" = :"+k)
 	}
 	slices.Sort(sets)
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	_, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.boxes,
 		Key:                       boxKey(b.Addr),
@@ -877,6 +891,8 @@ func (s *DynamoStore) UpdateBox(ctx context.Context, b *Box) error {
 
 // DeleteBox implements Store.
 func (s *DynamoStore) DeleteBox(ctx context.Context, a protocol.Address) error {
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	if _, err := s.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &s.boxes, Key: boxKey(a)}); err != nil {
 		return err
 	}
@@ -903,6 +919,8 @@ func (s *DynamoStore) Revoke(ctx context.Context, a protocol.Address, rv *Revoca
 		sets = append(sets, "#c = :c", "#s = :s", "#t = :t")
 		cond = aws.String("attribute_not_exists(#t) OR #t < :t")
 	}
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	out, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.boxes,
 		Key:                       revocationsKey(a),
@@ -958,7 +976,9 @@ func (s *DynamoStore) Dedupe(ctx context.Context, box protocol.Address, id [32]b
 // no live one has this id. A crash after the body leaves an orphan the
 // lifecycle rule reaps, and the retry writes both again.
 func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *Header, body []byte) (*Header, error) {
-	if _, err := s.s3.PutObject(ctx, &s3.PutObjectInput{
+	put, cancel := bounded(ctx)
+	defer cancel()
+	if _, err := s.s3.PutObject(put, &s3.PutObjectInput{
 		Bucket: &s.bucket,
 		Key:    aws.String(bodyKey(box, h.ID)),
 		Body:   bytes.NewReader(body),
@@ -969,7 +989,9 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 		return nil, err
 	}
 	now := s.nowMs()
-	_, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
+	item, cancelItem := bounded(ctx)
+	defer cancelItem()
+	_, err := s.db.PutItem(item, &dynamodb.PutItemInput{
 		TableName:                           &s.msgs,
 		Item:                                msgItem(box, h),
 		ConditionExpression:                 aws.String("attribute_not_exists(#id) OR #r <= :cutoff"),
@@ -992,6 +1014,8 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 // stays as the dedupe record until it expires. ErrNotFound if it is not live.
 func (s *DynamoStore) retire(ctx context.Context, box protocol.Address, id [32]byte) error {
 	now := s.nowMs()
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	out, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.msgs,
 		Key:                       msgKey(box, id),
@@ -1020,6 +1044,8 @@ func (s *DynamoStore) retire(ctx context.Context, box protocol.Address, id [32]b
 }
 
 func (s *DynamoStore) deleteBody(ctx context.Context, box protocol.Address, id [32]byte) error {
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	_, err := s.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.bucket, Key: aws.String(bodyKey(box, id))})
 	if err != nil && !isNoSuchKey(err) {
 		return err
@@ -1077,12 +1103,16 @@ func (s *DynamoStore) DeleteMessages(ctx context.Context, box protocol.Address) 
 
 // DeleteFrom implements Store: the live messages in the box whose sender
 // matches, as DeleteMessages deletes them all. The live index carries each
-// message's sender, so one Query of it finds them.
+// message's sender, so one Query of it finds them. The Query is strongly
+// consistent, which a local secondary index allows: a message stored just
+// before it is in it (IronGall-dev/irongall-server#15).
 func (s *DynamoStore) DeleteFrom(ctx context.Context, box protocol.Address, from func(protocol.Address) bool) error {
 	var ids [][32]byte
-	p := dynamodb.NewQueryPaginator(s.db, s.liveQuery(box, s.liveFrom(), s.consistent))
+	p := dynamodb.NewQueryPaginator(s.db, s.liveQuery(box, s.liveFrom(), true))
 	for p.HasMorePages() {
-		out, err := p.NextPage(ctx)
+		page, cancel := bounded(ctx)
+		out, err := p.NextPage(page)
+		cancel()
 		if err != nil {
 			return err
 		}
@@ -1110,7 +1140,9 @@ func (s *DynamoStore) DeleteFrom(ctx context.Context, box protocol.Address, from
 		for _, id := range chunk {
 			objs = append(objs, s3types.ObjectIdentifier{Key: aws.String(bodyKey(box, id))})
 		}
-		out, err := s.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: &s.bucket, Delete: &s3types.Delete{Objects: objs, Quiet: aws.Bool(true)}})
+		del, cancel := bounded(ctx)
+		out, err := s.s3.DeleteObjects(del, &s3.DeleteObjectsInput{Bucket: &s.bucket, Delete: &s3types.Delete{Objects: objs, Quiet: aws.Bool(true)}})
+		cancel()
 		if err != nil {
 			return err
 		}

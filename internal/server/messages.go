@@ -305,7 +305,7 @@ func (s *Server) ack(w http.ResponseWriter, r *http.Request) error {
 	if err := s.held(r, box, id); err != nil {
 		return err
 	}
-	err = s.store.DeleteMessage(r.Context(), box, id)
+	err = s.store.DeleteMessage(detached(r.Context()), box, id)
 	if errors.Is(err, ErrNotFound) {
 		return gone()
 	}
