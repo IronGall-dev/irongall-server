@@ -81,12 +81,12 @@ done
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$IG_BASE/to/$(tr a-f A-F <<< "$GA")")" = 404 ] && ok "a link in uppercase is 404, as clients refuse it" || bad "uppercase link page"
 
 printf 'from Go, <b>&\n' | gocli "$G" send "$RL" > /dev/null && ok "Go → recipe: sent, to the recipe box's link" || bad "Go → recipe: send"
-out=$(recipe "$R" ig_recv 2> "$work/err") && jq -e --arg f "$GA" '.body == "from Go, <b>&\n" and .from == $f' <<< "$out" > /dev/null \
+out=$(recipe "$R" ig_recv 2> "$work/err") && jq -e --arg f "$GA" '.envelope.body == "from Go, <b>&\n" and .envelope.from == $f' <<< "$out" > /dev/null \
   && ok "Go → recipe: delivered by ig_recv, verified" || bad "Go → recipe: ig_recv: $out $(cat "$work/err")"
 
 printf 'from the recipe\n' > "$work/body"
 recipe "$R" "ig_send $GL '$work/body'" && ok "recipe → Go: sent, to the Go box's link" || bad "recipe → Go: ig_send"
-out=$(gocli "$G" recv 2> "$work/err") && jq -e --arg f "$RA" '.body == "from the recipe\n" and .from == $f' <<< "$out" > /dev/null \
+out=$(gocli "$G" recv 2> "$work/err") && jq -e --arg f "$RA" '.envelope.body == "from the recipe\n" and .envelope.from == $f' <<< "$out" > /dev/null \
   && ok "recipe → Go: delivered by irongall recv, verified" || bad "recipe → Go: recv: $out $(cat "$work/err")"
 
 recipe "$R" "ig_rekey" && ok "recipe: ig_rekey" || bad "recipe: ig_rekey"
@@ -104,16 +104,16 @@ err=$(recipe "$R" "ig_send $nobody '$work/body'" 2>&1); rc=$?
 gocli "$G" alias add sh "$RL" > /dev/null || bad "Go alias add"
 M1=11111111-2222-4333-8444-555555555555
 id=$(printf 'threaded, from Go\n' | gocli "$G" send --subject 'a subject' --reply-to $M1 sh | jq -r 'select(.type == "sent") | .id') && ig_hex "$id" || bad "Go send with flags, to an alias: $id"
-out=$(recipe "$R" ig_recv 2> "$work/err") && jq -e --arg m $M1 '.subject == "a subject" and .in_reply_to == $m and .body == "threaded, from Go\n"' <<< "$out" > /dev/null \
+out=$(recipe "$R" ig_recv 2> "$work/err") && jq -e --arg m $M1 '.envelope.subject == "a subject" and .envelope.in_reply_to == $m and .envelope.body == "threaded, from Go\n"' <<< "$out" > /dev/null \
   && ok "Go → recipe: subject and in_reply_to arrive" || bad "Go → recipe with flags: $out $(cat "$work/err")"
-mid=$(jq -r .msg_id <<< "$out")
-jq -e --arg id "$id" --argjson d "$out" '.receipt.id == $id and (.receipt | keys == ["expires_at", "id", "received_at"]) and del(.receipt) == ($d | del(.type, .id))' "$G/sent/$RA.$mid.json" > /dev/null \
-  && ok "Go's sent/ record is the line its recipient delivered, plus the real server's receipt" || bad "Go's sent/ record: $(cat "$G/sent/$RA.$mid.json" 2>&1)"
+mid=$(jq -r .envelope.msg_id <<< "$out")
+jq -e --arg id "$id" --argjson d "$out" '.receipt.id == $id and (.receipt | keys == ["expires_at", "id", "received_at"]) and keys == ["envelope", "receipt"] and .envelope == $d.envelope' "$G/sent/$RA.$mid.json" > /dev/null \
+  && ok "Go's sent/ record is the envelope its recipient delivered, and the real server's receipt" || bad "Go's sent/ record: $(cat "$G/sent/$RA.$mid.json" 2>&1)"
 recipe "$R" "ig_send $GA '$work/body'" || bad "recipe send"
-out=$(gocli "$G" recv 2> "$work/err") && jq -e --arg f "$RA" '.from == $f and .body == "from the recipe\n"' <<< "$out" > /dev/null \
+out=$(gocli "$G" recv 2> "$work/err") && jq -e --arg f "$RA" '.envelope.from == $f and .envelope.body == "from the recipe\n"' <<< "$out" > /dev/null \
   && ok "recipe → Go: delivered" || bad "recipe → Go: $out $(cat "$work/err")"
-rec="$R/sent/$GA.$(jq -r .msg_id <<< "$out").json"
-jq -e --argjson d "$out" '(.receipt | keys == ["expires_at", "id", "received_at"]) and del(.receipt) == ($d | del(.type, .id))' "$rec" > /dev/null && [ -e "$G/inbox/$(jq -r .receipt.id "$rec").json" ] \
+rec="$R/sent/$GA.$(jq -r .envelope.msg_id <<< "$out").json"
+jq -e --argjson d "$out" '(.receipt | keys == ["expires_at", "id", "received_at"]) and keys == ["envelope", "receipt"] and .envelope == $d.envelope' "$rec" > /dev/null && [ -e "$G/inbox/$(jq -r .receipt.id "$rec").json" ] \
   && ok "the recipe's sent/ record is the same, its receipt naming the file in the recipient's inbox/" || bad "the recipe's sent/ record: $(cat "$rec" 2>&1)"
 
 # --- 4. a box whose identity is of the optional key type, ecdsa-sha2-nistp256, in each client ---
@@ -128,14 +128,14 @@ GPO=$(gocli "$GP" init --identity-type ecdsa-sha2-nistp256 2> "$work/err") && GP
 [ "$(curl -s "$IG_BASE/v1/$GA" | jq -c .sender_key_types)" = '["ssh-ed25519","ecdsa-sha2-nistp256"]' ] && [ "$(curl -s "$IG_BASE/v1/$RA" | jq -c .sender_key_types)" = '["ssh-ed25519","ecdsa-sha2-nistp256"]' ] \
   && ok "each client's box is served with the sender key types it declared" || bad "sender_key_types: $(curl -s "$IG_BASE/v1/$GA" | jq -c .sender_key_types) $(curl -s "$IG_BASE/v1/$RA" | jq -c .sender_key_types)"
 printf 'p256 recipe to go\n' > "$work/body5"
-recipe "$RP" "ig_send $GL '$work/body5'" && out=$(gocli "$G" recv 2> "$work/err") && jq -e --arg f "$RPA" '.body == "p256 recipe to go\n" and .from == $f' <<< "$out" > /dev/null \
+recipe "$RP" "ig_send $GL '$work/body5'" && out=$(gocli "$G" recv 2> "$work/err") && jq -e --arg f "$RPA" '.envelope.body == "p256 recipe to go\n" and .envelope.from == $f' <<< "$out" > /dev/null \
   && ok "recipe on P-256 → Go: delivered, verified under a certificate ssh-keygen made with a P-256 key" || bad "recipe on P-256 → Go: $out $(cat "$work/err")"
-printf 'go to p256 recipe\n' | gocli "$G" send "$RPL" > /dev/null && out=$(recipe "$RP" ig_recv 2> "$work/err") && jq -e --arg f "$GA" '.body == "go to p256 recipe\n" and .from == $f' <<< "$out" > /dev/null \
+printf 'go to p256 recipe\n' | gocli "$G" send "$RPL" > /dev/null && out=$(recipe "$RP" ig_recv 2> "$work/err") && jq -e --arg f "$GA" '.envelope.body == "go to p256 recipe\n" and .envelope.from == $f' <<< "$out" > /dev/null \
   && ok "Go → recipe on P-256: delivered" || bad "Go → recipe on P-256: $out $(cat "$work/err")"
-printf 'p256 go to recipe\n' | gocli "$GP" send "$RL" > /dev/null && out=$(recipe "$R" ig_recv 2> "$work/err") && jq -e --arg f "$GPA" '.body == "p256 go to recipe\n" and .from == $f' <<< "$out" > /dev/null \
+printf 'p256 go to recipe\n' | gocli "$GP" send "$RL" > /dev/null && out=$(recipe "$R" ig_recv 2> "$work/err") && jq -e --arg f "$GPA" '.envelope.body == "p256 go to recipe\n" and .envelope.from == $f' <<< "$out" > /dev/null \
   && ok "Go on P-256 → recipe: delivered, verified by ssh-keygen under a certificate the Go client made with a P-256 key" || bad "Go on P-256 → recipe: $out $(cat "$work/err")"
 printf 'recipe to p256 go\n' > "$work/body5"
-recipe "$R" "ig_send $GPL '$work/body5'" && out=$(gocli "$GP" recv 2> "$work/err") && jq -e --arg f "$RA" '.body == "recipe to p256 go\n" and .from == $f' <<< "$out" > /dev/null \
+recipe "$R" "ig_send $GPL '$work/body5'" && out=$(gocli "$GP" recv 2> "$work/err") && jq -e --arg f "$RA" '.envelope.body == "recipe to p256 go\n" and .envelope.from == $f' <<< "$out" > /dev/null \
   && ok "recipe → Go on P-256: delivered" || bad "recipe → Go on P-256: $out $(cat "$work/err")"
 # A box that declares Ed25519 only: the server refuses it a P-256 sender's mail, and the Go client does not even post it.
 GE="$work/ge"
@@ -154,9 +154,9 @@ for c in "-540 9 minutes slow" "2940 49 minutes fast"; do
   off=${c%% *}; name=${c#* }; d="$work/clock$off"; gf="$work/gf$off"
   L=$(recipe "$d" "$(clock "$off"); ig_init" 2> "$work/err" | linkof) && A=${L##*/} && ig_hex "$A" && GFL=$(gocli "$gf" init | linkof) && GFA=${GFL##*/} \
     && printf 'to the box whose clock is off\n' | gocli "$gf" send "$L" > /dev/null \
-    && out=$(recipe "$d" "$(clock "$off"); ig_recv" 2>> "$work/err") && jq -e --arg f "$GFA" '.body == "to the box whose clock is off\n" and .from == $f' <<< "$out" > /dev/null \
+    && out=$(recipe "$d" "$(clock "$off"); ig_recv" 2>> "$work/err") && jq -e --arg f "$GFA" '.envelope.body == "to the box whose clock is off\n" and .envelope.from == $f' <<< "$out" > /dev/null \
     && printf 'from the box whose clock is off\n' > "$work/body6" && recipe "$d" "$(clock "$off"); ig_send $GFL '$work/body6'" 2>> "$work/err" \
-    && out=$(gocli "$gf" recv 2>> "$work/err") && jq -e --arg f "$A" '.body == "from the box whose clock is off\n" and .from == $f' <<< "$out" > /dev/null \
+    && out=$(gocli "$gf" recv 2>> "$work/err") && jq -e --arg f "$A" '.envelope.body == "from the box whose clock is off\n" and .envelope.from == $f' <<< "$out" > /dev/null \
     && recipe "$d" "$(clock "$off"); ig_rekey" 2>> "$work/err" \
     && ok "a recipe box whose clock is $name registers, renews, and exchanges mail with a Go box made that moment" || bad "clock $name: $out $(cat "$work/err")"
 done
