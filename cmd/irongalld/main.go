@@ -69,6 +69,28 @@ func main() {
 	}
 }
 
+// sizeCaps refuses a cap on a ciphertext the protocol does not allow: one
+// above protocol.MaxCiphertext, the largest every reader takes (PROTOCOL.md
+// §4.5), or one that is not a whole number of its own padding blocks, which a
+// message just under it would be padded past (§4.3a). serve checks the two
+// before anything starts.
+func sizeCaps(l server.Limits) error {
+	for _, c := range []struct {
+		flag string
+		n    int
+	}{{"-max-size", l.MaxSize}, {"-account-max-size", l.AccountMaxSize}} {
+		switch {
+		case c.n < 0:
+			return fmt.Errorf("%s: %d is not a size", c.flag, c.n)
+		case c.n > protocol.MaxCiphertext:
+			return fmt.Errorf("%s: %d bytes is over the largest ciphertext the protocol allows, %d (PROTOCOL.md §4.5)", c.flag, c.n, protocol.MaxCiphertext)
+		case protocol.PaddedSize(c.n) != c.n:
+			return fmt.Errorf("%s: %d bytes is not a whole number of its own padding blocks, so a message just under it would be padded past it (PROTOCOL.md §4.3a): %d is the next size that is", c.flag, c.n, protocol.PaddedSize(c.n))
+		}
+	}
+	return nil
+}
+
 func serve(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	dev := fs.Bool("dev", false, "keep everything in memory, with no AWS")
@@ -84,8 +106,8 @@ func serve(args []string) error {
 	streamEvery := fs.Duration("stream-interval", time.Second, "how often each stream shard is read")
 	proxies := fs.String("trusted-proxy", "", "comma-separated CIDRs whose CF-Connecting-IP names the client: the proxy in front, if any")
 	l := server.DefaultLimits()
-	fs.IntVar(&l.MaxSize, "max-size", l.MaxSize, "cap on a ciphertext, bytes: a send reads its body to it")
-	fs.IntVar(&l.AccountMaxSize, "account-max-size", l.AccountMaxSize, "the most an account can lift -max-size to, bytes (up to -max-size: nothing)")
+	fs.IntVar(&l.MaxSize, "max-size", l.MaxSize, "cap on a ciphertext, bytes: a send reads its body to it. A whole number of its own padding blocks, at most the protocol's largest ciphertext (PROTOCOL.md §4.3a, §4.5), or serve does not start")
+	fs.IntVar(&l.AccountMaxSize, "account-max-size", l.AccountMaxSize, "the most an account can lift -max-size to, bytes (up to -max-size: nothing). Held as -max-size is")
 	fs.IntVar(&l.PairCap, "pair-cap", l.PairCap, "unacked messages per sender and box (0: off)")
 	fs.IntVar(&l.BoxCap, "box-cap", l.BoxCap, "messages per box (0: off)")
 	fs.IntVar(&l.SendsPerDay, "sends-per-day", l.SendsPerDay, "sends per sender a day: that many at once, then one back each day divided by it (0: off)")
@@ -118,6 +140,9 @@ func serve(args []string) error {
 	metricsListen := fs.String("metrics-listen", "", "address to serve the operator's metrics on, at /metrics in Prometheus' text format: a listener of its own, never the API's (empty: none)")
 	siteDir := fs.String("site", "", "a directory of pages to serve at every path outside /v1/ and /to/, each at its own path and an index at its directory's, read once at start (empty: none; those paths are 404)")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := sizeCaps(l); err != nil {
 		return err
 	}
 	logger := log.New(server.Redacting(os.Stderr), "", log.LstdFlags|log.LUTC)

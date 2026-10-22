@@ -185,7 +185,7 @@ A send signs the envelope with the recipient bound into the signature, then encr
 
 1. Who is sending, before the body is read: the per-IP rate; the mailbox the pass names registered and not revoked; the pass itself; then one of that mailbox's calls, which every send spends, a retry included (`LIMITS.md`).
 2. B's address well-formed, in lowercase; `prekey_serial` and `certificate_serial` present once each, written as a statement writes a serial, and no other parameter in the query.
-3. Size: the body is the ciphertext's bytes, read to that sender's cap and no further.
+3. Size: the body is the ciphertext's bytes, read to that sender's cap and no further. Every cap is at most the protocol's largest ciphertext, which every reader takes, so mail this server stores is mail every client reads.
 4. It is an age file.
 5. B registered and active (an in-memory lookup).
 6. Duplicate check: a retry of an already-stored message gets the original receipt, before anything about new mail is asked, so whatever has changed at B since; the same ciphertext from another sender is a conflict.
@@ -198,7 +198,7 @@ A send signs the envelope with the recipient bound into the signature, then encr
 **Receiving, B**
 
 1. Poll with the pass. An empty mailbox is answered from memory: about 34 µs of server CPU, no storage I/O.
-2. Fetch a message: the ciphertext's bytes alone, no more than the size its list entry gave, and refused if not exactly that size. Its `from`, on the server's word and checked below, and its times are the list entry's.
+2. Fetch a message: the ciphertext's bytes alone, no more than the size its list entry gave, which is at most the protocol's largest ciphertext, and refused if not exactly that size. Its `from`, on the server's word and checked below, and its times are the list entry's.
 3. Decrypt with every retained prekey.
 4. **The layout:** line 1 is the envelope, line 2 begins the one signature block, which ends at its first END line, and a line feed must follow that line or the message is refused: no later END line is looked for. Nothing after it is read, and nothing is searched for.
 5. **Whose it is:** the envelope is one JSON object, read as every reader reads JSON (`PROTOCOL.md` §0b): no key twice in any object in it, nested at most 32 deep; it carries an identity document, and its `from` must be that document's SHA-256.

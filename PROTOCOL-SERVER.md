@@ -29,9 +29,9 @@
 - **Step 8, a new box:** DynamoDB `PutItem` of the box's record with `state: active`, the certificate's serial and the SHA-256 of its bytes, and its expiry (`expires_at`, §7), condition `attribute_not_exists(addr)` → `201 {}`. One write, and the box is in use: no call of its owner is needed first.
 - **Step 9:** the record's `cert_serial` and `cert` are what later calls are held to (§6.1b, §6.4). Both are written with the statement they come from, in the same write, and so is `senders`: the sender key types the box declared with that statement (`PROTOCOL.md` §2c), of which the server keeps the names this build verifies, or `any` alone.
 
-## §4.3a. Padding: the size limits are checked by hand
+## §4.3a. Padding: the size limits are checked at start
 
-- **The server does nothing, and a size limit must be a whole number of its own blocks.** As sizes go, 64 KiB and 10 MiB are such numbers and 100 KiB is not: a message just under a limit like that one would be padded past it. With limits chosen that way a client never needs to know the limit. 🛑 Nothing checks this when `irongalld` starts: check `-max-size` and `-account-max-size` by hand before changing either.
+- **The server does nothing to a message, and a size limit must be a whole number of its own blocks.** As sizes go, 64 KiB and 10 MiB are such numbers and 100 KiB is not: a message just under a limit like that one would be padded past it. With limits chosen that way a client never needs to know the limit. **`irongalld serve` refuses to start on a `-max-size` or `-account-max-size` that is not one** (`protocol.PaddedSize(n) != n`), **or that is above the protocol's largest ciphertext,** `protocol.MaxCiphertext`, which every reader takes (`PROTOCOL.md` §4.5): `sizeCaps` in `cmd/irongalld/main.go`, decided on IronGall-dev/irongall-client#351.
 
 ## §4. The send pipeline: steps 1 to 3 and 5 to 9
 
