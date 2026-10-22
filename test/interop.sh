@@ -12,7 +12,9 @@
 #      client checking the one it is shown, refusing mail under a revoked certificate and following a box to its next one;
 #   8. a revocation of an address with no box here: kept and served, its registration refused, and a Go box shown it before it
 #      posts;
-#   9. the sender ACL: a Go box's block reaches this server, which refuses the recipe box's send.
+#   9. the sender ACL: a Go box's block reaches this server, which refuses the recipe box's send;
+#  10. the pass's name: the server runs with -names, so every pass above was checked for the name it is called by, and one made
+#      for another name is refused.
 # The recipe runs a box of its own: the two clients meet over the wire, never in one box directory.
 # Every script step runs in a FRESH shell (agents run each command in a new one). Every box is post-quantum: where the
 # local age is older than 1.3, the client module's own (its go.mod's tool, built by go tool) goes first in PATH.
@@ -44,7 +46,7 @@ port=$((20000 + RANDOM % 20000))
 if [ -n "${IRONGALL_TEST_MSGS_TABLE:-}" ]; then
   store=(-boxes-table "$IRONGALL_TEST_BOXES_TABLE" -msgs-table "$IRONGALL_TEST_MSGS_TABLE" -accounts-table "$IRONGALL_TEST_ACCOUNTS_TABLE" -bucket "$IRONGALL_TEST_BUCKET" -names "127.0.0.1:$port")
 else
-  store=(--dev)
+  store=(--dev -names "127.0.0.1:$port")   # --dev takes a pass made for any name without -names: with it, every pass's name is checked (PROTOCOL.md §6.1b)
 fi
 echo "server: irongalld serve ${store[*]:0:6}"
 "$work/irongalld" serve "${store[@]}" -listen "127.0.0.1:$port" -poll-burst 0 -registrations-per-hour 0 2> "$work/server.log" & srv=$!   # every box here registers from one address
@@ -61,7 +63,7 @@ gocli(){ local home=$1; shift; mkdir -p -m 700 "$home" && { [ -e "$home/policy" 
 holds(){ IRONGALL_BASE=http://127.0.0.1:9 gocli "$1" revocation ask "$2" 2> /dev/null | jq -e '.type == "revoked"' > /dev/null; }   # <go box> <address>: it keeps a revocation of the address, with no server to ask (a box keeps its records in its state file)
 through(){ gocli "$1" revocation ask "$2" 2> /dev/null | jq -r 'select(.type == "certificates_revoked") | .through'; }
 passof(){ local a n t; a=$(cat "$1/address") && n=$(gocli "$1" status | jq -r .prekey_serial) && t=$(date -u -d "@$(( $(date +%s) + 600 ))" +%Y-%m-%dT%H:%M:%SZ) \
-  && printf 'irongall-pass-v1\n%s\n%s\n%s\n' "$a" "${IG_BASE#http://}" "$t" | ssh-keygen -q -Y sign -n "irongall-pass-v1:$a" -f "$1/work/$n-cert.pub" > "$work/pass.sig" \
+  && printf 'irongall-pass-v1\n%s\n%s\n%s\n' "$a" "${2:-${IG_BASE#http://}}" "$t" | ssh-keygen -q -Y sign -n "irongall-pass-v1:$a" -f "$1/work/$n-cert.pub" > "$work/pass.sig" \
   && printf 'irongall-pass address="%s", not_after="%s", signature="%s"' "$a" "$t" "$(base64 < "$work/pass.sig" | tr -d '\n')"; }   # <go box> → a pass its working key signs, as PROTOCOL.md §6.1b makes one with ssh-keygen   # <go box> <address> → the serial its revocation of certificates runs through, as the box holds it once it has asked
 linkof(){ jq -er 'select(.type == "box") | .link'; }      # a box line, as init and addr print one → its link
 revoked_line(){ printf '{"type":"revoked","address":"%s","message":"published to the server"}' "$1"; }      # <address> → the line revocation publish prints
@@ -282,6 +284,12 @@ XB="$work/xb"; XBL=$(recipe "$XB" "ig_init" | linkof) && XBA=${XBL##*/} || bad "
 out=$(gocli "$G" peer block "$XBL" 2>&1) && curl -s -H "Authorization: $(passof "$G")" "$IG_BASE/v1/$GA/acl" | jq -e --arg x "$XBA" 'keys == ["allow","deny"] and .allow == ["*"] and .deny == [$x]' > /dev/null \
   && out=$(recipe "$XB" "ig_send $GL '$work/body'" 2>&1); [ $? -ne 0 ] && grep -q 'ERROR 403 sender_not_allowed' <<< "$out" && grep -q 'nothing is sent' <<< "$out" && [ ! -e "$XB/outbox" ] \
   && ok "a Go box's block reaches the server as its ACL, which refuses the recipe box's send: nothing is sent or kept" || bad "the ACL: $out"
+
+# --- 10. the pass's name: a pass made for a name this server is not called by is refused (PROTOCOL.md §6.1b) ---
+other="127.0.0.2:$port"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $other" -H "Authorization: $(passof "$G" "$other")" "$IG_BASE/v1/$GA/acl")" = 401 ] \
+  && [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: $(passof "$G")" "$IG_BASE/v1/$GA/acl")" = 200 ] \
+  && ok "a pass made for a name the server is not called by is refused, and one made for the name it is called by is taken" || bad "the pass's name check"
 
 echo "interop: $pass PASS, $fail FAIL"
 [ "$fail" -eq 0 ] || exit 1
