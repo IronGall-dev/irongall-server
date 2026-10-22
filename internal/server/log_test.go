@@ -188,9 +188,10 @@ func TestTheAccessLogWritesWhatTheRoutersMatched(t *testing.T) {
 	}
 }
 
-// The AWS SDK's own lines are written through the redaction
-// (IronGall-dev/irongall-server#72): serve and account both load their
-// configuration with AWSLogger.
+// AWSLogger writes the AWS SDK's own lines through the redaction
+// (IronGall-dev/irongall-server#72). That serve and account load their
+// configuration with it is held in cmd/irongalld, where they run
+// (TestServeAndAccountWriteTheSDKsLinesRedacted, #81).
 func TestTheAWSSDKsLinesAreRedacted(t *testing.T) {
 	var logged bytes.Buffer
 	run := strings.Repeat("ab", 32)
