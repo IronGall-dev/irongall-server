@@ -109,7 +109,7 @@ func (e *env) box(kt protocol.KeyType) *client.Box {
 // mail.
 func landAll(t *testing.T, b *client.Box) {
 	t.Helper()
-	if err := b.SetPolicy(client.Policy{Unknown: client.LandInbox, Server: client.AdmitAll}); err != nil {
+	if err := b.SetPolicy(t.Context(), client.Policy{Unknown: client.LandInbox, Server: client.AdmitAll}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -500,7 +500,7 @@ func TestTheGoClientsACL(t *testing.T) {
 	if codeOf(err) != protocol.CodeSenderNotAllowed || !strings.Contains(err.Error(), "moved to outbox/failed/") {
 		t.Fatalf("a send from a blocked sender: %v", err)
 	}
-	if err := b.SetPolicy(client.Policy{Unknown: client.LandHeld, Server: client.AdmitAllowed}); err != nil {
+	if err := b.SetPolicy(t.Context(), client.Policy{Unknown: client.LandHeld, Server: client.AdmitAllowed}); err != nil {
 		t.Fatal(err)
 	}
 	send(t, b, c, "hello")

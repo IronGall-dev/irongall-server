@@ -54,7 +54,7 @@ for _ in $(seq 300); do   # up once the API answers other than 503 (loading)
 done
 
 R="$work/r"; G="$work/g"
-recipe(){ local home=$1; shift; IRONGALL_HOME=$home bash -c ". '$SCRIPT'; $*"; }   # a fresh shell per call
+recipe(){ local home=$1; shift; IG_HOME=$home bash -c ". '$SCRIPT'; $*"; }   # a fresh shell per call
 # The Go client holds mail from a sender its box has not allowed (PROTOCOL.md §5.6). These tests are of what the two clients
 # send each other, so every box the Go client runs lands every sender's mail in inbox/, by its policy file, unless a test wrote one.
 gocli(){ local home=$1; shift; mkdir -p -m 700 "$home" && { [ -e "$home/policy" ] || printf 'unknown inbox\n' > "$home/policy"; } && IRONGALL_HOME=$home "$work/irongall" "$@"; }

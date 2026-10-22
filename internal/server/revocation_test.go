@@ -64,7 +64,7 @@ func recordOf(t *testing.T, r reply) ([]byte, map[string]json.RawMessage) {
 // record is a box's own revocation, as its owner makes it.
 func record(t *testing.T, b *client.Box) *protocol.Revocations {
 	t.Helper()
-	rec, err := b.Revocation()
+	rec, err := b.Revocation(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,10 +236,11 @@ func TestADeletedBoxIsRevoked(t *testing.T) {
 
 // A server keeps a revocation for an address it has no box for (PROTOCOL.md
 // §6.3): of an address never registered, and of one whose box was deleted.
-// It serves it from both reads, and holds a later registration to it: 410
-// while the address is revoked, and nothing under a certificate its identity
-// revoked. A revocation of certificates alone leaves the read 404, and a
-// registration above it carries it.
+// It serves it at the address's revocations, and at the read of the box too
+// once the address itself is revoked, and holds a later registration to it:
+// 410 while the address is revoked, and nothing under a certificate its
+// identity revoked. A revocation of certificates alone leaves the read 404,
+// and a registration above it carries it.
 func TestARevocationIsKeptWithNoBox(t *testing.T) {
 	e := newEnv(t, relaxed())
 	now := e.clock.Now()
@@ -264,6 +265,21 @@ func TestARevocationIsKeptWithNoBox(t *testing.T) {
 	e.want(e.do("PUT", r.path(""), r.registration(6), r.pass(6)), 201, "")
 	if b := held(t, e.do("GET", r.path(""), nil, "")); b == nil || !bytes.Equal(b.RevokedCertificates, floor.RevokedCertificates) {
 		t.Fatal("a box registered above its identity's revocation of certificates is read without it")
+	}
+
+	// Certificates revoked of an address whose box was deleted: the read of
+	// the box answers as if it had never been registered, and its
+	// revocations are served (IronGall-dev/irongall-server#80).
+	d := e.raw().register(protocol.MaxPrekeyLifetime)
+	e.want(e.do("DELETE", d.path(""), nil, d.pass(1)), 204, "")
+	deleted := d.certs(1)
+	e.want(e.do("PUT", d.path("/revocations"), deleted, ""), 200, "")
+	e.want(e.do("GET", d.path(""), nil, ""), 404, protocol.CodeNoSuchMailbox)
+	got = e.do("GET", d.path("/revocations"), nil, "")
+	e.want(got, 200, "")
+	served = protocol.Revocations{}
+	if err := json.Unmarshal(got.body, &served); err != nil || !bytes.Equal(served.RevokedCertificates, deleted.RevokedCertificates) {
+		t.Fatalf("the revocation of certificates of an address whose box was deleted: %s", got.body)
 	}
 
 	// The address revoked with no box: the read is 410 with the record, and

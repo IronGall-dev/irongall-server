@@ -193,7 +193,7 @@ func (e *env) numbers(a protocol.Address) (prekey, cert uint64) {
 // the one made with the prekey it published last.
 func worker(t *testing.T, b *client.Box) ssh.Signer {
 	t.Helper()
-	st, err := b.Status()
+	st, err := b.Status(t.Context())
 	if err != nil || st.PrekeySerial == 0 {
 		t.Fatalf("the box's status: %+v, %v", st, err)
 	}
