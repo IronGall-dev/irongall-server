@@ -14,18 +14,15 @@ import (
 )
 
 // State is what a server holds of an address (PROTOCOL.md §3a). A box's
-// record is Active or Deleted; Revoked and NoBox are what the store answers
-// from the address's revocations alone.
+// record is Active, the one state a record is written in or read back as;
+// Revoked and NoBox are what the store answers from the address's
+// revocations alone.
 type State string
 
 // The states.
 const (
 	// Active is a registered box.
 	Active State = "active"
-	// Deleted is a box its owner deleted: answered as if never registered,
-	// but to a registration, which undoes the delete. Its record is kept
-	// until its newest certificate ends, then DynamoDB's TTL takes it.
-	Deleted State = "deleted"
 	// Revoked is an address its identity revoked. Its record is deleted,
 	// and the revocation is kept for good.
 	Revoked State = "revoked"
@@ -66,8 +63,7 @@ type Box struct {
 	Created time.Time
 	// Expires is when the record may go: DynamoDB's TTL deletes it some time
 	// after (PROTOCOL.md §7). Every registration and renewal moves it to
-	// when nothing of the box is valid any more, and a delete to when its
-	// newest certificate ends. Zero: never.
+	// when nothing of the box is valid any more. Zero: never.
 	Expires time.Time
 	// Account is the account the box belongs to, or "" (PROTOCOL.md §6.5).
 	// Only Adopt and Leave change it.
@@ -95,16 +91,17 @@ type Box struct {
 	ACL *protocol.ACL
 }
 
-// open reports whether b is a box that takes calls: one registered, not
-// deleted and not revoked. Every other state is answered as no box, but
-// Revoked, which is 410.
+// open reports whether b is a box that takes calls: one registered and not
+// revoked. Every other state is answered as no box, but Revoked, which is
+// 410.
 func (b *Box) open() bool { return b != nil && b.State == Active }
 
-// writable returns an error unless b's state is one a record holds: what
-// the store answers from revocations alone is never written as a record.
+// writable returns an error unless b's state is the one a record holds:
+// what the store answers from revocations alone is never written as a
+// record.
 func (b *Box) writable() error {
-	if b.State != Active && b.State != Deleted {
-		return fmt.Errorf("a box record is %s or %s, never %s", Active, Deleted, b.State)
+	if b.State != Active {
+		return fmt.Errorf("a box record is %s, never %s", Active, b.State)
 	}
 	return nil
 }
@@ -430,7 +427,7 @@ type Store interface {
 	// only a read can tell, which is what Box then does.
 	Known(a protocol.Address) (b *Box, ok bool)
 	// CreateBox stores a new box's record at Rev 1, or returns ErrExists if
-	// the address has one, of a deleted box or not.
+	// the address has one.
 	CreateBox(ctx context.Context, b *Box) error
 	// UpdateBox stores b's record if the stored one is still at b.Rev, and
 	// bumps b.Rev; otherwise ErrStale. It writes nothing of the revocations.
@@ -460,8 +457,8 @@ type Store interface {
 	// its dedupe record stays until it expires. ErrNotFound if it is not
 	// live.
 	DeleteMessage(ctx context.Context, box protocol.Address, id [32]byte) error
-	// DeleteMessages deletes every live message in a box (a delete, a
-	// revocation).
+	// DeleteMessages deletes every live message in a box (a revocation of
+	// its address).
 	DeleteMessages(ctx context.Context, box protocol.Address) error
 	// DeleteFrom deletes every live message in a box whose sender from
 	// matches, as acks do: what an ACL's deny list now refuses (PROTOCOL.md

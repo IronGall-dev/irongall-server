@@ -44,17 +44,17 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	// The pass showed the box exists, so reading its record is no guess at
 	// an address: it is not a read lookup would count or refuse.
 	// It is held to what the pass's check held the box to (sender), since
-	// the box can be deleted or revoked, or its certificate revoked, between
-	// the two reads.
+	// the box can be revoked, or its certificate revoked, between the two
+	// reads.
 	sender, err := s.box(ctx, from)
 	if err != nil {
 		return err
 	}
 	switch {
-	case sender == nil, sender.State == Deleted, sender.State == NoBox:
-		return fail(protocol.CodeUnknownSender, "register your own box first: irongall init", "the box the pass names is not registered")
-	case sender.State == Revoked:
+	case sender != nil && sender.State == Revoked:
 		return fail(protocol.CodeSenderRevoked, "your box is revoked: make a new one, irongall init", "the sending box is revoked")
+	case !sender.open():
+		return fail(protocol.CodeUnknownSender, "register your own box first: irongall init", "the box the pass names is not registered")
 	}
 	if listed, err := sender.listed(sender.CertSerial); err != nil {
 		return err
@@ -303,8 +303,8 @@ func (s *Server) deliver(ctx context.Context, p *post) (delivered, error) {
 		return delivered{h: orig}, nil // a send of the same ciphertext from another process, or a stale dedupe read
 	}
 	stored = true
-	// The box may have been deleted or revoked since step 5 read it: then
-	// what this wrote is deleted, as the delete deleted the rest, and the
+	// The box's address may have been revoked since step 5 read it: then
+	// what this wrote is deleted, as the revocation deleted the rest, and the
 	// send is answered as the box now stands (IronGall-dev/irongall-server#15).
 	// One process has the change in memory at once; with more, this is to be
 	// a strongly consistent read (ARCHITECTURE.md, stage 2).

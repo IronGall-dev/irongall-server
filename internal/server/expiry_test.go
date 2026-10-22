@@ -34,8 +34,7 @@ func (e *env) stands(a protocol.Address) (*Box, *protocol.Certificate) {
 
 // A box's record may go once nothing of the box is valid any more
 // (PROTOCOL.md §7): a registration and every renewal set its expiry to the
-// later of its certificate's end and its prekey's last mail, and a delete to
-// its certificate's end, its mail being gone.
+// later of its certificate's end and its prekey's last mail.
 func TestARecordExpiresWhenNothingOfTheBoxIsValid(t *testing.T) {
 	e := newEnv(t, relaxed())
 	now := e.clock.Now()
@@ -51,18 +50,11 @@ func TestARecordExpiresWhenNothingOfTheBoxIsValid(t *testing.T) {
 	if !b.Expires.Equal(cert.NotAfter()) || !cert.NotAfter().After(b.Prekey.NotAfter.Add(protocol.TTL)) {
 		t.Fatalf("a renewal's record expires %v, want its certificate's end, %v", b.Expires, cert.NotAfter())
 	}
+	// A renewal for the full lifetime moves it back to its prekey's last mail.
 	r.prekey(3, now.Add(protocol.MaxPrekeyLifetime), nil)
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(3), r.pass(3)), 200, "")
-	e.want(e.do("DELETE", r.path(""), nil, r.pass(3)), 204, "")
-	b, cert = e.stands(r.id.Address())
-	if b.State != Deleted || !b.Expires.Equal(cert.NotAfter()) {
-		t.Fatalf("a deleted box's record is %s and expires %v, want deleted at its certificate's end, %v", b.State, b.Expires, cert.NotAfter())
-	}
-	// A registration that undoes the delete sets it as a registration does.
-	r.prekey(4, now.Add(protocol.MaxPrekeyLifetime), nil)
-	e.want(e.do("PUT", r.path(""), r.registration(4), r.pass(4)), 201, "")
-	if b, _ = e.stands(r.id.Address()); b.State != Active || !b.Expires.Equal(b.Prekey.NotAfter.Add(protocol.TTL)) {
-		t.Fatalf("an undone delete's record is %s and expires %v", b.State, b.Expires)
+	if b, _ = e.stands(r.id.Address()); !b.Expires.Equal(b.Prekey.NotAfter.Add(protocol.TTL)) {
+		t.Fatalf("a renewal for the full lifetime leaves the record expiring %v, want %v", b.Expires, b.Prekey.NotAfter.Add(protocol.TTL))
 	}
 }
 
@@ -147,10 +139,9 @@ func TestTheRecordAndTheRevocationsAreTwoItems(t *testing.T) {
 }
 
 // A second process that holds a box learns from the stream what another
-// wrote: a revocation of the box's certificates, the box's delete, and the
-// revocation of its address, each answered from its memory once it arrives.
-// AWS only.
-func TestASecondProcessLearnsWhatIsRevokedAndDeleted(t *testing.T) {
+// wrote: a revocation of the box's certificates, and the revocation of its
+// address, each answered from its memory once it arrives. AWS only.
+func TestASecondProcessLearnsWhatIsRevoked(t *testing.T) {
 	e, _ := dynamoEnv(t)
 	other := startDynamo(t, e.clock.Now)
 	srv := httptest.NewServer(apitest.Handler(t, New(Config{Store: other, Limits: relaxed(), Now: e.clock.Now, Ready: other.Ready}).Handler()))
@@ -179,11 +170,6 @@ func TestASecondProcessLearnsWhatIsRevokedAndDeleted(t *testing.T) {
 	e2.want(poll(certs)(), 200, "") // the second process holds it
 	e.want(e.do("PUT", certs.path("/revocations"), certs.certs(1), ""), 200, "")
 	within("the box's certificate revoked", poll(certs), 401, protocol.CodeCertificateRevoked)
-
-	deleted := e.raw().register(protocol.MaxPrekeyLifetime)
-	e2.want(poll(deleted)(), 200, "")
-	e.want(e.do("DELETE", deleted.path(""), nil, deleted.pass(1)), 204, "")
-	within("the box deleted", poll(deleted), 404, protocol.CodeNoSuchMailbox)
 
 	revoked := e.raw().register(protocol.MaxPrekeyLifetime)
 	e2.want(poll(revoked)(), 200, "")

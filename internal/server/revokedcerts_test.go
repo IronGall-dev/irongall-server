@@ -178,7 +178,7 @@ func TestRevokedCertificates(t *testing.T) {
 	e.want(e.do("PUT", path, good, ""), 409, protocol.CodeConflict)
 	e.want(e.do("GET", r.path("/messages"), nil, seen), 401, protocol.CodeCertificateRevoked)
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 401, protocol.CodeCertificateRevoked)
-	e.want(e.do("DELETE", r.path(""), nil, r.pass(2)), 401, protocol.CodeCertificateRevoked)
+	e.want(e.do("GET", r.path("/acl"), nil, r.pass(2)), 401, protocol.CodeCertificateRevoked)
 	e.want(e.sendTo(other, 1, 1, r, 2), 401, protocol.CodeCertificateRevoked)
 	e.want(e.sendTo(r, 2, 2, other, 1), 409, protocol.CodePrekeyExpired)
 	e.want(put(2, 2), 401, protocol.CodeCertificateRevoked)

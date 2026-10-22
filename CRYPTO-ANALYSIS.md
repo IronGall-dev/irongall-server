@@ -183,7 +183,7 @@ A send signs the envelope with the recipient bound into the signature, then encr
 
 **The server's checks, cheapest first; nothing is written until all pass**
 
-1. Who is sending, before the body is read: the per-IP rate; the mailbox the pass names registered, not deleted and not revoked; the pass itself; then one of that mailbox's calls, which every send spends, a retry included (`LIMITS.md`).
+1. Who is sending, before the body is read: the per-IP rate; the mailbox the pass names registered and not revoked; the pass itself; then one of that mailbox's calls, which every send spends, a retry included (`LIMITS.md`).
 2. B's address well-formed, in lowercase; `prekey_serial` and `certificate_serial` present once each, written as a statement writes a serial, and no other parameter in the query.
 3. Size: the body is the ciphertext's bytes, read to that sender's cap and no further.
 4. It is an age file.
@@ -241,7 +241,7 @@ We can stop or slow mail, and we see its metadata. We cannot read it, forge it, 
 | Replay old ciphertext — the recipient's seen-set and `sent_at` window reject it | Re-attribute a message: the `from` it gives must be the sender whose signature is inside |
 | List a message under an id that is not its hash — the client refuses it, and names every file by the hash it computes | Show two readers different envelopes: the client parses exact keys, no key twice, and prints only the checked fields |
 | Serve a stale prekey to a sender who has never seen a newer one, until its `not_after`: at most 33 days, or the mailbox's shorter lifetime | Substitute an identity (a SHA-256 second preimage), or a working key or a prekey (an Ed25519 forgery) |
-| See every pass (as Cloudflare does). A pass gives, for the minutes it has left, control of that mailbox's availability: irrecoverable deletion of unacked mail, deleting the mailbox, posting in its name | Turn a pass into plaintext or into a signature on mail, make a pass of its own, or keep a mailbox deleted: a registration under a working key the identity certified undoes the delete, and the owner's next renewal makes one |
+| See every pass (as Cloudflare does). A pass gives, for the minutes it has left, control of that mailbox's availability: irrecoverable deletion of unacked mail, its ACL, which can pause the mailbox, posting in its name | Turn a pass into plaintext or into a signature on mail, make a pass of its own, or end the address, which only the identity's revocation does (`PROTOCOL.md` §6.3) |
 | Serve altered instructions to an agent that runs what it is served | Change the public client or recipe, which are pinned by commit and checksum: the server serves data and pointers only |
 | Write anything it likes in an error's words, a receipt, an account name or a list's cursor | Put those words in front of a reader, or into a URL: a client shows an error as a code it knows, under its own status and beside its own `type`, and values it has checked to their types, in its own words, checks a receipt against the ciphertext it posted, and an account name and a cursor against their forms (`PROTOCOL.md` §13, §5.1) |
 | Refuse registrations, rate-limit, revoke our own service | Alter a message undetected: age's AEAD and the signature both cover it |

@@ -143,34 +143,16 @@ func TestAWriteOutlivesItsCallersHangUp(t *testing.T) {
 	if n, _ := e.store.Count(ctx0, r.id.Address()); n != 0 {
 		t.Errorf("an ACL put whose caller hung up mid-write left %d messages from the sender it denies", n)
 	}
-
-	// The owner's delete, whose mark is held, and whose second pass over the
-	// mail comes after it.
-	hangUp("DELETE", r.path(""), "", nil, r.pass(1))
-	if b, _ := e.store.Box(ctx0, r.id.Address()); b.State != Deleted {
-		t.Errorf("a delete whose caller hung up mid-write left the box %s", b.State)
-	}
 }
 
-// aroundADelete runs hooks inside a box's delete and a send: before each
-// PutMessage and UpdateBox, and it fails the DeleteMessages call of the
-// number set.
-type aroundADelete struct {
+// heldPut runs a hook before the next PutMessage, once.
+type heldPut struct {
 	Store
-	mu         sync.Mutex
-	put        func()
-	update     func(*Box)
-	deletes    int
-	failDelete int
+	mu  sync.Mutex
+	put func()
 }
 
-func (s *aroundADelete) set(f func(*aroundADelete)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	f(s)
-}
-
-func (s *aroundADelete) PutMessage(ctx context.Context, box protocol.Address, h *Header, body []byte) (*Header, error) {
+func (s *heldPut) PutMessage(ctx context.Context, box protocol.Address, h *Header, body []byte) (*Header, error) {
 	s.mu.Lock()
 	f := s.put
 	s.put = nil
@@ -181,95 +163,20 @@ func (s *aroundADelete) PutMessage(ctx context.Context, box protocol.Address, h 
 	return s.Store.PutMessage(ctx, box, h, body)
 }
 
-func (s *aroundADelete) UpdateBox(ctx context.Context, b *Box) error {
-	s.mu.Lock()
-	f := s.update
-	s.update = nil
-	s.mu.Unlock()
-	if f != nil {
-		f(b)
-	}
-	return s.Store.UpdateBox(ctx, b)
-}
-
-func (s *aroundADelete) DeleteMessages(ctx context.Context, a protocol.Address) error {
-	s.mu.Lock()
-	s.deletes++
-	fail := s.deletes == s.failDelete
-	s.mu.Unlock()
-	if fail {
-		return errors.New("injected: a delete that failed")
-	}
-	return s.Store.DeleteMessages(ctx, a)
-}
-
-// Mail sent around a box's delete does not outlive it
-// (IronGall-dev/irongall-server#15): a send that writes after the box is
-// marked deleted deletes what it wrote and is answered 404; one that writes
-// between the delete's first pass over the mail and the mark is deleted by
-// the second; and what a second pass that failed left is deleted when the
-// delete is undone, so the box comes back with no mail. A send that writes
-// after the box's address is revoked is answered 410 and leaves nothing.
-func TestMailSentAroundADeleteDoesNotOutliveIt(t *testing.T) {
+// Mail sent around a revocation of its box's address does not outlive it
+// (IronGall-dev/irongall-server#15): a send that passed its check of the box
+// before the revocation and writes after it deletes what it wrote, and is
+// answered 410.
+func TestMailSentAroundARevocationDoesNotOutliveIt(t *testing.T) {
 	ctx0 := context.Background()
-	s := &aroundADelete{}
+	s := &heldPut{}
 	e := newEnv(t, relaxed(), func(c *Config) { s.Store, c.Store = c.Store, s })
-	undo := func(owner *raw) {
-		t.Helper()
-		owner.prekey(2, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
-		e.want(e.do("PUT", owner.path(""), owner.registration(2), owner.pass(2)), http.StatusCreated, "")
-		if l := listOf(t, e.do("GET", owner.path("/messages"), nil, owner.pass(2))); l.Count != 0 {
-			t.Errorf("the box came back from its delete holding %d messages", l.Count)
-		}
-	}
-
-	// A send that writes after the mark.
 	owner, from := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
 	writing, release := make(chan struct{}), make(chan struct{})
-	s.set(func(s *aroundADelete) { s.put = func() { close(writing); <-release } })
+	s.mu.Lock()
+	s.put = func() { close(writing); <-release }
+	s.mu.Unlock()
 	sent := make(chan reply, 1)
-	go func() { sent <- e.sendTo(owner, 1, 1, from, 1) }()
-	<-writing
-	e.want(e.do("DELETE", owner.path(""), nil, owner.pass(1)), http.StatusNoContent, "")
-	close(release)
-	e.want(<-sent, http.StatusNotFound, protocol.CodeNoSuchMailbox)
-	if n, _ := e.store.Count(ctx0, owner.id.Address()); n != 0 {
-		t.Errorf("a send that wrote after the mark left %d messages", n)
-	}
-	undo(owner)
-
-	// A send that writes between the first pass and the mark, then the
-	// second pass fails.
-	for _, second := range []string{"deletes it", "fails"} {
-		owner, from := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
-		var before reply
-		s.set(func(s *aroundADelete) {
-			s.deletes, s.failDelete = 0, 0
-			if second == "fails" {
-				s.failDelete = 2
-			}
-			s.update = func(b *Box) {
-				if b.State == Deleted {
-					before = e.sendTo(owner, 1, 1, from, 1) // the box is not marked yet
-				}
-			}
-		})
-		e.want(e.do("DELETE", owner.path(""), nil, owner.pass(1)), http.StatusNoContent, "")
-		e.want(before, http.StatusCreated, "")
-		n, _ := e.store.Count(ctx0, owner.id.Address())
-		switch {
-		case second == "deletes it" && n != 0:
-			t.Errorf("a send that wrote before the mark left %d messages after the second pass", n)
-		case second == "fails" && n != 1:
-			t.Fatalf("with the second pass failed, the box holds %d messages; the test wants the one left", n)
-		}
-		undo(owner)
-	}
-
-	// A send that writes after the address is revoked.
-	owner, from = e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
-	writing, release = make(chan struct{}), make(chan struct{})
-	s.set(func(s *aroundADelete) { s.put = func() { close(writing); <-release } })
 	go func() { sent <- e.sendTo(owner, 1, 1, from, 1) }()
 	<-writing
 	sig, err := protocol.SignRevocation(owner.signer, owner.id.Address())

@@ -357,10 +357,10 @@ func (s *Server) owner(r *http.Request, params ...string) (protocol.Address, err
 	switch {
 	case err != nil:
 		return a, err
-	case !ok, st.State == Deleted: // a deleted box is answered as if never registered
-		return a, noSuchMailbox
 	case st.State == Revoked:
 		return a, revoked()
+	case !ok, st.State != Active: // no box, or none in the state that takes calls
+		return a, noSuchMailbox
 	case st.Listed:
 		return a, listedCertificate()
 	}
@@ -380,10 +380,10 @@ func (s *Server) sender(r *http.Request) (protocol.Address, error) {
 	switch {
 	case err != nil:
 		return a, err
-	case !ok, st.State == Deleted:
-		return a, fail(protocol.CodeUnknownSender, "register your own box first: irongall init", "the box the pass names is not registered")
 	case st.State == Revoked:
 		return a, fail(protocol.CodeSenderRevoked, "your box is revoked: make a new one, irongall init", "the sending box is revoked")
+	case !ok, st.State != Active:
+		return a, fail(protocol.CodeUnknownSender, "register your own box first: irongall init", "the box the pass names is not registered")
 	case st.Listed:
 		return a, listedCertificate()
 	}

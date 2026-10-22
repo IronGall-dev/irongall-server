@@ -202,7 +202,8 @@ func TestACLRefusesSends(t *testing.T) {
 
 // A deny list deletes the box's unacked mail from what it matches, and only
 // that; a retry of a message stored before is still answered with its
-// receipt, since a retry is no new mail (PROTOCOL.md §4.5 step 6).
+// receipt, since a retry is no new mail (PROTOCOL.md §4.5 step 6). One that
+// denies everyone is how a box pauses, and a later ACL undoes it (§6.2).
 func TestACLDenyPurges(t *testing.T) {
 	e := newEnv(t, relaxed())
 	ctx := context.Background()
@@ -239,12 +240,19 @@ func TestACLDenyPurges(t *testing.T) {
 	}
 	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(a)), 403, protocol.CodeSenderNotAllowed)
 
-	// Deny "*": everything goes, and nothing more comes.
-	e.want(e.do("PUT", to+"/acl", aclOf(2, []string{"*"}, []string{"*"}), e.pass(b)), 200, "")
+	// The pause (PROTOCOL.md §6.2), nobody allowed and everyone denied:
+	// everything goes, and nothing more comes until a later ACL undoes it.
+	// What the pause deleted stays deleted.
+	e.want(e.do("PUT", to+"/acl", aclOf(2, []string{}, []string{"*"}), e.pass(b)), 200, "")
 	if n, err := e.store.Count(ctx, b.Address()); err != nil || n != 0 {
 		t.Fatalf("after denying everyone the box holds %d, %v", n, err)
 	}
 	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(c)), 403, protocol.CodeSenderNotAllowed)
+	e.want(e.do("PUT", to+"/acl", aclOf(3, []string{"*"}, nil), e.pass(b)), 200, "")
+	e.want(e.do("POST", to+"/messages", e.sealTo(b), e.pass(c)), 201, "")
+	if n, err := e.store.Count(ctx, b.Address()); err != nil || n != 1 {
+		t.Fatalf("after the pause is undone the box holds %d, %v; want the one sent since", n, err)
+	}
 }
 
 // On DynamoDB, an ACL put through one process reaches another through the

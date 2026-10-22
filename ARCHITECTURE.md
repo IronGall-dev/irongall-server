@@ -167,7 +167,7 @@ sequenceDiagram
 ### Following the stream
 - **Nothing is kept across restarts.** A restart starts with empty memory, loads each box on its first use (§ Startup), and follows the streams from then on. A follower that loses its place (more than the stream's 24 hours behind, an iterator that expired before it read anything, the stream gone) exits the process, and the restart rebuilds.
 - Each process reads the streams of the boxes, messages and accounts tables itself, with the `NEW_IMAGE` view, one follower per stream.
-  - **Boxes:** a record's image (`sk` `0x00`) refreshes the LRU and the standing. An address's revocations (`sk` `0x01`) add to what memory holds of it, since nothing in them is ever taken away. A record's removal, by the TTL or a revocation of its address, makes the process forget the box: its next use reads it again, so a removal that arrives after a later registration costs one read and loses nothing. Other items under an address are not memory's.
+  - **Boxes:** a record's image (`sk` `0x00`) refreshes the LRU and the standing; one that does not read as a record, in a state this build never writes among them, makes the process forget the box, whose next read then fails. An address's revocations (`sk` `0x01`) add to what memory holds of it, since nothing in them is ever taken away. A record's removal, by the TTL or a revocation of its address, makes the process forget the box: its next use reads it again, so a removal that arrives after a later registration costs one read and loses nothing. Other items under an address are not memory's.
   - **Messages:** an image with `live` adds the message's mark; one without (an ack, or a body found gone) removes it. Removals are ignored: only the TTL deletes a message item, after it expired, and memory drops a mark at its expiry.
   - **Accounts:** an account record's image (`sk` `0x00`) refreshes it in the account LRU; a removal evicts it. Its other items (adopt keys) are not memory's. Which boxes an account holds is the box records' to say, through the boxes table's index on `account`, which nothing in memory follows.
 - **With one process the followers are a placeholder for stage 2.** The process applies its own writes to memory at once and a box loads from the tables on first use, so the streams carry only its own echoes (which clear its ack tombs) and hand edits to the tables. So with one process `-stream-interval` can be long: at ten times the interval, idle CPU and Streams reads both fell tenfold (measured). Lower it when a second process arrives: each empty `GetRecords` costs ~0.34 ms of CPU (measured; never profiled).
@@ -233,7 +233,7 @@ What changes:
 - **Not built:** `net/http/pprof` on the same listener, which Boulder serves there.
 
 ### Background jobs
-**Not built.** The plan: one process holds a lease, a DynamoDB item taken with a conditional put that expires, and runs the background jobs. None is planned now: DynamoDB's TTL deletes a box's record once nothing valid for it is left (`PROTOCOL-SERVER.md` §7), so there is no reaper of our own and no `last_seen`. A deleted box is not in memory unless something used it, since memory loads per box (§ Startup).
+**Not built.** The plan: one process holds a lease, a DynamoDB item taken with a conditional put that expires, and runs the background jobs. None is planned now: DynamoDB's TTL deletes a box's record once nothing valid for it is left (`PROTOCOL-SERVER.md` §7), so there is no reaper of our own and no `last_seen`. A box past its expiry is not in memory unless something used it, since memory loads per box (§ Startup).
 
 ### Failure modes
 
@@ -325,7 +325,7 @@ Decided 2026-10-10 and gone from this list: DynamoDB Streams as the change log (
 - **The default budget for layer 2.** Proposed: on, with a byte budget; 0 means counts only.
 - **Limits and resident state:**
   - per-process shares plus edge rules for the per-IP limits;
-  - eviction of a box nothing uses: the index holds a loaded box until the process restarts or its record is deleted, a deleted box's marked record included.
+  - eviction of a box nothing uses: the index holds a loaded box until the process restarts or its record is deleted.
 - **The readiness threshold:** 30 s of stream lag, proposed.
 
 ## Estimates and measurements

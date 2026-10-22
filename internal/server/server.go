@@ -211,8 +211,7 @@ const (
 func (s *Server) routes() []route {
 	return []route{
 		{"GET /v1/{addr}", s.getBox, passAnyBox},
-		{"PUT /v1/{addr}", s.register, passNone}, // its pass is read after its body
-		{"DELETE /v1/{addr}", s.deleteBox, passPathBox},
+		{"PUT /v1/{addr}", s.register, passNone},      // its pass is read after its body
 		{"PUT /v1/{addr}/prekey", s.prekey, passNone}, // its pass is read after its body
 		{"PUT /v1/{addr}/revocations", s.revoke, passNone},
 		{"GET /v1/{addr}/revocations", s.getRevocations, passNone},
@@ -305,11 +304,10 @@ func (s *Server) boxsCall(pass passRule, r *http.Request) bool {
 
 // live reports whether this process's memory holds box a as live, with no
 // read of a store: loaded (Held), or its record in the cache (Known), and
-// not deleted, not revoked, its current certificate not one its identity
-// revoked. Memory is what the stream keeps current, so a change made through
-// another process counts as one made here. A box memory does not hold is
-// not live here: its call spends its address's flood budget, and its route
-// reads it.
+// active: not revoked, its current certificate not one its identity revoked.
+// Memory is what the stream keeps current, so a change made through another
+// process counts as one made here. A box memory does not hold is not live
+// here: its call spends its address's flood budget, and its route reads it.
 func (s *Server) live(a protocol.Address) bool {
 	if st, ok := s.store.Held(a); ok {
 		return st.State == Active && !st.Listed

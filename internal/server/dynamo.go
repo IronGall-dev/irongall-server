@@ -359,8 +359,8 @@ func decodeStanding(it item) (Standing, uint64, error) {
 	if err != nil {
 		return Standing{}, 0, err
 	}
-	if State(state) != Active && State(state) != Deleted {
-		return Standing{}, 0, fmt.Errorf("item: a record's state is %q", state)
+	if State(state) != Active { // a record is written active and no other way
+		return Standing{}, 0, fmt.Errorf("item: a record's state is %q, not %q", state, Active)
 	}
 	doc, err := it.bytes("identity")
 	if err != nil {
@@ -1104,8 +1104,8 @@ func (s *DynamoStore) DeleteMessage(ctx context.Context, box protocol.Address, i
 	return s.retire(ctx, box, id)
 }
 
-// DeleteMessages implements Store (a delete, a revocation): every live message in the box, as
-// acks: bodies first, then each item leaves the list.
+// DeleteMessages implements Store (a revocation): every live message in the
+// box, as acks: bodies first, then each item leaves the list.
 func (s *DynamoStore) DeleteMessages(ctx context.Context, box protocol.Address) error {
 	return s.DeleteFrom(ctx, box, func(protocol.Address) bool { return true })
 }
@@ -1251,7 +1251,11 @@ func (s *DynamoStore) Fetched(ctx context.Context, box protocol.Address, id [32]
 }
 
 // applyBoxImage applies an item of the -boxes-table table as it now is,
-// from the stream: a box's record, or an address's revocations.
+// from the stream: a box's record, or an address's revocations. A record
+// this build cannot read, such as one in a state it never writes, is
+// forgotten, not skipped: memory then answers for none of it, and the
+// address's next use reads the record, which fails, so nothing is served or
+// taken for it on what memory held before.
 func (s *DynamoStore) applyBoxImage(it item) {
 	a, sk, err := boxItemKey(it)
 	if err != nil {
@@ -1262,7 +1266,8 @@ func (s *DynamoStore) applyBoxImage(it item) {
 	case bytes.Equal(sk, []byte{skBox}):
 		st, rev, err := decodeStanding(it)
 		if err != nil {
-			s.logf("boxes: skipping a box record: %v", err)
+			s.logf("boxes: forgetting a box record that does not read: %v", err)
+			s.forget(a)
 			return
 		}
 		s.misses.wrote(a)

@@ -132,9 +132,9 @@ func TestIndex(t *testing.T) {
 		if st, ok := x.standing(box); !ok || st != second {
 			t.Fatalf("standing %v %v", st, ok)
 		}
-		x.setStanding(box, Standing{State: Deleted, Cert: [32]byte{2}}, 4)
-		if st, _ := x.standing(box); st.State != Deleted {
-			t.Fatal("deleted not kept")
+		x.setStanding(box, Standing{State: Active, Cert: [32]byte{3}}, 4)
+		if st, _ := x.standing(box); st.Cert != [32]byte{3} {
+			t.Fatal("a later standing not kept")
 		}
 		x.forget(box)
 		if _, ok := x.standing(box); ok {

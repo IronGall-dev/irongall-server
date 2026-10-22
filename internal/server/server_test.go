@@ -546,46 +546,6 @@ func TestOwnerCalls(t *testing.T) {
 	e.want(e.do("GET", r.path("/messages"), nil, ahead), 401, protocol.CodePassExpired)
 	e.clock.Add(time.Second)
 	e.want(e.do("GET", r.path("/messages"), nil, ahead), 200, "")
-
-	// Delete: the box is answered as if it had never been registered, and its
-	// mail is deleted at once. A renewal brings nothing back; a registration
-	// under a later certificate than the box's last, with a key it never
-	// published, undoes the delete while its record is kept, and the box
-	// comes back as it was, its ACL with it, but for the mail.
-	a := e.box(protocol.Classic)
-	if _, err := a.Send(context.Background(), r.id.Address(), "deleted with the box"); err != nil {
-		t.Fatal(err)
-	}
-	e.want(e.do("PUT", r.path("/acl"), aclOf(1, []string{"*"}, nil), pass), 200, "")
-	e.want(e.do("DELETE", r.path(""), nil, pass), 204, "")
-	e.want(e.do("GET", r.path("/messages"), nil, pass), 404, protocol.CodeNoSuchMailbox)
-	e.want(e.do("GET", r.path(""), nil, ""), 404, protocol.CodeNoSuchMailbox)
-	e.want(e.do("GET", r.path("/revocations"), nil, ""), 404, protocol.CodeNotRevoked)
-	e.want(e.do("DELETE", r.path(""), nil, pass), 404, protocol.CodeNoSuchMailbox)
-	if _, err := a.Send(context.Background(), r.id.Address(), "to a deleted box"); codeOf(err) != protocol.CodeNoSuchMailbox {
-		t.Fatalf("send to a deleted box: %v", err)
-	}
-	e.want(e.do("PUT", r.path("/prekey"), r.upload(1), pass), 404, protocol.CodeNoSuchMailbox)
-	e.want(e.do("PUT", r.path(""), r.registration(1), pass), 401, protocol.CodeCertificateNotCurrent)
-	r.prekey(2, e.clock.Now().Add(protocol.MaxPrekeyLifetime), r.keys[1])
-	e.want(e.do("PUT", r.path(""), r.registration(2), r.pass(2)), 400, protocol.CodePrekeyNotNew)
-	r.prekey(3, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
-	e.want(e.do("PUT", r.path(""), r.registration(3), r.pass(3)), 201, "")
-	e.want(e.do("PUT", r.path(""), r.registration(3), r.pass(3)), 200, "") // an identical retry, now of a registered box
-	if _, err := a.Send(context.Background(), r.id.Address(), "to a box whose delete was undone"); err != nil {
-		t.Fatalf("send to a box whose delete was undone: %v", err)
-	}
-	// The pass from before the new certificate is refused, though the server
-	// took it a moment ago; one under the new certificate is taken.
-	e.want(e.do("GET", r.path("/messages"), nil, pass), 401, protocol.CodeCertificateNotCurrent)
-	list := e.do("GET", r.path("/messages"), nil, r.pass(3))
-	e.want(list, 200, "")
-	if !bytes.Contains(list.body, []byte(`"count":1`)) {
-		t.Fatalf("the delete did not delete the mail: %s", list.body)
-	}
-	if got := e.do("GET", r.path("/acl"), nil, r.pass(3)); got.status != 200 || !bytes.Contains(got.body, []byte(`"version":1`)) {
-		t.Fatalf("the ACL did not come back with the box: %d %s", got.status, got.body)
-	}
 }
 
 // An address in a path is 64 lowercase hex characters, so a box has one URL:
@@ -984,9 +944,11 @@ func TestSendPipeline(t *testing.T) {
 	e.clock.Add(protocol.PassLifetime)
 	e.want(e.do("POST", to+"/messages", ok, ranOut), 401, protocol.CodePassExpired)
 
-	// A registered sender that its owner deleted (TestOwnerCalls has the rest).
+	// A registered sender the server has since forgotten.
 	c := e.raw().register(time.Hour)
-	e.want(e.do("DELETE", c.path(""), nil, c.pass(1)), 204, "")
+	if err := e.store.DeleteBox(t.Context(), c.id.Address()); err != nil { // as the TTL deletes it
+		t.Fatal(err)
+	}
 	e.want(e.do("POST", to+"/messages", ok, c.pass(1)), 403, protocol.CodeUnknownSender)
 
 	first := e.do("POST", to+"/messages", ok, pass)

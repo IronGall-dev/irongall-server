@@ -86,8 +86,8 @@ func respelled(t *testing.T, pass string) string {
 // counted by the router's own (LIMITS.md, rule 1;
 // IronGall-dev/irongall-client#269, IronGall-dev/irongall-server#67, #69,
 // #74). So from an address past its flood budget, every route on a box in
-// every state (live, revoked, deleted, its current certificate revoked, and
-// one the server holds nothing of), the link page, a site's page and a
+// every state (live, revoked, forgotten, its current certificate revoked,
+// and one the server holds nothing of), the link page, a site's page and a
 // request no route answers are refused 429 requests, whatever the call
 // carries, with nothing else done: no other count of any limit taken, no
 // pass parsed or checked, no box looked up, no body read. The one call that
@@ -142,8 +142,10 @@ func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.want(call(fresh(), "PUT", revoked.path("/revocations"), protocol.Revocations{Identity: revoked.id.Document(), Revocation: rev}, ""), http.StatusCreated, "")
-	deleted, deletedPass := checked()
-	e.want(call(fresh(), "DELETE", deleted.path(""), nil, deletedPass), http.StatusNoContent, "")
+	forgotten, forgottenPass := checked()
+	if err := e.store.DeleteBox(t.Context(), forgotten.id.Address()); err != nil { // as the TTL deletes it
+		t.Fatal(err)
+	}
 	listed, listedPass := checked()
 	e.want(call(fresh(), "PUT", listed.path("/revocations"), listed.certs(1), ""), http.StatusOK, "")
 	e.clock.Add(time.Second)
@@ -157,7 +159,7 @@ func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 	states := []state{
 		{"live", live.id.Address().String(), livePass},
 		{"revoked", revoked.id.Address().String(), revokedPass},
-		{"deleted", deleted.id.Address().String(), deletedPass},
+		{"forgotten", forgotten.id.Address().String(), forgottenPass},
 		{"its certificate revoked", listed.id.Address().String(), listedPass},
 		{"held by nobody", nobody, ""},
 	}
@@ -171,19 +173,14 @@ func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 		own          string // its own checked pass
 		direct       bool   // answered by the router or a site, which the API's description does not hold
 	}
-	var targets, last []target
+	var targets []target
 	for _, r := range e.server.routes() {
 		method, path, _ := strings.Cut(r.pattern, " ")
 		for _, st := range states {
 			p := strings.NewReplacer("{addr}", st.addr, "{id}", strings.Repeat("0", 64)).Replace(path)
-			if r.pattern == "DELETE /v1/{addr}" { // it deletes the live box: last
-				last = append(last, target{method, p, r.pass, st.addr, st.pass, false})
-				continue
-			}
 			targets = append(targets, target{method, p, r.pass, st.addr, st.pass, false})
 		}
 	}
-	targets = append(targets, last...)
 	targets = append(targets,
 		target{"GET", protocol.LinkPath + nobody, passNone, nobody, "", false},
 		target{"GET", "/llms.txt", passNone, "", "", true},

@@ -348,16 +348,12 @@ func TestTwoProcesses(t *testing.T) {
 func TestRestartLoadsLazily(t *testing.T) {
 	e, _ := dynamoEnv(t)
 	ctx := context.Background()
-	a, b, c, d, f := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic)
+	a, b, c, f := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic)
 	send(t, a, b, "one")
 	send(t, a, b, "two")
 	send(t, a, f, "three")
 	if _, err := c.Rekey(ctx, ""); err != nil {
 		t.Fatal(err)
-	}
-	send(t, a, d, "deleted with the box")
-	if r := e.do(http.MethodDelete, "/v1/"+d.Address().String(), nil, e.pass(d)); r.status != http.StatusNoContent {
-		t.Fatalf("delete: %d %s", r.status, r.body)
 	}
 	renewed, err := e.store.Box(ctx, c.Address())
 	if err != nil {
@@ -391,12 +387,6 @@ func TestRestartLoadsLazily(t *testing.T) {
 	}
 	if st, ok := fresh.Held(c.Address()); !ok || st.State != Active || st.Cert != renewed.Cert {
 		t.Fatalf("rekeyed box: %v %v", st, ok)
-	}
-	if n, _ := fresh.Count(ctx, d.Address()); n != 0 {
-		t.Fatal("the delete left mail in the table")
-	}
-	if st, ok := fresh.Held(d.Address()); !ok || st.State != Deleted {
-		t.Fatalf("deleted box: %v %v", st, ok)
 	}
 	var nobody protocol.Address
 	if n, err := fresh.Count(ctx, nobody); n != 0 || err != nil {
@@ -617,8 +607,8 @@ func (c *countingStore) Leave(ctx context.Context, b *Box) error {
 
 // An empty poll never leaves the process (ARCHITECTURE.md § Memory): a box
 // showing a new pass, one showing a pass the server has taken, a renewed
-// one, a pass from before the renewal, a deleted box and a revoked one are all
-// answered from memory.
+// one, a pass from before the renewal and a revoked box are all answered
+// from memory.
 func TestPollStaysInMemory(t *testing.T) {
 	e := newEnv(t, relaxed())
 	ctx := context.Background()
@@ -656,12 +646,6 @@ func TestPollStaysInMemory(t *testing.T) {
 	}
 	if r := poll(c, old); r.code() != protocol.CodeCertificateNotCurrent {
 		t.Fatalf("the pass from before the renewal: %d %s", r.status, r.body)
-	}
-	if r := e.do(http.MethodDelete, "/v1/"+c.Address().String(), nil, e.pass(c)); r.status != http.StatusNoContent {
-		t.Fatalf("delete: %d %s", r.status, r.body)
-	}
-	if r := poll(c, e2.pass(c)); r.code() != protocol.CodeNoSuchMailbox {
-		t.Fatalf("deleted box: %d %s", r.status, r.body)
 	}
 	before := cs.calls.Load()
 	rv := record(t, b)
@@ -750,7 +734,7 @@ func TestTheRecordAndTheRevocationsAreMemorys(t *testing.T) {
 	}
 	other := keys([]byte("a-later-item"))
 	img := map[string]stypes.AttributeValue{
-		"addr": other["addr"], "sk": other["sk"], "state": &stypes.AttributeValueMemberS{Value: string(Deleted)},
+		"addr": other["addr"], "sk": other["sk"], "state": &stypes.AttributeValueMemberS{Value: string(Active)},
 		"identity": b([]byte("x")), "revocation": b([]byte("x")), "rev": &stypes.AttributeValueMemberN{Value: "9"},
 	}
 	record := func(op stypes.OperationType, k, img map[string]stypes.AttributeValue) stypes.Record {
@@ -788,6 +772,39 @@ func TestTheRecordAndTheRevocationsAreMemorys(t *testing.T) {
 	}
 }
 
+// A box record in a state this build never writes, as "deleted" was until
+// the box's delete was dropped (IronGall-dev/irongall-client#312), is no
+// record: reading it is an error, so nothing is served or taken for the
+// address, and its image on the stream makes memory forget the box rather
+// than keep answering for it as it was.
+func TestARecordInAStateNotWrittenIsRefused(t *testing.T) {
+	e := newEnv(t, relaxed())
+	ctx := context.Background()
+	r := e.raw().register(protocol.MaxPrekeyLifetime)
+	rec, err := e.store.Box(ctx, r.id.Address())
+	if err != nil {
+		t.Fatal(err)
+	}
+	it := item(boxItem(rec))
+	if _, err := decodeBox(it); err != nil {
+		t.Fatalf("an active record: %v", err)
+	}
+	it["state"] = str("deleted")
+	if b, err := decodeBox(it); err == nil {
+		t.Fatalf("a record in the state \"deleted\" read as %s", b.State)
+	}
+	s := NewDynamoStore(DynamoConfig{BoxCache: 10})
+	if err := s.idx.ensure(ctx, r.id.Address(), func() (boxRead, error) {
+		return boxRead{exists: true, st: Standing{State: Active, CertSerial: rec.CertSerial}, rev: rec.Rev}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.applyBoxImage(it)
+	if st, ok := s.idx.standing(r.id.Address()); ok {
+		t.Fatalf("memory kept the box as %+v after an image it cannot read", st)
+	}
+}
+
 // A box's record is only written over the revision it was read at.
 func TestUpdateBoxIsConditional(t *testing.T) {
 	e := newEnv(t, relaxed())
@@ -799,7 +816,7 @@ func TestUpdateBoxIsConditional(t *testing.T) {
 	if err := e.store.UpdateBox(ctx, first); err != nil {
 		t.Fatal(err)
 	}
-	second.State = Deleted
+	second.CertSerial += 2
 	if err := e.store.UpdateBox(ctx, second); !errors.Is(err, ErrStale) {
 		t.Fatalf("an update over a stale read: %v", err)
 	}
@@ -808,35 +825,30 @@ func TestUpdateBoxIsConditional(t *testing.T) {
 	}
 }
 
-// A delete deletes the box's mail, bodies included: a sender's retry after
-// the delete is undone is answered, and nothing comes back.
-func TestRetryAfterDeleteIsNotRedelivered(t *testing.T) {
+// A pause, an ACL that denies everyone, deletes the box's mail, bodies
+// included: a sender's retry once a later ACL has undone it is answered from
+// the dedupe record, and nothing comes back (PROTOCOL.md §6.2).
+func TestRetryAfterAPauseIsNotRedelivered(t *testing.T) {
 	e := newEnv(t, relaxed())
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
-	sent := capture(e, "/v1/"+b.Address().String())
+	to := "/v1/" + b.Address().String()
+	sent := capture(e, to)
 	send(t, a, b, "deleted unread")
 	e.setMiddle(nil)
-	if r := e.do(http.MethodDelete, "/v1/"+b.Address().String(), nil, e.pass(b)); r.status != http.StatusNoContent {
-		t.Fatalf("delete: %d %s", r.status, r.body)
-	}
-	// The delete undone, by a registration under a later certificate.
-	again := e.raw()
-	again.signer, again.id = signer(t, b), b.Identity()
-	_, under := e.numbers(b.Address())
-	again.prekey(under+1, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
-	e.want(e.do("PUT", again.path(""), again.registration(under+1), again.pass(under+1)), 201, "")
+	e.want(e.do("PUT", to+"/acl", aclOf(1, []string{}, []string{"*"}), e.pass(b)), 200, "")
+	e.want(e.do("PUT", to+"/acl", aclOf(2, []string{"*"}, nil), e.pass(b)), 200, "")
 	// A retry of the same bytes is answered as the first send was, from the
-	// dedupe record, though it names the retired serial (PROTOCOL.md §4.5
-	// step 6): it stores nothing, and what the delete deleted stays deleted.
-	if r := e.do(http.MethodPost, "/v1/"+b.Address().String()+"/messages", *sent, e.pass(a)); r.status != http.StatusOK {
+	// dedupe record (PROTOCOL.md §4.5 step 6): it stores nothing, and what the
+	// pause deleted stays deleted.
+	if r := e.do(http.MethodPost, to+"/messages", *sent, e.pass(a)); r.status != http.StatusOK {
 		t.Fatalf("retry: %d %s", r.status, r.body)
 	}
-	if list := listOf(t, e.do("GET", "/v1/"+b.Address().String()+"/messages", nil, again.pass(under+1))); len(list.Messages) != 0 {
-		t.Fatalf("mail deleted with the box came back: %+v", list)
+	if list := listOf(t, e.do("GET", to+"/messages", nil, e.pass(b))); len(list.Messages) != 0 {
+		t.Fatalf("mail the pause deleted came back: %+v", list)
 	}
 	if s, ok := e.store.(*DynamoStore); ok {
 		if id := sha256.Sum256(sent.ciphertext); s.listed(t, b.Address(), id) || s.bodyExists(t, b.Address(), id) {
-			t.Fatal("mail the delete deleted is still listed, or its body kept")
+			t.Fatal("mail the pause deleted is still listed, or its body kept")
 		}
 	}
 }
@@ -878,23 +890,13 @@ func TestBoxCache(t *testing.T) {
 }
 
 // A box's state answers before its pass is looked at: a call naming no box,
-// a deleted one or a revoked one is told so whatever it carries, and only a
-// call on a box in use is asked for that box's pass.
+// one the server forgot or a revoked one is told so whatever it carries, and
+// only a call on a box in use is asked for that box's pass.
 func TestTheBoxsStateAnswersBeforeItsPass(t *testing.T) {
 	e := newEnv(t, relaxed())
 	ctx := context.Background()
 	poll := func(a protocol.Address, pass string) reply {
 		return e.do(http.MethodGet, "/v1/"+a.String()+"/messages", nil, pass)
-	}
-	set := func(x *client.Box, f func(*Box)) {
-		rec, err := e.store.Box(ctx, x.Address())
-		if err != nil {
-			t.Fatal(err)
-		}
-		f(rec)
-		if err := e.store.UpdateBox(ctx, rec); err != nil {
-			t.Fatal(err)
-		}
 	}
 	b, c, d := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.Classic)
 	if r := poll(b.Address(), "irongall-pass not-a-pass"); r.code() != protocol.CodeUnauthorized {
@@ -908,10 +910,12 @@ func TestTheBoxsStateAnswersBeforeItsPass(t *testing.T) {
 		t.Fatalf("unknown box: %d %s", r.status, r.body)
 	}
 	pass := e.pass(c)
-	set(c, func(x *Box) { x.State = Deleted })
+	if err := e.store.DeleteBox(ctx, c.Address()); err != nil { // as the TTL deletes it
+		t.Fatal(err)
+	}
 	for _, p := range []string{"", pass} {
 		if r := poll(c.Address(), p); r.code() != protocol.CodeNoSuchMailbox {
-			t.Fatalf("deleted box: %d %s", r.status, r.body)
+			t.Fatalf("a box the server forgot: %d %s", r.status, r.body)
 		}
 	}
 	pass = e.pass(d)
