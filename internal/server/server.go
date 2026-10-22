@@ -544,6 +544,14 @@ func (p *pacedBody) Read(b []byte) (int, error) {
 	if err != nil {
 		p.ended = true
 	}
+	// A chunked body cut off at the deadline after its last chunk's line, or
+	// inside its trailer, is answered by net/http with an error of its own
+	// that does not wrap the deadline's (go1.27.2 body.readTrailer): one that
+	// comes at or past the deadline is the cut (#83), and so is one that
+	// comes then for another reason, a peer that closes at that moment.
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrDeadlineExceeded) && !time.Now().Before(p.deadline) {
+		err = fmt.Errorf("%w: %w", os.ErrDeadlineExceeded, err)
+	}
 	if errors.Is(err, os.ErrDeadlineExceeded) {
 		p.m.bodyCut()
 	}

@@ -136,6 +136,42 @@ func TestABodyThatStopsIsCutBehindEveryAnswer(t *testing.T) {
 	}
 }
 
+// A chunked body cut off at its deadline where a handler reads it is 408
+// request_timeout, and counted as cut, wherever it stops: in a chunk's data,
+// after its last chunk's line, or inside its trailer (#83), where net/http's
+// error for the trailer is not the deadline's.
+func TestAChunkedBodyCutInItsTrailerIs408(t *testing.T) {
+	nobody := strings.Repeat("ab", 32)
+	head := "PUT /v1/" + nobody + " HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+	for _, c := range []struct{ name, req string }{
+		{"stops in a chunk's data (control)", head + "a\r\n{\"x"},
+		{"stops after the last chunk's line", head + "2\r\n{}\r\n0\r\n"},
+		{"stops inside a trailer", head + "2\r\n{}\r\n0\r\nX-T: 1\r\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			l := pacedLimits()
+			reg := prometheus.NewRegistry()
+			s := New(Config{Store: NewMemStore(time.Now), Limits: l, Metrics: NewMetrics(reg)})
+			addr, _ := served(t, s, l)
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			if _, err := io.WriteString(conn, c.req); err != nil {
+				t.Fatal(err)
+			}
+			if _, got := closesWithin(conn, 5*time.Second); !strings.HasPrefix(got, "HTTP/1.1 408 ") || !strings.Contains(got, `"code":"request_timeout"`) {
+				t.Errorf("a body cut off at its deadline where its handler reads it: %.200q, want 408 request_timeout", got)
+			}
+			if cut := counts(t, reg, "irongalld_bodies_cut_total")[""]; cut != 1 {
+				t.Errorf("irongalld_bodies_cut_total %v, want 1", cut)
+			}
+		})
+	}
+}
+
 // A body that keeps coming above -body-min-rate, behind an answer written
 // before it is read, gets that answer (#82): net/http drains the body with
 // its own reader, which no byte of moves the read deadline, so the drain is
