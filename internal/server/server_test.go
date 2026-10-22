@@ -152,6 +152,17 @@ func (e *env) want(r reply, status int, code protocol.Code) {
 	}
 }
 
+// wantNotCurrent is want of a pass refused as under another certificate than
+// the one the call takes a pass under, serial n, which the answer names
+// (IronGall-dev/irongall-server#66).
+func (e *env) wantNotCurrent(r reply, n uint64) {
+	e.t.Helper()
+	e.want(r, http.StatusUnauthorized, protocol.CodeCertificateNotCurrent)
+	if p := r.problem(); p.CertificateSerial == nil || *p.CertificateSerial != n {
+		e.t.Fatalf("certificate_not_current names certificate %v, want %d: %s", p.CertificateSerial, n, r.body)
+	}
+}
+
 // name is the name the tests call the server by: the host of its URL.
 func (e *env) name() string { return strings.TrimPrefix(e.srv.URL, "http://") }
 
@@ -781,14 +792,14 @@ func TestPrekeyRenewal(t *testing.T) {
 	// A good statement with no pass, with a pass under the box's current
 	// certificate and not its own, and with another box's pass.
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(2), ""), 401, protocol.CodeUnauthorized)
-	e.want(put(2, 1), 401, protocol.CodeCertificateNotCurrent)
+	e.wantNotCurrent(put(2, 1), 2) // the statement's certificate, which an upload's pass is under
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(2), unknown.pass(2)), 401, protocol.CodeUnauthorized)
 	old := r.pass(1)
 	e.want(e.do("GET", r.path("/messages"), nil, old), 200, "")
 	e.want(put(2, 2), 200, "")
 	// The box is now known by certificate 2: the pass under 1, taken a moment
 	// ago, is refused, and so is a statement under 1.
-	e.want(e.do("GET", r.path("/messages"), nil, old), 401, protocol.CodeCertificateNotCurrent)
+	e.wantNotCurrent(e.do("GET", r.path("/messages"), nil, old), 2)
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(2)), 200, "")
 	r.prekeyUnder(r.work[1], 3, now.Add(time.Hour), nil)
 	e.want(put(3, 1), 401, protocol.CodeCertificateNotCurrent)

@@ -182,25 +182,26 @@ const (
 // checkPass checks that the call carries the pass of box a: made for this
 // server, not run out, and signed under the certificate whose hash is cert
 // by a working key of the identity whose key, in SSH wire form, is key
-// (PROTOCOL.md §6.1b). p is the call's pass if the caller parsed it already,
-// and otherwise nil.
+// (PROTOCOL.md §6.1b). serial is that certificate's serial, which a pass
+// refused as under another names (certificate_serial). p is the call's pass
+// if the caller parsed it already, and otherwise nil.
 //
 // A pass this process does not remember costs signature checks, and anyone
 // can bring one: so its caller's address reserves a count under
 // Limits.MissesPerMinute first, kept if the pass fails and given back if it
 // passes (s.miss). One the process remembers is a lookup in memory.
-func (s *Server) checkPass(r *http.Request, a protocol.Address, key string, cert [32]byte, p *protocol.Pass) error {
-	return s.passCheck(r, a, key, cert, p, true)
+func (s *Server) checkPass(r *http.Request, a protocol.Address, key string, cert [32]byte, serial uint64, p *protocol.Pass) error {
+	return s.passCheck(r, a, key, cert, serial, p, true)
 }
 
 // checkPassBounded is checkPass for a call that a count taken before it
 // already bounds, a registration's (Limits.RegistrationsPerHour): its pass
 // is checked without a count of its own.
-func (s *Server) checkPassBounded(r *http.Request, a protocol.Address, key string, cert [32]byte) error {
-	return s.passCheck(r, a, key, cert, nil, false)
+func (s *Server) checkPassBounded(r *http.Request, a protocol.Address, key string, cert [32]byte, serial uint64) error {
+	return s.passCheck(r, a, key, cert, serial, nil, false)
 }
 
-func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert [32]byte, p *protocol.Pass, count bool) (err error) {
+func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert [32]byte, serial uint64, p *protocol.Pass, count bool) (err error) {
 	auth, one := authorization(r)
 	if !one || len(auth) > protocol.MaxPassAuthorization {
 		if !count {
@@ -274,7 +275,7 @@ func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert
 	under, err := p.VerifyUnder(cert, name, now)
 	switch {
 	case errors.Is(err, protocol.ErrCertificate):
-		return fail(protocol.CodeCertificateNotCurrent, "sign the pass with the working key of the box's newest prekey; if that key is lost, irongall prekey renew", "the pass is not under the box's current certificate")
+		return fail(protocol.CodeCertificateNotCurrent, "sign the pass with the working key of the box's newest prekey; if that key is lost, irongall prekey renew", "the pass is not under certificate %d, the one this call takes a pass under", certificateSerialValue(serial))
 	case errors.Is(err, protocol.ErrCertificateNotBegun):
 		return fail(protocol.CodePassExpired, "a certificate starts an hour before it is made: check this machine's clock, then irongall prekey renew", "the certificate the pass is signed under has not begun")
 	case errors.Is(err, protocol.ErrCertificateTime):
@@ -292,7 +293,7 @@ func (s *Server) passCheck(r *http.Request, a protocol.Address, key string, cert
 		if s.log != nil {
 			s.log.Printf("box %s: the certificate on record does not verify against the identity on record: %v", a, err) // the address redacted, as every line is
 		}
-		return fail(protocol.CodeCertificateNotCurrent, "publish a new prekey, which comes with a new certificate: irongall prekey renew", "the box's certificate on record does not verify against its identity")
+		return fail(protocol.CodeCertificateNotCurrent, "publish a new prekey, which comes with a new certificate: irongall prekey renew", "the box's certificate on record, %d, does not verify against its identity", certificateSerialValue(serial))
 	}
 	// A pass is never good for longer than the certificate it is under.
 	until := p.NotAfter
@@ -363,7 +364,7 @@ func (s *Server) owner(r *http.Request, params ...string) (protocol.Address, err
 	case st.Listed:
 		return a, listedCertificate()
 	}
-	return a, s.checkPass(r, a, st.Key, st.Cert, nil)
+	return a, s.checkPass(r, a, st.Key, st.Cert, st.CertSerial, nil)
 }
 
 // sender authenticates a send: the sender is the box the call's pass names
@@ -386,5 +387,5 @@ func (s *Server) sender(r *http.Request) (protocol.Address, error) {
 	case st.Listed:
 		return a, listedCertificate()
 	}
-	return a, s.checkPass(r, a, st.Key, st.Cert, p)
+	return a, s.checkPass(r, a, st.Key, st.Cert, st.CertSerial, p)
 }

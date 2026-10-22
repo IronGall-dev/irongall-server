@@ -338,9 +338,11 @@ func TestTheClientRevokesItsEarlierCertificates(t *testing.T) {
 	if err != nil || certs == nil || second <= first || !certs.Revokes(first) || certs.Revokes(second) {
 		t.Fatalf("RevokeEarlier: %+v, %v", certs, err)
 	}
-	// The working key from before: its pass is refused, and a prekey it
-	// signs at the highest serial there is, is refused too.
-	e.want(e.do("GET", "/v1/"+a.Address().String()+"/messages", nil, old), 401, protocol.CodeCertificateNotCurrent)
+	// The working key from before: its pass is refused as under another
+	// certificate than the current one, revoked or not, which the answer
+	// names (IronGall-dev/irongall-client#263), and a prekey it signs at the
+	// highest serial there is, is refused too.
+	e.wantNotCurrent(e.do("GET", "/v1/"+a.Address().String()+"/messages", nil, old), second)
 	key, _ := age.GenerateX25519Identity()
 	top := &protocol.Prekey{Address: a.Address(), Serial: protocol.MaxSerial, Key: key.Recipient().String(), NotAfter: e.clock.Now().Add(time.Hour)}
 	sig, err := protocol.Sign(taken, top.Statement(), protocol.PrekeyNamespace(a.Address()))

@@ -155,7 +155,7 @@ func TestACertificateOnRecordThatTheIdentityDidNotSign(t *testing.T) {
 			t.Fatal(err)
 		}
 		pass := e.passFor(under, a, e.name())
-		e.want(e.do("GET", victim.path("/messages"), nil, pass), 401, protocol.CodeCertificateNotCurrent)
+		e.wantNotCurrent(e.do("GET", victim.path("/messages"), nil, pass), b.CertSerial)
 		// Control: the first two steps take it. It carries the certificate
 		// on record, and that certificate's working key signed it.
 		p, err := protocol.ParsePass(pass)
@@ -167,7 +167,7 @@ func TestACertificateOnRecordThatTheIdentityDidNotSign(t *testing.T) {
 		}
 		// And the box's own pass, under the certificate its identity did
 		// sign, is no longer under the one on record.
-		e.want(e.do("GET", victim.path("/messages"), nil, victim.pass(1)), 401, protocol.CodeCertificateNotCurrent)
+		e.wantNotCurrent(e.do("GET", victim.path("/messages"), nil, victim.pass(1)), b.CertSerial)
 	}
 }
 

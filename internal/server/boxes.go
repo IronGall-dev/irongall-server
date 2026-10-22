@@ -93,7 +93,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	// The pass, under the certificate the statement is signed under: the
 	// certificate shows the identity chose this working key, and a pass
 	// minutes old that its holder is here now.
-	if err := s.checkPassBounded(r, h, string(id.PublicKey().Marshal()), certHash(cert)); err != nil {
+	if err := s.checkPassBounded(r, h, string(id.PublicKey().Marshal()), certHash(cert), cert.Serial()); err != nil {
 		return err
 	}
 	now := s.now()
@@ -173,11 +173,11 @@ func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol
 	}
 	key := string(id.PublicKey().Marshal())
 	if bounded {
-		if err := s.checkPassBounded(r, cur.Addr, key, cur.Cert); err != nil {
+		if err := s.checkPassBounded(r, cur.Addr, key, cur.Cert, cur.CertSerial); err != nil {
 			return err
 		}
 	} else {
-		if err := s.checkPass(r, cur.Addr, key, cur.Cert, nil); err != nil {
+		if err := s.checkPass(r, cur.Addr, key, cur.Cert, cur.CertSerial, nil); err != nil {
 			return err
 		}
 		if err := s.spendOwner(r.Context(), cur.Addr); err != nil {
@@ -335,7 +335,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 		} else if listed {
 			return refusedRevoked
 		}
-		if err := s.checkPass(r, h, key, b.Cert, nil); err != nil {
+		if err := s.checkPass(r, h, key, b.Cert, b.CertSerial, nil); err != nil {
 			return err
 		}
 		if err := s.spendOwner(r.Context(), h); err != nil {
@@ -382,7 +382,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 	}
 	m.release(s.now())
 	under := certHash(cert)
-	if err := s.checkPass(r, h, key, under, nil); err != nil {
+	if err := s.checkPass(r, h, key, under, cert.Serial(), nil); err != nil {
 		return err
 	}
 	// A renewal under the box's current certificate counts against the
