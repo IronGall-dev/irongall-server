@@ -662,7 +662,7 @@ func TestAPanicSettlesItsReservations(t *testing.T) {
 	victim, owner := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
 	s := New(Config{Store: panicStore{e.store, victim.id.Address()}, Limits: l, Now: e.clock.Now})
 	srv := httptest.NewUnstartedServer(apitest.Handler(t, s.Handler()))
-	var panics bytes.Buffer
+	var panics lockedBuffer
 	srv.Config.ErrorLog = log.New(&panics, "", 0) // net/http's report of each panic
 	srv.Start()
 	t.Cleanup(srv.Close)
@@ -713,9 +713,29 @@ func TestAPanicSettlesItsReservations(t *testing.T) {
 	if n := held(s.raises); n != 0 {
 		t.Errorf("after a panic in a raise's write: %d reservations held", n)
 	}
-	if n := strings.Count(panics.String(), "http: panic serving"); n != 4 {
-		t.Errorf("%d of the four calls panicked: %s", n, panics.String())
+	if got := panics.String(); strings.Count(got, "http: panic serving") != 4 {
+		t.Errorf("%d of the four calls panicked: %s", strings.Count(got, "http: panic serving"), got)
 	}
+}
+
+// lockedBuffer is a buffer written by the server's goroutines and read by
+// the test's: net/http logs a panic before it closes the connection, an
+// order the race detector does not see (IronGall-dev/irongall-server#73).
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }
 
 // A box takes mail out at a rate of its own (Limits.DrainBurst): its first
