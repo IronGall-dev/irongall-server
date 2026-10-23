@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 const (
@@ -295,14 +296,15 @@ func TestARefusalAWSStatedGivesTheCountBack(t *testing.T) {
 }
 
 // A write to what is held of an address whose answer leaves open whether it
-// was applied is counted by the record cache as a write is, and leaves
-// nothing cached of the address: a read begun before it puts nothing after
-// it, and the next read reads the table (recCache.write;
-// IronGall-dev/irongall-server#89). The controls: a refusal AWS stated, one
-// the SDK models or one it gives no fault (#90), changes nothing cached; a
-// failed condition with nothing applied evicts the copy and counts no write,
-// as before.
-func TestAWriteThatMayHaveBeenAppliedIsCountedByTheCache(t *testing.T) {
+// was applied leaves memory holding nothing of the address, as forget does:
+// the record cache counts it as a write and keeps no copy, so a read begun
+// before it puts nothing after it, and the index forgets the box, so its
+// standing from before the write checks no pass; the next use reads the
+// table (recCache.write; IronGall-dev/irongall-server#89). The controls: a
+// refusal AWS stated, one the SDK models or one it gives no fault (#90),
+// changes nothing in memory; a failed condition with nothing applied evicts
+// the cached copy, counts no write and leaves the index, as before.
+func TestAWriteThatMayHaveBeenAppliedForgetsItsAddress(t *testing.T) {
 	_, r, box := heldRecord(t)
 	notFound := answer{status: http.StatusBadRequest, body: dynErr("ResourceNotFoundException", "")}
 	validation := answer{status: http.StatusBadRequest, body: dynErr("ValidationException", "")}
@@ -341,9 +343,9 @@ func TestAWriteThatMayHaveBeenAppliedIsCountedByTheCache(t *testing.T) {
 	}
 	// Every write at once, each on a fake of its own, then each judged.
 	type outcome struct {
-		err          error
-		held, filled bool
-		cachedFirst  bool
+		err                   error
+		held, filled, indexed bool
+		cachedFirst           bool
 	}
 	outs := make([]outcome, len(cases))
 	var wg sync.WaitGroup
@@ -353,6 +355,13 @@ func TestAWriteThatMayHaveBeenAppliedIsCountedByTheCache(t *testing.T) {
 		s := fakeStore(t, f)
 		s.cache.fill(cloneBox(box), s.cache.begin(box.Addr))
 		_, outs[i].cachedFirst = s.cache.get(box.Addr)
+		st, _, err := box.standing()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.idx.ensure(t.Context(), box.Addr, func() (boxRead, error) { return boxRead{exists: true, st: st, rev: box.Rev}, nil }); err != nil {
+			t.Fatal(err)
+		}
 		ctx, cancel := context.WithoutCancel(t.Context()), func() {}
 		if c.timeout > 0 {
 			ctx, cancel = context.WithTimeout(ctx, c.timeout)
@@ -364,6 +373,7 @@ func TestAWriteThatMayHaveBeenAppliedIsCountedByTheCache(t *testing.T) {
 			_, outs[i].held = s.cache.get(box.Addr)
 			s.cache.fill(cloneBox(box), tok) // that read's copy, from before the write
 			_, outs[i].filled = s.cache.get(box.Addr)
+			_, outs[i].indexed = s.Held(box.Addr)
 		})
 	}
 	wg.Wait()
@@ -373,7 +383,8 @@ func TestAWriteThatMayHaveBeenAppliedIsCountedByTheCache(t *testing.T) {
 			if !outs[i].cachedFirst {
 				t.Fatal("the cache does not hold the record put in it")
 			}
-			t.Logf("err %v (mayHaveApplied %v); after it the record is held %v; the read begun before it puts its copy %v", err, mayHaveApplied(err), held, filled)
+			t.Logf("err %v (mayHaveApplied %v); after it the record is held %v; the read begun before it puts its copy %v; the index holds the box %v",
+				err, mayHaveApplied(err), held, filled, outs[i].indexed)
 			if err == nil {
 				t.Fatal("the write did not fail")
 			}
@@ -382,6 +393,9 @@ func TestAWriteThatMayHaveBeenAppliedIsCountedByTheCache(t *testing.T) {
 			}
 			if filled == c.counts && c.evicted {
 				t.Errorf("a read begun before the write puts its copy after it %v; want %v: the write is counted %v", filled, !c.counts, !filled)
+			}
+			if outs[i].indexed == c.counts {
+				t.Errorf("after the write the index holds the box's standing from before it %v; want %v", outs[i].indexed, !c.counts)
 			}
 		})
 	}
@@ -509,6 +523,133 @@ func TestASendWhoseWriteWasRetriedIsStored(t *testing.T) {
 			t.Logf("a send that wrote after its recipient's revocation: %d %s; the revoked box holds %d", got.status, got.code(), n)
 			if got.status != http.StatusGone || n != 0 {
 				t.Errorf("a send that wrote after its recipient's revocation is answered %d and leaves %d messages; want 410 and none", got.status, n)
+			}
+		})
+	}
+}
+
+// boxesTable is a fake of the boxes table, enough for a registration, a
+// box's load and its reads: a PutItem keeps its item, a Query of an address
+// returns that address's items, the messages table holds nothing, and update
+// answers each UpdateItem, keeping what it applies (keep).
+type boxesTable struct {
+	mu     sync.Mutex
+	items  map[string]map[string]any // by addr and sk, as DynamoDB's JSON writes them
+	update func(b *boxesTable, n int) answer
+}
+
+// asJSON is v as DynamoDB's JSON protocol reads it back: binary as base64.
+func asJSON(v any) map[string]any {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		panic(err)
+	}
+	return m
+}
+
+func attrB(it map[string]any, name string) string {
+	v, _ := it[name].(map[string]any)
+	s, _ := v["B"].(string)
+	return s
+}
+
+func (b *boxesTable) keep(it map[string]any) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.items[attrB(it, "addr")+"/"+attrB(it, "sk")] = it
+}
+
+func (b *boxesTable) answer(op string, n int, body []byte) answer {
+	var in struct {
+		TableName                 string
+		Item                      map[string]any
+		ExpressionAttributeValues map[string]map[string]any
+	}
+	_ = json.Unmarshal(body, &in)
+	ok := func(v any) answer { j, _ := json.Marshal(v); return answer{status: http.StatusOK, body: string(j)} }
+	switch {
+	case op == "PutItem" && in.TableName == "boxes":
+		b.keep(in.Item)
+		return ok(map[string]any{})
+	case op == "Query" && in.TableName == "boxes":
+		a, _ := in.ExpressionAttributeValues[":a"]["B"].(string)
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		items := []any{}
+		for _, it := range b.items {
+			if attrB(it, "addr") == a {
+				items = append(items, it)
+			}
+		}
+		return ok(map[string]any{"Items": items, "Count": len(items), "ScannedCount": len(items)})
+	case op == "Query":
+		return ok(map[string]any{"Items": []any{}, "Count": 0, "ScannedCount": 0})
+	case op == "GetItem":
+		return ok(map[string]any{})
+	case op == "UpdateItem":
+		return b.update(b, n)
+	}
+	return answer500
+}
+
+// A raise of a revocation of certificates whose write AWS applied, and whose
+// answer was lost, leaves memory holding nothing of the address, the index
+// as the cache (unsettled): the next call with a pass under the revoked
+// certificate is refused at once, from the record read again. Before, the
+// index's standing from before the write took that pass until the stream's
+// echo. The control: a raise AWS refused leaves the index standing, and the
+// same pass is taken (IronGall-dev/irongall-server#89).
+func TestARevocationWhoseAnswerWasLostIsInTheNextPassCheck(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		applied bool
+		status  int
+		code    protocol.Code
+	}{
+		{"applied and its answer lost, then the retry's failed condition", true, http.StatusUnauthorized, protocol.CodeCertificateRevoked},
+		{"control: refused, a ValidationException", false, http.StatusOK, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tb := &boxesTable{items: map[string]map[string]any{}}
+			f := newFakeAWS()
+			f.dynamo = tb.answer
+			s := fakeStore(t, f)
+			e := newEnv(t, relaxed(), func(cfg *Config) { cfg.Store, cfg.Ready = s, nil })
+			r := e.raw().register(protocol.MaxPrekeyLifetime)
+			a := r.id.Address()
+			e.want(e.do("GET", r.path("/messages"), nil, r.pass(1)), http.StatusOK, "")
+			if _, held := s.Held(a); !held {
+				t.Fatal("the box is not loaded")
+			}
+			rv := r.certs(1)
+			list, err := protocol.ParseRevokedCertificates(rv.RevokedCertificates)
+			if err != nil {
+				t.Fatal(err)
+			}
+			item := asJSON(itemJSON(map[string]types.AttributeValue{
+				"addr": bin(a[:]), "sk": bin([]byte{skRevocations}), "identity": bin(rv.Identity),
+				"revoked_certs": bin(rv.RevokedCertificates), "revoked_certs_sig": bin(rv.RevokedCertificatesSignature), "through": num(list.Through),
+			}))
+			tb.update = func(b *boxesTable, n int) answer {
+				switch {
+				case !c.applied:
+					return answer{status: http.StatusBadRequest, body: dynErr("ValidationException", "")}
+				case n == 1:
+					b.keep(item)
+					return answer{drop: true}
+				}
+				return answerCCF
+			}
+			err = s.Revoke(context.WithoutCancel(t.Context()), a, &Revocations{Identity: rv.Identity, Certs: rv.RevokedCertificates, CertsSig: rv.RevokedCertificatesSignature, Through: list.Through})
+			_, held := s.Held(a)
+			got := e.do("GET", r.path("/messages"), nil, r.pass(1))
+			t.Logf("the raise: %v (mayHaveApplied %v); the index holds the box %v; then a pass under certificate 1: %d %s", err, mayHaveApplied(err), held, got.status, got.code())
+			if got.status != c.status || got.code() != c.code {
+				t.Errorf("a pass under certificate 1 after the raise: %d %s; want %d %s", got.status, got.code(), c.status, c.code)
 			}
 		})
 	}

@@ -706,14 +706,16 @@ func notingRetries(seen *atomic.Bool) func(*dynamodb.Options) {
 var errNotStored = errors.New("not stored")
 
 // unsettled returns err, the error of a write to what is held of address a,
-// once the record cache has taken what the write may have done: one that
-// may have been applied all the same (mayHaveApplied) is counted as a write
-// is and leaves nothing of a cached, so a read begun before it puts nothing
-// after it, and the next read reads the table (recCache.write). A refusal
+// once memory holds nothing the write may have changed: one that may have
+// been applied all the same (mayHaveApplied) makes the process forget the
+// address, as a record's removal does (forget). The record cache counts it
+// as a write and keeps no copy, so a read begun before it puts nothing after
+// it (recCache.write), and the index drops the box, so its standing from
+// before the write checks no pass; the next use reads the record. A refusal
 // stated changes nothing there.
 func (s *DynamoStore) unsettled(a protocol.Address, err error) error {
 	if mayHaveApplied(err) {
-		s.cache.write(a, evicted[*Box])
+		s.forget(a)
 	}
 	return err
 }
@@ -851,9 +853,10 @@ func (s *DynamoStore) applyRevocations(a protocol.Address, rv *Revocations) {
 }
 
 // forget drops what memory holds of an address whose record was deleted,
-// so that its next use reads it again. A deletion seen on the stream may be
-// of a record older than one this process has written since: the read after
-// it is what tells.
+// or that a write whose answer was lost may have changed (unsettled), so
+// that its next use reads it again. A deletion seen on the stream may be of
+// a record older than one this process has written since: the read after it
+// is what tells.
 func (s *DynamoStore) forget(a protocol.Address) {
 	s.cache.write(a, evicted[*Box])
 	s.idx.forget(a)
