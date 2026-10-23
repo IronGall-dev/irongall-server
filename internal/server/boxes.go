@@ -483,7 +483,7 @@ func (s *Server) getRevocations(w http.ResponseWriter, r *http.Request) error {
 	case err != nil:
 		return err
 	case !b.holdsRevocations():
-		return fail(protocol.CodeNotRevoked, "nothing to do: this server holds no revocation of that address. That is its word, and another server or the box's owner may hold one", "no revocation of this address is held here")
+		return fail(protocol.CodeNotRevoked, "nothing to do: this server holds no revocation of that address. That is its word, and the box's owner may hold a record of one", "no revocation of this address is held here")
 	}
 	if err := conditions(r, true, "", hintConditions); err != nil {
 		return err
