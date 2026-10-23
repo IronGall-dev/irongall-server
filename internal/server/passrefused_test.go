@@ -309,3 +309,27 @@ func TestARevokedCurrentCertificateIsAnsweredBeforeThePass(t *testing.T) {
 	e.want(e.do("PUT", r.path("/prekey"), r.upload(6), r.pass(6)), 200, "")
 	e.want(e.do("GET", r.path("/messages"), nil, r.pass(6)), 200, "")
 }
+
+// An address with no box whose identity revoked certificates: a registration
+// of a statement under one of them is certificate_revoked before its pass is
+// read, whatever it carries (PROTOCOL.md §3 step 6, §6.1b). Control: one
+// above them has its pass read.
+func TestARegistrationUnderARevokedCertificateIsAnsweredBeforeThePass(t *testing.T) {
+	e := newEnv(t, relaxed())
+	m := e.raw()
+	e.want(e.do("PUT", m.path("/revocations"), m.certs(4), ""), 200, "")
+	m.prekey(3, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	for name, pass := range map[string]string{
+		"no pass":                          "",
+		"not a pass":                       "Bearer " + strings.Repeat("a", 50),
+		"under its statement's":            m.pass(3),
+		"under certificate 6, not revoked": e.passFor(m.certify(6), m.id.Address(), e.name()),
+	} {
+		if got := e.do("PUT", m.path(""), m.registration(3), pass); got.status != 401 || got.code() != protocol.CodeCertificateRevoked {
+			t.Errorf("a registration under a revoked certificate, its pass %s: %d %s", name, got.status, got.body)
+		}
+	}
+	m.prekey(5, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	e.want(e.do("PUT", m.path(""), m.registration(5), ""), 401, protocol.CodeUnauthorized)
+	e.want(e.do("PUT", m.path(""), m.registration(5), m.pass(5)), 201, "")
+}
