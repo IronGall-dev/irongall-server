@@ -1,0 +1,658 @@
+## CreateBox
+PutItem {
+ "ConditionExpression": "attribute_not_exists(#a)",
+ "ExpressionAttributeNames": {
+  "#a": "addr"
+ },
+ "Item": {
+  "acl": {
+   "B": "eyJhbGxvdyI6WyIqIl0sImRlbnkiOlsiYjEwMjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCJdfQ=="
+  },
+  "addr": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "cert": {
+   "B": "zgUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "cert_serial": {
+   "N": "7"
+  },
+  "created": {
+   "N": "1792670400000"
+  },
+  "expires_at": {
+   "N": "1798027200"
+  },
+  "identity": {
+   "B": "YW4gaWRlbnRpdHkgZG9jdW1lbnQ="
+  },
+  "retired": {
+   "L": [
+    {
+     "M": {
+      "key_hash": {
+       "B": "SwYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      },
+      "not_after": {
+       "N": "1792929600000"
+      },
+      "type": {
+       "S": "X25519"
+      }
+     }
+    }
+   ]
+  },
+  "rev": {
+   "N": "1"
+  },
+  "senders": {
+   "L": [
+    {
+     "S": "ssh-ed25519"
+    }
+   ]
+  },
+  "sk": {
+   "B": "AA=="
+  },
+  "state": {
+   "S": "active"
+  },
+  "statement": {
+   "B": "YSBwcmVrZXkgc3RhdGVtZW50"
+  },
+  "statement_sig": {
+   "B": "aXRzIHNpZ25hdHVyZQ=="
+  }
+ },
+ "TableName": "boxes"
+}
+## UpdateBox
+UpdateItem {
+ "ConditionExpression": "#rev = :old",
+ "ExpressionAttributeNames": {
+  "#acl": "acl",
+  "#cert": "cert",
+  "#cert_serial": "cert_serial",
+  "#expires_at": "expires_at",
+  "#retired": "retired",
+  "#rev": "rev",
+  "#senders": "senders",
+  "#state": "state",
+  "#statement": "statement",
+  "#statement_sig": "statement_sig"
+ },
+ "ExpressionAttributeValues": {
+  ":acl": {
+   "B": "eyJhbGxvdyI6WyIqIl0sImRlbnkiOlsiYjEwMjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCJdfQ=="
+  },
+  ":cert": {
+   "B": "zgUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  ":cert_serial": {
+   "N": "7"
+  },
+  ":expires_at": {
+   "N": "1798027200"
+  },
+  ":old": {
+   "N": "3"
+  },
+  ":retired": {
+   "L": [
+    {
+     "M": {
+      "key_hash": {
+       "B": "SwYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      },
+      "not_after": {
+       "N": "1792929600000"
+      },
+      "type": {
+       "S": "X25519"
+      }
+     }
+    }
+   ]
+  },
+  ":rev": {
+   "N": "4"
+  },
+  ":senders": {
+   "L": [
+    {
+     "S": "ssh-ed25519"
+    }
+   ]
+  },
+  ":state": {
+   "S": "active"
+  },
+  ":statement": {
+   "B": "YSBwcmVrZXkgc3RhdGVtZW50"
+  },
+  ":statement_sig": {
+   "B": "aXRzIHNpZ25hdHVyZQ=="
+  }
+ },
+ "Key": {
+  "addr": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "sk": {
+   "B": "AA=="
+  }
+ },
+ "TableName": "boxes",
+ "UpdateExpression": "SET #acl = :acl, #cert = :cert, #cert_serial = :cert_serial, #expires_at = :expires_at, #retired = :retired, #rev = :rev, #senders = :senders, #state = :state, #statement = :statement, #statement_sig = :statement_sig"
+}
+## Revoke, the address and certificates through 9
+UpdateItem {
+ "ConditionExpression": "attribute_not_exists(#t) OR #t \u003c :t",
+ "ExpressionAttributeNames": {
+  "#c": "revoked_certs",
+  "#i": "identity",
+  "#r": "revocation",
+  "#s": "revoked_certs_sig",
+  "#t": "through"
+ },
+ "ExpressionAttributeValues": {
+  ":c": {
+   "B": "Y2VydGlmaWNhdGVz"
+  },
+  ":i": {
+   "B": "YW4gaWRlbnRpdHkgZG9jdW1lbnQ="
+  },
+  ":r": {
+   "B": "YSByZXZvY2F0aW9u"
+  },
+  ":s": {
+   "B": "dGhlaXIgc2lnbmF0dXJl"
+  },
+  ":t": {
+   "N": "9"
+  }
+ },
+ "Key": {
+  "addr": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "sk": {
+   "B": "AQ=="
+  }
+ },
+ "ReturnValues": "ALL_NEW",
+ "TableName": "boxes",
+ "UpdateExpression": "SET #i = if_not_exists(#i, :i), #r = if_not_exists(#r, :r), #c = :c, #s = :s, #t = :t"
+}
+## Revoke, the address alone
+UpdateItem {
+ "ExpressionAttributeNames": {
+  "#i": "identity",
+  "#r": "revocation"
+ },
+ "ExpressionAttributeValues": {
+  ":i": {
+   "B": "YW4gaWRlbnRpdHkgZG9jdW1lbnQ="
+  },
+  ":r": {
+   "B": "YSByZXZvY2F0aW9u"
+  }
+ },
+ "Key": {
+  "addr": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "sk": {
+   "B": "AQ=="
+  }
+ },
+ "ReturnValues": "ALL_NEW",
+ "TableName": "boxes",
+ "UpdateExpression": "SET #i = if_not_exists(#i, :i), #r = if_not_exists(#r, :r)"
+}
+## Box
+Query {
+ "ConsistentRead": true,
+ "ExpressionAttributeNames": {
+  "#a": "addr"
+ },
+ "ExpressionAttributeValues": {
+  ":a": {
+   "B": "sQIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  }
+ },
+ "KeyConditionExpression": "#a = :a",
+ "TableName": "boxes"
+}
+## Count, the box's load
+Query {
+ "ConsistentRead": true,
+ "ExpressionAttributeNames": {
+  "#a": "addr"
+ },
+ "ExpressionAttributeValues": {
+  ":a": {
+   "B": "sQIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  }
+ },
+ "KeyConditionExpression": "#a = :a",
+ "TableName": "boxes"
+}
+Query {
+ "ConsistentRead": true,
+ "ExpressionAttributeNames": {
+  "#b": "box",
+  "#f": "from",
+  "#l": "live",
+  "#s": "size"
+ },
+ "ExpressionAttributeValues": {
+  ":b": {
+   "B": "sQIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  ":hi": {
+   "B": "/////////////////////////////////////////////////////w=="
+  },
+  ":lo": {
+   "B": "AAABoMQPHUEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+  }
+ },
+ "IndexName": "live",
+ "KeyConditionExpression": "#b = :b AND #l BETWEEN :lo AND :hi",
+ "ProjectionExpression": "#l, #f, #s",
+ "TableName": "msgs"
+}
+## Dedupe
+GetItem {
+ "ConsistentRead": false,
+ "Key": {
+  "box": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "id": {
+   "B": "HQQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  }
+ },
+ "TableName": "msgs"
+}
+## PutMessage
+S3 PUT /bodies/b001000000000000000000000000000000000000000000000000000000000000/1d04000000000000000000000000000000000000000000000000000000000000?x-id=PutObject
+PutItem {
+ "ConditionExpression": "attribute_not_exists(#id) OR #r \u003c= :cutoff",
+ "ExpressionAttributeNames": {
+  "#id": "id",
+  "#r": "received_at"
+ },
+ "ExpressionAttributeValues": {
+  ":cutoff": {
+   "N": "1789995720000"
+  }
+ },
+ "Item": {
+  "box": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "expires_at": {
+   "N": "1795687080"
+  },
+  "from": {
+   "B": "8AMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "id": {
+   "B": "HQQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "live": {
+   "B": "AAABoW2RR4AdBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+  },
+  "received_at": {
+   "N": "1792839600000"
+  },
+  "size": {
+   "N": "100"
+  }
+ },
+ "ReturnItemCollectionMetrics": "SIZE",
+ "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+ "TableName": "msgs"
+}
+## List, from the start
+Query {
+ "ConsistentRead": false,
+ "ExpressionAttributeNames": {
+  "#b": "box",
+  "#f": "from",
+  "#l": "live",
+  "#s": "size"
+ },
+ "ExpressionAttributeValues": {
+  ":b": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  ":hi": {
+   "B": "/////////////////////////////////////////////////////w=="
+  },
+  ":lo": {
+   "B": "AAABoMQPHUEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+  }
+ },
+ "IndexName": "live",
+ "KeyConditionExpression": "#b = :b AND #l BETWEEN :lo AND :hi",
+ "Limit": 50,
+ "ProjectionExpression": "#l, #f, #s",
+ "TableName": "msgs"
+}
+## List, after a cursor
+Query {
+ "ConsistentRead": false,
+ "ExclusiveStartKey": {
+  "box": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "id": {
+   "B": "HQQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "live": {
+   "B": "AAABoW2RR4AdBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+  }
+ },
+ "ExpressionAttributeNames": {
+  "#b": "box",
+  "#f": "from",
+  "#l": "live",
+  "#s": "size"
+ },
+ "ExpressionAttributeValues": {
+  ":b": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  ":hi": {
+   "B": "/////////////////////////////////////////////////////w=="
+  },
+  ":lo": {
+   "B": "AAABoMQPHUEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+  }
+ },
+ "IndexName": "live",
+ "KeyConditionExpression": "#b = :b AND #l BETWEEN :lo AND :hi",
+ "Limit": 50,
+ "ProjectionExpression": "#l, #f, #s",
+ "TableName": "msgs"
+}
+## Message, whole
+GetItem {
+ "ConsistentRead": false,
+ "Key": {
+  "box": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "id": {
+   "B": "HQQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  }
+ },
+ "TableName": "msgs"
+}
+S3 GET /bodies/b001000000000000000000000000000000000000000000000000000000000000/1d04000000000000000000000000000000000000000000000000000000000000?x-id=GetObject
+## Message, from byte 40
+GetItem {
+ "ConsistentRead": false,
+ "Key": {
+  "box": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "id": {
+   "B": "HQQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  }
+ },
+ "TableName": "msgs"
+}
+S3 GET /bodies/b001000000000000000000000000000000000000000000000000000000000000/1d04000000000000000000000000000000000000000000000000000000000000?x-id=GetObject Range: bytes=40-
+## DeleteMessage
+S3 DELETE /bodies/b001000000000000000000000000000000000000000000000000000000000000/1d04000000000000000000000000000000000000000000000000000000000000?x-id=DeleteObject
+UpdateItem {
+ "ConditionExpression": "attribute_exists(#l) AND #r \u003e :cutoff",
+ "ExpressionAttributeNames": {
+  "#l": "live",
+  "#r": "received_at"
+ },
+ "ExpressionAttributeValues": {
+  ":cutoff": {
+   "N": "1789995720000"
+  }
+ },
+ "Key": {
+  "box": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "id": {
+   "B": "HQQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  }
+ },
+ "ReturnValues": "UPDATED_OLD",
+ "TableName": "msgs",
+ "UpdateExpression": "REMOVE #l"
+}
+## DeleteFrom
+Query {
+ "ConsistentRead": true,
+ "ExpressionAttributeNames": {
+  "#b": "box",
+  "#f": "from",
+  "#l": "live",
+  "#s": "size"
+ },
+ "ExpressionAttributeValues": {
+  ":b": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  ":hi": {
+   "B": "/////////////////////////////////////////////////////w=="
+  },
+  ":lo": {
+   "B": "AAABoMQPHUEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+  }
+ },
+ "IndexName": "live",
+ "KeyConditionExpression": "#b = :b AND #l BETWEEN :lo AND :hi",
+ "ProjectionExpression": "#l, #f, #s",
+ "TableName": "msgs"
+}
+S3 POST /bodies?delete=
+<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Object><Key>b001000000000000000000000000000000000000000000000000000000000000/1d04000000000000000000000000000000000000000000000000000000000000</Key></Object><Quiet>true</Quiet></Delete>
+UpdateItem {
+ "ConditionExpression": "attribute_exists(#l) AND #r \u003e :cutoff",
+ "ExpressionAttributeNames": {
+  "#l": "live",
+  "#r": "received_at"
+ },
+ "ExpressionAttributeValues": {
+  ":cutoff": {
+   "N": "1789995720000"
+  }
+ },
+ "Key": {
+  "box": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "id": {
+   "B": "HQQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  }
+ },
+ "ReturnValues": "UPDATED_OLD",
+ "TableName": "msgs",
+ "UpdateExpression": "REMOVE #l"
+}
+## DeleteBox
+DeleteItem {
+ "Key": {
+  "addr": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "sk": {
+   "B": "AA=="
+  }
+ },
+ "TableName": "boxes"
+}
+## Account
+GetItem {
+ "ConsistentRead": true,
+ "Key": {
+  "account": {
+   "B": "YW4gYWNjb3VudA=="
+  },
+  "sk": {
+   "B": "AA=="
+  }
+ },
+ "TableName": "accounts"
+}
+## CreateAccount
+PutItem {
+ "ConditionExpression": "attribute_not_exists(#a)",
+ "ExpressionAttributeNames": {
+  "#a": "account"
+ },
+ "Item": {
+  "account": {
+   "B": "YW4gYWNjb3VudA=="
+  },
+  "rev": {
+   "N": "1"
+  },
+  "sk": {
+   "B": "AA=="
+  },
+  "unmetered": {
+   "BOOL": true
+  }
+ },
+ "TableName": "accounts"
+}
+## PutAdoptKey
+PutItem {
+ "ConditionExpression": "attribute_not_exists(#a)",
+ "ExpressionAttributeNames": {
+  "#a": "account"
+ },
+ "Item": {
+  "account": {
+   "B": "YW4gYWNjb3VudA=="
+  },
+  "expires": {
+   "N": "1792846800000"
+  },
+  "expires_at": {
+   "N": "1792846800"
+  },
+  "sk": {
+   "B": "BK0HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "uses": {
+   "N": "2"
+  }
+ },
+ "TableName": "accounts"
+}
+## AdoptKey
+GetItem {
+ "ConsistentRead": true,
+ "Key": {
+  "account": {
+   "B": "YW4gYWNjb3VudA=="
+  },
+  "sk": {
+   "B": "BK0HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  }
+ },
+ "TableName": "accounts"
+}
+## Adopt
+TransactWriteItems {
+ "TransactItems": [
+  {
+   "Update": {
+    "ConditionExpression": "#rev = :old",
+    "ExpressionAttributeNames": {
+     "#acct": "account",
+     "#rev": "rev"
+    },
+    "ExpressionAttributeValues": {
+     ":acct": {
+      "B": "YW4gYWNjb3VudA=="
+     },
+     ":new": {
+      "N": "4"
+     },
+     ":old": {
+      "N": "3"
+     }
+    },
+    "Key": {
+     "addr": {
+      "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+     },
+     "sk": {
+      "B": "AA=="
+     }
+    },
+    "TableName": "boxes",
+    "UpdateExpression": "SET #acct = :acct, #rev = :new"
+   }
+  },
+  {
+   "Update": {
+    "ConditionExpression": "#u \u003e= :one AND #e \u003e :now",
+    "ExpressionAttributeNames": {
+     "#e": "expires",
+     "#u": "uses"
+    },
+    "ExpressionAttributeValues": {
+     ":now": {
+      "N": "1792843200000"
+     },
+     ":one": {
+      "N": "1"
+     }
+    },
+    "Key": {
+     "account": {
+      "B": "YW4gYWNjb3VudA=="
+     },
+     "sk": {
+      "B": "BK0HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+     }
+    },
+    "TableName": "accounts",
+    "UpdateExpression": "SET #u = #u - :one"
+   }
+  }
+ ]
+}
+## Leave
+UpdateItem {
+ "ConditionExpression": "#rev = :old",
+ "ExpressionAttributeNames": {
+  "#acct": "account",
+  "#rev": "rev"
+ },
+ "ExpressionAttributeValues": {
+  ":new": {
+   "N": "4"
+  },
+  ":old": {
+   "N": "3"
+  }
+ },
+ "Key": {
+  "addr": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "sk": {
+   "B": "AA=="
+  }
+ },
+ "TableName": "boxes",
+ "UpdateExpression": "REMOVE #acct SET #rev = :new"
+}

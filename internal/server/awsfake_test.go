@@ -43,6 +43,9 @@ type fakeAWS struct {
 	s3      func(method string, n int) answer
 	release chan struct{}
 	once    sync.Once
+	// record, if set, is told of each request as it arrives: its operation
+	// as calls counts it, and its body.
+	record func(op string, r *http.Request, body []byte)
 }
 
 type answer struct {
@@ -75,6 +78,9 @@ func (f *fakeAWS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.calls[op]++
 	n := f.calls[op]
 	f.mu.Unlock()
+	if f.record != nil {
+		f.record(op, r, body)
+	}
 	a := answer{status: http.StatusOK, body: "{}"}
 	switch {
 	case strings.HasPrefix(op, "S3 ") && f.s3 != nil:
