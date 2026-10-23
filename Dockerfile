@@ -3,7 +3,7 @@
 # go.mod replaces irongall-client with ../irongall-client, so the build needs
 # that checkout too: pass it as the build context named "client"
 # (docker build --build-context client=../irongall-client .).
-FROM golang:1.27.2-trixie AS build
+FROM golang:1.27.3-trixie AS build
 WORKDIR /src/irongall-server
 COPY --from=client go.mod go.sum /src/irongall-client/
 COPY go.mod go.sum ./
