@@ -5,6 +5,9 @@ version: 2
 updates:
   - package-ecosystem: gomod
     directory: /
+    # Indirect modules too, as go get -u ./... moves them.
+    allow:
+      - dependency-type: all
     schedule:
       interval: weekly
       day: monday
