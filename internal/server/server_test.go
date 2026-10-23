@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -544,6 +545,50 @@ func TestARegistrationOfARegisteredBoxIsAnsweredFromItsRecordFirst(t *testing.T)
 			e.want(e.do("PUT", r.path(""), bad, r.pass(5)), 410, protocol.CodeRevoked)
 		})
 	}
+}
+
+// boxReads counts the reads of address a's record.
+type boxReads struct {
+	Store
+	a protocol.Address
+	n atomic.Int32
+}
+
+func (s *boxReads) Box(ctx context.Context, a protocol.Address) (*Box, error) {
+	if a == s.a {
+		s.n.Add(1)
+	}
+	return s.Store.Box(ctx, a)
+}
+
+// A registration that memory cannot answer reads what is kept of its address
+// once, under the count of registrations, and no more: one that makes a box,
+// one of an address whose identity revoked certificates before it had a box,
+// and one answered from a registered box's record (PROTOCOL-SERVER.md § 3;
+// IronGall-dev/irongall-server#94).
+func TestARegistrationReadsItsAddressOnce(t *testing.T) {
+	reads := &boxReads{}
+	e := newEnv(t, relaxed(), func(c *Config) { reads.Store, c.Store = c.Store, unknownStore{reads} })
+	once := func(what string, r *raw, req protocol.RegisterRequest, pass string, status int, code protocol.Code) {
+		t.Helper()
+		reads.a = r.id.Address()
+		reads.n.Store(0)
+		e.want(e.do("PUT", r.path(""), req, pass), status, code)
+		if n := reads.n.Load(); n != 1 {
+			t.Errorf("%s: %d reads of its address, want 1", what, n)
+		}
+	}
+	r := e.raw()
+	r.prekey(1, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	once("a new box", r, r.registration(1), r.pass(1), 201, "")
+	once("a registered box, its statement again", r, r.registration(1), r.pass(1), 200, "")
+	r.prekey(2, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	once("a registered box, another statement", r, r.registration(2), r.pass(2), 409, protocol.CodeConflict)
+
+	m := e.raw()
+	e.want(e.do("PUT", m.path("/revocations"), m.certs(2), ""), 200, "")
+	m.prekey(5, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	once("an address whose identity revoked certificates", m, m.registration(5), m.pass(5), 201, "")
 }
 
 func TestOwnerCalls(t *testing.T) {
