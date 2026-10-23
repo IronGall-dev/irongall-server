@@ -3,7 +3,7 @@ package server
 // What a write AWS answered with an error is taken to have done: applied,
 // or possibly so, and the count reserved for it is kept; or refused, as AWS
 // or the store stated, and the count is given back (LIMITS.md rule 4;
-// IronGall-dev/irongall-server#14, #89). awsfake_test.go has the fake.
+// IronGall-dev/irongall-server#14, #89, #90). awsfake_test.go has the fake.
 
 import (
 	"context"
@@ -200,16 +200,69 @@ func TestAPutRetriedOntoItsOwnItemIsStored(t *testing.T) {
 	}
 }
 
+// A refusal AWS stated, of a write it did not apply, gives the count back
+// whatever fault the SDK gives it (IronGall-dev/irongall-server#90):
+// DynamoDB's refusals that the SDK does not model (ValidationException,
+// AccessDeniedException) come back with no fault, and are refusals all the
+// same; and a send whose body's PUT failed, whatever S3 answered, wrote no
+// item, so nothing is stored. The control: a refusal the SDK models,
+// ResourceNotFound.
+func TestARefusalAWSStatedGivesTheCountBack(t *testing.T) {
+	_, from, box := heldRecord(t)
+	t.Run("UpdateItem", func(t *testing.T) {
+		for _, code := range []string{"ValidationException", "AccessDeniedException", "ResourceNotFoundException"} {
+			t.Run(code, func(t *testing.T) {
+				f := newFakeAWS()
+				f.dynamo = func(string, int, []byte) answer { return answer{status: http.StatusBadRequest, body: dynErr(code, "")} }
+				s := fakeStore(t, f)
+				err := s.UpdateBox(context.WithoutCancel(t.Context()), cloneBox(box))
+				calls, applied := f.count("UpdateItem")
+				got := mayHaveApplied(err)
+				t.Logf("%d calls, %d applied; %s; mayHaveApplied %v", calls, applied, faultOf(err), got)
+				if got {
+					t.Errorf("a refusal DynamoDB stated, nothing applied, keeps the count (%s)", faultOf(err))
+				}
+			})
+		}
+	})
+	t.Run("PutMessage", func(t *testing.T) {
+		for _, c := range []struct {
+			name string
+			a    answer
+		}{
+			{"S3 403 AccessDenied", answer{status: http.StatusForbidden, body: s3Err("AccessDenied")}},
+			{"S3 500 InternalError", answer{status: http.StatusInternalServerError, body: s3Err("InternalError")}},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				f := newFakeAWS()
+				f.s3 = func(string, int) answer { return c.a }
+				s := fakeStore(t, f)
+				now := s.now().UTC().Truncate(time.Millisecond)
+				h := &Header{ID: [32]byte{7}, From: from.id.Address(), Size: 3, ReceivedAt: now, ExpiresAt: now.Add(protocol.Retention)}
+				_, err := s.PutMessage(context.WithoutCancel(t.Context()), protocol.Address{4}, h, []byte("abc"))
+				items, _ := f.count("PutItem")
+				got := mayHaveApplied(err)
+				t.Logf("PutItem calls %d; %s; mayHaveApplied %v", items, faultOf(err), got)
+				if got || items != 0 {
+					t.Errorf("a send whose item was never written keeps its counts (%s, %d PutItem calls)", faultOf(err), items)
+				}
+			})
+		}
+	})
+}
+
 // A write to what is held of an address whose answer leaves open whether it
 // was applied is counted by the record cache as a write is, and leaves
 // nothing cached of the address: a read begun before it puts nothing after
 // it, and the next read reads the table (recCache.write;
-// IronGall-dev/irongall-server#89). The controls: a refusal AWS stated
-// changes nothing cached; a failed condition with nothing applied evicts the
-// copy and counts no write, as before.
+// IronGall-dev/irongall-server#89). The controls: a refusal AWS stated, one
+// the SDK models or one it gives no fault (#90), changes nothing cached; a
+// failed condition with nothing applied evicts the copy and counts no write,
+// as before.
 func TestAWriteThatMayHaveBeenAppliedIsCountedByTheCache(t *testing.T) {
 	_, r, box := heldRecord(t)
 	notFound := answer{status: http.StatusBadRequest, body: dynErr("ResourceNotFoundException", "")}
+	validation := answer{status: http.StatusBadRequest, body: dynErr("ValidationException", "")}
 	raise := func(ctx context.Context, s *DynamoStore) error {
 		return s.Revoke(ctx, box.Addr, &Revocations{Identity: r.id.Document(), Certs: []byte("c"), CertsSig: []byte("s"), Through: 7})
 	}
@@ -237,6 +290,7 @@ func TestAWriteThatMayHaveBeenAppliedIsCountedByTheCache(t *testing.T) {
 		{"Leave answered 500 every attempt", "UpdateItem", []answer{applied(answer500), answer500, answer500},
 			func(ctx context.Context, s *DynamoStore) error { return s.Leave(ctx, cloneBox(box)) }, true, true},
 		{"control: UpdateBox refused, a ResourceNotFoundException", "UpdateItem", []answer{notFound}, update, false, false},
+		{"control: UpdateBox refused, a ValidationException, which the SDK gives no fault", "UpdateItem", []answer{validation}, update, false, false},
 		{"control: UpdateBox's failed condition, nothing applied", "UpdateItem", []answer{answerCCF}, update, true, false},
 	}
 	// Every write at once, each on a fake of its own, then each judged.

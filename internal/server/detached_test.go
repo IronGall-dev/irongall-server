@@ -10,10 +10,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"filippo.io/age"
 	"github.com/IronGall-dev/irongall-client/protocol"
-	"github.com/aws/smithy-go"
 )
 
 // heldTillGone holds a write, while armed, until its request's context has
@@ -210,37 +210,68 @@ func (s *failPut) PutMessage(ctx context.Context, box protocol.Address, h *Heade
 }
 
 // A count reserved for a write is kept when the write may have been applied,
-// whatever error it returned, and given back only for a refusal the store
-// stated (IronGall-dev/irongall-server#14): a send whose write timed out, or
-// met a fault of AWS's own, spends its send a day; one AWS throttled, or
-// refused for the call itself, does not.
+// whatever error it returned, and given back only for a refusal the store or
+// AWS stated (IronGall-dev/irongall-server#14, #90): a send whose write timed
+// out, or met a fault of AWS's own, spends its send a day; one AWS
+// throttled, or refused for the call itself, or whose body's PUT failed
+// before its item, does not. Each error from AWS is the one DynamoStore
+// returns when the fake answers so, as the SDK makes it.
 func TestACountIsKeptWhenItsWriteMayHaveBeenApplied(t *testing.T) {
-	for _, c := range []struct {
+	every := func(a answer) func(string, int, []byte) answer { return func(string, int, []byte) answer { return a } }
+	everyS3 := func(a answer) func(string, int) answer { return func(string, int) answer { return a } }
+	// put is the error of a send's PutMessage on ctx when AWS answers so.
+	put := func(ctx context.Context, dynamo func(string, int, []byte) answer, s3 func(string, int) answer) func() error {
+		return func() error {
+			f := newFakeAWS()
+			f.dynamo, f.s3 = dynamo, s3
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			h := &Header{ID: [32]byte{7}, From: protocol.Address{6}, Size: 3, ReceivedAt: now, ExpiresAt: now.Add(protocol.Retention)}
+			_, err := fakeStore(t, f).PutMessage(ctx, protocol.Address{4}, h, []byte("abc"))
+			return err
+		}
+	}
+	ctx := context.WithoutCancel(t.Context())
+	short, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	cases := []struct {
 		name string
-		err  error
+		err  func() error
 		kept bool
 	}{
-		{"a timeout", context.DeadlineExceeded, true},
-		{"a fault of AWS's own", &smithy.GenericAPIError{Code: "InternalServerError", Fault: smithy.FaultServer}, true},
-		{"an error of no kind the store states", errors.New("injected"), true},
-		{"a throttle", &smithy.GenericAPIError{Code: "ProvisionedThroughputExceededException", Fault: smithy.FaultClient}, false},
-		{"a refusal of the call", &smithy.GenericAPIError{Code: "ValidationException", Fault: smithy.FaultClient}, false},
-		{"a stale record", ErrStale, false},
-	} {
-		l := relaxed()
-		l.SendsPerDay = 1
-		s := &failPut{}
-		e := newEnv(t, l, func(cfg *Config) { s.Store, cfg.Store = cfg.Store, s })
-		from, to := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
-		s.mu.Lock()
-		s.err = c.err
-		s.mu.Unlock()
-		e.want(e.sendTo(to, 1, 1, from, 1), http.StatusServiceUnavailable, protocol.CodeUnavailable)
-		s.mu.Lock()
-		s.err = nil
-		s.mu.Unlock()
-		if got := e.sendTo(to, 1, 1, from, 1); (got.status == http.StatusTooManyRequests) != c.kept {
-			t.Errorf("%s: the next send %d %s; want the count kept %v", c.name, got.status, got.code(), c.kept)
-		}
+		{"a timeout", put(short, every(answer{hang: true}), nil), true},
+		{"a fault of AWS's own", put(ctx, every(answer500), nil), true},
+		{"an error of no kind the store states", func() error { return errors.New("injected") }, true},
+		{"a throttle", put(ctx, every(answerPTEE), nil), false},
+		{"a refusal of the call", put(ctx, every(answer{status: http.StatusBadRequest, body: dynErr("ValidationException", "")}), nil), false},
+		{"a refusal of the body", put(ctx, nil, everyS3(answer{status: http.StatusForbidden, body: s3Err("AccessDenied")})), false},
+		{"a fault of AWS's own at the body", put(ctx, nil, everyS3(answer{status: http.StatusInternalServerError, body: s3Err("InternalError")})), false},
+		{"a stale record", func() error { return ErrStale }, false},
+	}
+	errs := make([]error, len(cases))
+	var wg sync.WaitGroup
+	for i, c := range cases {
+		wg.Go(func() { errs[i] = c.err() })
+	}
+	wg.Wait()
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			l := relaxed()
+			l.SendsPerDay = 1
+			s := &failPut{}
+			e := newEnv(t, l, func(cfg *Config) { s.Store, cfg.Store = cfg.Store, s })
+			from, to := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+			s.mu.Lock()
+			s.err = errs[i]
+			s.mu.Unlock()
+			e.want(e.sendTo(to, 1, 1, from, 1), http.StatusServiceUnavailable, protocol.CodeUnavailable)
+			s.mu.Lock()
+			s.err = nil
+			s.mu.Unlock()
+			got := e.sendTo(to, 1, 1, from, 1)
+			t.Logf("the write's error: %v (%s); the next send %d %s", errs[i], faultOf(errs[i]), got.status, got.code())
+			if (got.status == http.StatusTooManyRequests) != c.kept {
+				t.Errorf("the next send %d %s; want the count kept %v", got.status, got.code(), c.kept)
+			}
+		})
 	}
 }

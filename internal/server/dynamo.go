@@ -700,6 +700,11 @@ func notingRetries(seen *atomic.Bool) func(*dynamodb.Options) {
 	}
 }
 
+// errNotStored is a send's error that the store states left nothing stored:
+// its body's PUT failed, before its item was written, whatever S3 answered
+// (IronGall-dev/irongall-server#90).
+var errNotStored = errors.New("not stored")
+
 // unsettled returns err, the error of a write to what is held of address a,
 // once the record cache has taken what the write may have done: one that
 // may have been applied all the same (mayHaveApplied) is counted as a write
@@ -1054,7 +1059,8 @@ func (s *DynamoStore) Dedupe(ctx context.Context, box protocol.Address, id [32]b
 
 // PutMessage implements Store (PROTOCOL-SERVER.md §7): the body, then the item, if
 // no live one has this id. A crash after the body leaves an orphan the
-// lifecycle rule reaps, and the retry writes both again. An item whose
+// lifecycle rule reaps, and the retry writes both again. A body that fails
+// stores nothing, whatever S3 answered (errNotStored); an item whose
 // condition fails on the item this write made, which an attempt the SDK
 // retried applied, is stored.
 func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *Header, body []byte) (*Header, error) {
@@ -1065,7 +1071,7 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 		Key:    aws.String(bodyKey(box, h.ID)),
 		Body:   bytes.NewReader(body),
 	}); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errNotStored, err)
 	}
 	if err := s.failAt("put: after the body"); err != nil {
 		return nil, err
