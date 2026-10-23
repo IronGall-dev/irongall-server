@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -104,12 +105,16 @@ func (s *DynamoStore) CreateAccount(ctx context.Context, a *Account) error {
 	a.Rev = 1
 	ctx, cancel := bounded(ctx)
 	defer cancel()
+	seen := new(atomic.Bool)
 	_, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                &s.accts,
 		Item:                     accountItem(a),
 		ConditionExpression:      aws.String("attribute_not_exists(#a)"),
 		ExpressionAttributeNames: map[string]string{"#a": "account"},
-	})
+	}, notingRetries(seen))
+	if err != nil && seen.Load() {
+		return retriedAfter{err}
+	}
 	if _, ok := isConditionFailed(err); ok {
 		return ErrExists
 	}
@@ -124,12 +129,16 @@ func (s *DynamoStore) PutAdoptKey(ctx context.Context, k *AdoptKey) error {
 	it["expires_at"] = num(ttlSeconds(ms(k.Expires)))
 	ctx, cancel := bounded(ctx)
 	defer cancel()
+	seen := new(atomic.Bool)
 	_, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                &s.accts,
 		Item:                     it,
 		ConditionExpression:      aws.String("attribute_not_exists(#a)"),
 		ExpressionAttributeNames: map[string]string{"#a": "account"},
-	})
+	}, notingRetries(seen))
+	if err != nil && seen.Load() {
+		return retriedAfter{err}
+	}
 	if _, ok := isConditionFailed(err); ok {
 		return ErrExists
 	}
@@ -201,6 +210,7 @@ func (s *DynamoStore) Leave(ctx context.Context, b *Box) error {
 	upd := boxRevCheck(b, "REMOVE #acct SET #rev = :new", map[string]string{"#acct": "account"}, map[string]types.AttributeValue{})
 	ctx, cancel := bounded(ctx)
 	defer cancel()
+	seen := new(atomic.Bool)
 	_, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.boxes,
 		Key:                       upd.Key,
@@ -208,7 +218,10 @@ func (s *DynamoStore) Leave(ctx context.Context, b *Box) error {
 		ConditionExpression:       upd.ConditionExpression,
 		ExpressionAttributeNames:  upd.ExpressionAttributeNames,
 		ExpressionAttributeValues: upd.ExpressionAttributeValues,
-	})
+	}, notingRetries(seen))
+	if err != nil && seen.Load() {
+		return s.unsettled(b.Addr, retriedAfter{err})
+	}
 	if _, ok := isConditionFailed(err); ok || isTransactionConflict(err) {
 		s.cache.evict(b.Addr) // the cached record may be the stale one
 		return ErrStale
@@ -236,7 +249,13 @@ const (
 // transact writes items in one transaction. A condition that failed is the
 // error named for its item, whatever else met another; a failed box
 // condition also evicts the box's cached record, which may be the stale one.
-// A conflict that lasts every try is ErrStale, and evicts it too.
+// A conflict that lasts every try is ErrStale, and evicts it too. The SDK
+// gives one call's transaction a client token, the same on each of its
+// attempts, and "if the original TransactWriteItems call was successful,
+// then subsequent TransactWriteItems calls with the same client token return
+// successfully without making any changes" (Amazon DynamoDB Developer Guide,
+// Transaction APIs, Idempotency): so a failed condition here is a refusal
+// stated, and no attempt is noted (noting).
 func (s *DynamoStore) transact(ctx context.Context, b *Box, items []types.TransactWriteItem, failed map[int]error) error {
 	for try := 1; ; try++ {
 		call, cancel := bounded(ctx)

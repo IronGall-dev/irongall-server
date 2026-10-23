@@ -690,8 +690,11 @@ func (n noting) IsErrorRetryable(err error) bool {
 }
 
 // notingRetries is the option of one call that notes in seen an attempt
-// that left open whether it was applied (noting). The SDK's retryers,
-// retry.Standard and retry.AdaptiveMode, are each a RetryerV2.
+// that left open whether it was applied (noting). Every conditional write of
+// one item carries it, whose retry would otherwise read its own applied
+// attempt as a failed condition, and so does DeleteBox, whose retry may be
+// throttled after one; Adopt's transaction needs none (transact). The SDK's
+// retryers, retry.Standard and retry.AdaptiveMode, are each a RetryerV2.
 func notingRetries(seen *atomic.Bool) func(*dynamodb.Options) {
 	return func(o *dynamodb.Options) {
 		if v2, ok := o.Retryer.(aws.RetryerV2); ok {
@@ -909,12 +912,16 @@ func (s *DynamoStore) CreateBox(ctx context.Context, b *Box) error {
 	b.Rev = 1
 	ctx, cancel := bounded(ctx)
 	defer cancel()
+	seen := new(atomic.Bool)
 	_, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                &s.boxes,
 		Item:                     boxItem(b),
 		ConditionExpression:      aws.String("attribute_not_exists(#a)"),
 		ExpressionAttributeNames: map[string]string{"#a": "addr"},
-	})
+	}, notingRetries(seen))
+	if err != nil && seen.Load() {
+		return s.unsettled(b.Addr, retriedAfter{err})
+	}
 	if _, ok := isConditionFailed(err); ok {
 		// It has a record, whoever wrote it, and what is cached of it is the
 		// stale view.
@@ -975,7 +982,11 @@ func (s *DynamoStore) UpdateBox(ctx context.Context, b *Box) error {
 func (s *DynamoStore) DeleteBox(ctx context.Context, a protocol.Address) error {
 	ctx, cancel := bounded(ctx)
 	defer cancel()
-	if _, err := s.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &s.boxes, Key: boxKey(a)}); err != nil {
+	seen := new(atomic.Bool)
+	if _, err := s.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &s.boxes, Key: boxKey(a)}, notingRetries(seen)); err != nil {
+		if seen.Load() {
+			err = retriedAfter{err}
+		}
 		return s.unsettled(a, err)
 	}
 	s.forget(a)
@@ -1126,6 +1137,7 @@ func (s *DynamoStore) retire(ctx context.Context, box protocol.Address, id [32]b
 	now := s.nowMs()
 	ctx, cancel := bounded(ctx)
 	defer cancel()
+	seen := new(atomic.Bool)
 	out, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.msgs,
 		Key:                       msgKey(box, id),
@@ -1134,7 +1146,10 @@ func (s *DynamoStore) retire(ctx context.Context, box protocol.Address, id [32]b
 		ExpressionAttributeNames:  map[string]string{"#l": "live", "#r": "received_at"},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":cutoff": num(now - ttlMs)},
 		ReturnValues:              types.ReturnValueUpdatedOld,
-	})
+	}, notingRetries(seen))
+	if err != nil && seen.Load() {
+		return retriedAfter{err}
+	}
 	if _, ok := isConditionFailed(err); ok {
 		return ErrNotFound
 	}

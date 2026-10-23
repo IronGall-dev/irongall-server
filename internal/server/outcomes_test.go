@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -431,6 +433,17 @@ func (s *overFake) UpdateBox(ctx context.Context, b *Box) error {
 	return s.fake().UpdateBox(ctx, read)
 }
 
+func (s *overFake) Leave(ctx context.Context, b *Box) error {
+	if !s.armed.Swap(false) {
+		return s.Store.Leave(ctx, b)
+	}
+	read := cloneBox(b)
+	if err := s.Store.Leave(ctx, b); err != nil {
+		return err
+	}
+	return s.fake().Leave(ctx, read)
+}
+
 func (s *overFake) PutMessage(ctx context.Context, box protocol.Address, h *Header, body []byte) (*Header, error) {
 	if !s.armed.Swap(false) {
 		return s.Store.PutMessage(ctx, box, h, body)
@@ -650,6 +663,139 @@ func TestARevocationWhoseAnswerWasLostIsInTheNextPassCheck(t *testing.T) {
 			t.Logf("the raise: %v (mayHaveApplied %v); the index holds the box %v; then a pass under certificate 1: %d %s", err, mayHaveApplied(err), held, got.status, got.code())
 			if got.status != c.status || got.code() != c.code {
 				t.Errorf("a pass under certificate 1 after the raise: %d %s; want %d %s", got.status, got.code(), c.status, c.code)
+			}
+		})
+	}
+}
+
+// Every conditional write of the store is no stated refusal when its retry's
+// condition fails after an attempt that left open whether it was applied:
+// the fake applies the first attempt and answers it with a 500, and the
+// retry fails its condition, as DynamoDB answers a retry of an applied
+// conditional write (IronGall-dev/irongall-server#89). So too a delete,
+// which has no condition, throttled after a 500. The controls: the same
+// write's failed condition, or throttles, alone, a refusal stated as before;
+// and Adopt's transaction cancelled for a failed condition after a 500, a
+// refusal stated, since its retry carries its first attempt's token
+// (TestAnAdoptsRetriesCarryItsFirstAttemptsToken).
+func TestEveryConditionalWriteRetriedAfterAnAmbiguousAttemptMayHaveBeenApplied(t *testing.T) {
+	_, _, box := heldRecord(t)
+	createBox := func(ctx context.Context, s *DynamoStore) error { return s.CreateBox(ctx, cloneBox(box)) }
+	leave := func(ctx context.Context, s *DynamoStore) error { return s.Leave(ctx, cloneBox(box)) }
+	deleteBox := func(ctx context.Context, s *DynamoStore) error { return s.DeleteBox(ctx, box.Addr) }
+	ack := func(ctx context.Context, s *DynamoStore) error { return s.DeleteMessage(ctx, box.Addr, [32]byte{7}) }
+	account := func(ctx context.Context, s *DynamoStore) error { return s.CreateAccount(ctx, &Account{ID: "acct"}) }
+	adoptKey := func(ctx context.Context, s *DynamoStore) error {
+		return s.PutAdoptKey(ctx, &AdoptKey{Account: "acct", Hash: [32]byte{1}, Uses: 1, Expires: time.Now().Add(time.Hour)})
+	}
+	adopt := func(ctx context.Context, s *DynamoStore) error {
+		return s.Adopt(ctx, cloneBox(box), "acct", [32]byte{1})
+	}
+	cancelled := answer{status: http.StatusBadRequest, body: dynErr("TransactionCanceledException", `,"CancellationReasons":[{"Code":"ConditionalCheckFailed"},{"Code":"None"}]`)}
+	cases := []struct {
+		name    string
+		op      string
+		answers []answer
+		write   func(context.Context, *DynamoStore) error
+		stated  error // the refusal the write states, or nil for one that may have been applied
+	}{
+		{"CreateBox applied and answered 500, then the retry's failed condition", "PutItem", []answer{applied(answer500), answerCCF}, createBox, nil},
+		{"Leave applied and answered 500, then the retry's failed condition", "UpdateItem", []answer{applied(answer500), answerCCF}, leave, nil},
+		{"DeleteBox applied and answered 500, then throttled twice", "DeleteItem", []answer{applied(answer500), answerPTEE, answerPTEE}, deleteBox, nil},
+		{"an ack's item applied and answered 500, then the retry's failed condition", "UpdateItem", []answer{applied(answer500), answerCCF}, ack, nil},
+		{"CreateAccount applied and answered 500, then the retry's failed condition", "PutItem", []answer{applied(answer500), answerCCF}, account, nil},
+		{"PutAdoptKey applied and answered 500, then the retry's failed condition", "PutItem", []answer{applied(answer500), answerCCF}, adoptKey, nil},
+		{"control: CreateBox's failed condition", "PutItem", []answer{answerCCF}, createBox, ErrExists},
+		{"control: Leave's failed condition", "UpdateItem", []answer{answerCCF}, leave, ErrStale},
+		{"control: DeleteBox throttled three times", "DeleteItem", []answer{answerPTEE, answerPTEE, answerPTEE}, deleteBox, nil},
+		{"control: an ack's failed condition", "UpdateItem", []answer{answerCCF}, ack, ErrNotFound},
+		{"control: CreateAccount's failed condition", "PutItem", []answer{answerCCF}, account, ErrExists},
+		{"control: PutAdoptKey's failed condition", "PutItem", []answer{answerCCF}, adoptKey, ErrExists},
+		{"control: Adopt answered 500, then its transaction cancelled for the box's condition", "TransactWriteItems", []answer{answer500, cancelled}, adopt, ErrStale},
+	}
+	fakes, errs := make([]*fakeAWS, len(cases)), make([]error, len(cases))
+	var wg sync.WaitGroup // every write at once, each on a fake of its own, then each judged
+	for i, c := range cases {
+		fakes[i] = newFakeAWS()
+		fakes[i].dynamo = scripted(c.op, c.answers...)
+		s := fakeStore(t, fakes[i])
+		wg.Go(func() { errs[i] = c.write(context.WithoutCancel(t.Context()), s) })
+	}
+	wg.Wait()
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := errs[i]
+			calls, applied := fakes[i].count(c.op)
+			want := c.stated == nil && !strings.HasPrefix(c.name, "control:")
+			t.Logf("%d %s calls, %d applied; err %v; mayHaveApplied %v", calls, c.op, applied, err, mayHaveApplied(err))
+			if err == nil || mayHaveApplied(err) != want || (c.stated != nil && !errors.Is(err, c.stated)) || (want && (errors.Is(err, ErrExists) || errors.Is(err, ErrStale) || errors.Is(err, ErrNotFound))) {
+				t.Errorf("err %v, mayHaveApplied %v; want a write that may have been applied %v, the refusal %v", err, mayHaveApplied(err), want, c.stated)
+			}
+		})
+	}
+}
+
+// Adopt is the conditional write that needs no note of its attempts: its
+// transaction carries a client token, the same on every attempt of one call,
+// so DynamoDB answers the retry of an applied attempt as that attempt
+// succeeded, and a failed condition there is a refusal stated (Amazon
+// DynamoDB Developer Guide, Transaction APIs, Idempotency; transact). The
+// fake answers every attempt with a 500 and keeps each one's token.
+func TestAnAdoptsRetriesCarryItsFirstAttemptsToken(t *testing.T) {
+	_, _, box := heldRecord(t)
+	var mu sync.Mutex
+	var tokens []string
+	f := newFakeAWS()
+	f.dynamo = func(op string, n int, body []byte) answer {
+		var in struct{ ClientRequestToken string }
+		_ = json.Unmarshal(body, &in)
+		mu.Lock()
+		tokens = append(tokens, in.ClientRequestToken)
+		mu.Unlock()
+		return answer500
+	}
+	err := fakeStore(t, f).Adopt(context.WithoutCancel(t.Context()), cloneBox(box), "acct", [32]byte{1})
+	mu.Lock()
+	defer mu.Unlock()
+	t.Logf("%d attempts, tokens %q; err %v", len(tokens), tokens, err)
+	if len(tokens) < 2 || tokens[0] == "" || slices.ContainsFunc(tokens, func(tok string) bool { return tok != tokens[0] }) {
+		t.Errorf("the attempts of one Adopt carry tokens %q; want one token, on each", tokens)
+	}
+}
+
+// A Leave the store applied, whose first attempt AWS answered with a fault
+// and whose retry met its own write's failed condition, is answered as any
+// write whose outcome is unknown, 503, never 409 box_changed. The control:
+// a Leave whose condition failed alone is 409 (IronGall-dev/irongall-server#89).
+func TestALeaveTheStoreMayHaveAppliedIsNot409(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		answers []answer
+		status  int
+		code    protocol.Code
+	}{
+		{"applied and answered 500, then the retry's failed condition", []answer{applied(answer500), answerCCF}, http.StatusServiceUnavailable, protocol.CodeUnavailable},
+		{"control: a failed condition, nothing applied", []answer{answerCCF}, http.StatusConflict, protocol.CodeBoxChanged},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := t.Context()
+			s := &overFake{t: t, dynamo: scripted("UpdateItem", c.answers...)}
+			e := newEnv(t, relaxed(), func(cfg *Config) { s.Store, cfg.Store = cfg.Store, s })
+			r := e.raw().register(protocol.MaxPrekeyLifetime)
+			acc, key := accountEnv(t, e, false, 1)
+			_, hash, _ := parseAdopt(key)
+			rec, err := e.store.Box(ctx, r.id.Address())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := e.store.Adopt(ctx, rec, acc.ID, hash); err != nil {
+				t.Fatal(err)
+			}
+			s.armed.Store(true)
+			got := e.do("DELETE", r.path("/account"), nil, r.pass(1))
+			t.Logf("the leave: %d %s", got.status, got.code())
+			if got.status != c.status || got.code() != c.code {
+				t.Errorf("the leave is answered %d %s; want %d %s", got.status, got.code(), c.status, c.code)
 			}
 		})
 	}
