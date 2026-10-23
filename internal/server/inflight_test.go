@@ -1,16 +1,26 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/IronGall-dev/irongall-client/api/apitest"
 	"github.com/IronGall-dev/irongall-client/protocol"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 )
 
 // Posts of the same ciphertext from one sender in flight at once are one
@@ -295,5 +305,359 @@ func TestLookupsThatShareAReadGetCopiesOfTheirOwn(t *testing.T) {
 	wg.Wait()
 	if got[0] == nil || got[0] == got[1] {
 		t.Errorf("two lookups that shared a read got %p and %p; want two copies", got[0], got[1])
+	}
+}
+
+// rawAnswer is one call's answer, or the error that ended it.
+type rawAnswer struct {
+	status int
+	code   protocol.Code
+	err    error
+}
+
+func (a rawAnswer) String() string {
+	if a.err != nil {
+		return "error"
+	}
+	return fmt.Sprint(a.status, " ", a.code)
+}
+
+// plainCall makes one call, for goroutines: it never stops the test, and a call
+// cut off (a panic in its handler) is an answer with err set.
+func plainCall(method, url string, body []byte, ctype, pass string) rawAnswer {
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req, _ := http.NewRequest(method, url, rd)
+	if ctype != "" {
+		req.Header.Set("Content-Type", ctype)
+	}
+	if pass != "" {
+		req.Header.Set("Authorization", pass)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return rawAnswer{err: err}
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	var p protocol.Problem
+	_ = json.Unmarshal(b, &p)
+	return rawAnswer{status: resp.StatusCode, code: p.Code}
+}
+
+// rawPost is a post of ct to box to, naming the serials given, with pass.
+func rawPost(e *env, to *raw, ct []byte, serial, under uint64, pass string) func() rawAnswer {
+	q := protocol.SendQuery{PrekeySerial: serial, CertificateSerial: under}
+	url := e.srv.URL + to.path("/messages") + "?" + q.Encode()
+	return func() rawAnswer { return plainCall(http.MethodPost, url, ct, protocol.CiphertextContentType, pass) }
+}
+
+// allAtOnce runs each call on a goroutine of its own, all released at once,
+// and returns their answers in order.
+func allAtOnce(calls ...func() rawAnswer) []rawAnswer {
+	start := make(chan struct{})
+	out := make([]rawAnswer, len(calls))
+	var wg sync.WaitGroup
+	for i, c := range calls {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			out[i] = c()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	return out
+}
+
+// tallyOf counts the answers by status and code.
+func tallyOf(as []rawAnswer) string {
+	n := map[string]int{}
+	for _, a := range as {
+		n[a.String()]++
+	}
+	var ks []string
+	for k, v := range n {
+		ks = append(ks, fmt.Sprintf("%dx %s", v, k))
+	}
+	sort.Strings(ks)
+	return strings.Join(ks, ", ")
+}
+
+// Posts of the same bytes from one sender naming other serials are posts of
+// their own: the single flight's key holds the query (send). A post naming a
+// stale serial, which leads, is refused stale_prekey; one naming the current
+// serials, in flight at the same time, is stored, never handed the stale
+// one's refusal (IronGall-dev/irongall-server#92).
+func TestAStaleSerialIsAPostOfItsOwn(t *testing.T) {
+	for trial := range 5 {
+		e := newEnv(t, relaxed(), func(cfg *Config) { cfg.Store = slowDedupe{cfg.Store, 100 * time.Millisecond} })
+		to, from := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+		ct := sealFor(t, to, 1)
+		pass := from.pass(1)
+		stale, cur := rawPost(e, to, ct, 2, 1, pass), rawPost(e, to, ct, 1, 1, pass)
+		got := allAtOnce(stale, func() rawAnswer { time.Sleep(20 * time.Millisecond); return cur() })
+		if got[0].code != protocol.CodeStalePrekey || got[1].status != http.StatusCreated {
+			t.Errorf("trial %d: the same bytes naming a stale and the current serials at once: %s and %s; want 409 stale_prekey and 201", trial, got[0], got[1])
+		}
+	}
+}
+
+// panicOnce panics once it is armed, after a gate, in a post's write, a
+// purge's delete or a lookup's read of address x.
+type panicOnce struct {
+	Store
+	x              protocol.Address
+	let            chan struct{}
+	put, del, read atomic.Bool
+	entered        chan string
+}
+
+func (s *panicOnce) PutMessage(ctx context.Context, box protocol.Address, h *Header, body []byte) (*Header, error) {
+	if s.put.CompareAndSwap(true, false) {
+		s.entered <- "put"
+		<-s.let
+		panic("panicOnce: a panic in a post's write")
+	}
+	return s.Store.PutMessage(ctx, box, h, body)
+}
+
+func (s *panicOnce) DeleteMessages(ctx context.Context, a protocol.Address) error {
+	if s.del.CompareAndSwap(true, false) {
+		s.entered <- "delete"
+		<-s.let
+		panic("panicOnce: a panic in a purge")
+	}
+	return s.Store.DeleteMessages(ctx, a)
+}
+
+func (s *panicOnce) Known(a protocol.Address) (*Box, bool) {
+	if a == s.x {
+		return nil, false
+	}
+	return s.Store.Known(a)
+}
+
+func (s *panicOnce) Box(ctx context.Context, a protocol.Address) (*Box, error) {
+	if a == s.x && s.read.CompareAndSwap(true, false) {
+		s.entered <- "read"
+		<-s.let
+		panic("panicOnce: a panic in a lookup's read")
+	}
+	return s.Store.Box(ctx, a)
+}
+
+// A panic in the shared function of each single flight, the posts', the
+// lookups' and the purges', with callers waiting on it, ends none but those
+// calls: each caller's handler panics, which net/http reports and recovers,
+// the process goes on, and the next call of the same key is made afresh.
+// singleflight's DoChan would end the process on that panic, and Do hands it
+// to every caller (IronGall-dev/irongall-server#92).
+func TestAPanicInEachSingleFlightEndsOnlyItsCalls(t *testing.T) {
+	const n = 8
+	e := newEnv(t, relaxed())
+	p := &panicOnce{Store: e.store, entered: make(chan string, 3)}
+	srv := httptest.NewUnstartedServer(apitest.Handler(t, New(Config{Store: p, Limits: relaxed(), Now: e.clock.Now}).Handler()))
+	var panics lockedBuffer
+	srv.Config.ErrorLog = log.New(&panics, "", 0)
+	srv.Start()
+	t.Cleanup(srv.Close)
+	api := &env{t: t, clock: e.clock, srv: srv, store: p}
+	to, from := api.raw().register(protocol.MaxPrekeyLifetime), api.raw().register(protocol.MaxPrekeyLifetime)
+	victim := api.raw().register(protocol.MaxPrekeyLifetime)
+	p.x = victim.id.Address()
+
+	run := func(name string, arm *atomic.Bool, call func() rawAnswer) {
+		t.Helper()
+		before := strings.Count(panics.String(), "http: panic serving")
+		p.let = make(chan struct{})
+		arm.Store(true)
+		calls := make([]func() rawAnswer, n)
+		for i := range calls {
+			calls[i] = call
+		}
+		go func() { <-p.entered; time.Sleep(300 * time.Millisecond); close(p.let) }()
+		got := allAtOnce(calls...)
+		time.Sleep(50 * time.Millisecond) // net/http logs a panic before it closes the connection
+		after := strings.Count(panics.String(), "http: panic serving")
+		t.Logf("%s: %s; %d panics reported", name, tallyOf(got), after-before)
+		if after-before != n {
+			t.Errorf("%s: %d of %d callers' handlers panicked", name, after-before, n)
+		}
+		if again := call(); again.err != nil || again.status >= 500 {
+			t.Errorf("%s: the next call after the panic: %v %s", name, again.err, again)
+		}
+	}
+
+	post := rawPost(api, to, sealFor(t, to, 1), 1, 1, api.passFor(from.work[1], from.id.Address(), api.name()))
+	run("posts", &p.put, post)
+	run("lookups", &p.read, func() rawAnswer { return plainCall(http.MethodGet, srv.URL+victim.path(""), nil, "", "") })
+
+	box := api.raw().register(protocol.MaxPrekeyLifetime)
+	api.want(api.sendTo(box, 1, 1, from, 1), http.StatusCreated, "")
+	sig, err := protocol.SignRevocation(box.signer, box.id.Address())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := json.Marshal(protocol.Revocations{Identity: box.id.Document(), Revocation: sig})
+	if err := p.Store.Revoke(context.Background(), box.id.Address(), &Revocations{Identity: box.id.Document(), Address: sig}); err != nil {
+		t.Fatal(err)
+	}
+	run("purges", &p.del, func() rawAnswer {
+		return plainCall(http.MethodPut, srv.URL+box.path("/revocations"), rec, "application/json", "")
+	})
+	if n, _ := p.Store.Count(context.Background(), box.id.Address()); n != 0 {
+		t.Errorf("after the purge's panic and the next PUT: %d messages left", n)
+	}
+}
+
+// changedBetween changes sender a, once, just before the first read of its
+// record once set: in a send, the read after its pass's check.
+type changedBetween struct {
+	Store
+	a      protocol.Address
+	change func(ctx context.Context) error
+	done   atomic.Bool
+}
+
+func (s *changedBetween) Box(ctx context.Context, a protocol.Address) (*Box, error) {
+	if a == s.a && s.change != nil && s.done.CompareAndSwap(false, true) {
+		if err := s.change(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return s.Store.Box(ctx, a)
+}
+
+// A sender revoked, its current certificate revoked, or forgotten between its
+// pass's check and the send's read of its record is refused as its pass's
+// check would refuse it, and nothing is stored (send; IronGall-dev/irongall-server#92).
+func TestASenderChangedBetweenItsPassAndItsRecordIsRefused(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		status int
+		code   protocol.Code
+		change func(s *changedBetween, from *raw) func(context.Context) error
+	}{
+		{"revoked", http.StatusForbidden, protocol.CodeSenderRevoked, func(s *changedBetween, from *raw) func(context.Context) error {
+			return func(ctx context.Context) error {
+				sig, err := protocol.SignRevocation(from.signer, from.id.Address())
+				if err != nil {
+					return err
+				}
+				return s.Store.Revoke(ctx, from.id.Address(), &Revocations{Identity: from.id.Document(), Address: sig})
+			}
+		}},
+		{"its current certificate revoked", http.StatusUnauthorized, protocol.CodeCertificateRevoked, func(s *changedBetween, from *raw) func(context.Context) error {
+			return func(ctx context.Context) error {
+				rc := from.certs(1)
+				return s.Store.Revoke(ctx, from.id.Address(), &Revocations{Identity: from.id.Document(), Certs: rc.RevokedCertificates, CertsSig: rc.RevokedCertificatesSignature, Through: 1})
+			}
+		}},
+		{"forgotten", http.StatusForbidden, protocol.CodeUnknownSender, func(s *changedBetween, from *raw) func(context.Context) error {
+			return func(ctx context.Context) error { return s.Store.DeleteBox(ctx, from.id.Address()) }
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := &changedBetween{}
+			e := newEnv(t, relaxed(), func(cfg *Config) { s.Store, cfg.Store = cfg.Store, s })
+			to, from := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+			pass := from.pass(1)
+			s.a, s.change = from.id.Address(), c.change(s, from)
+			r := e.do("POST", to.path("/messages"), sealedTo(1, 1, sealFor(t, to, 1)), pass)
+			n, _ := e.store.Count(context.Background(), to.id.Address())
+			if !s.done.Load() || r.status != c.status || r.code() != c.code || n != 0 {
+				t.Errorf("a sender %s between its pass's check and its record's read: %d %s, %d stored (changed %v); want %d %s and none",
+					c.name, r.status, r.code(), n, s.done.Load(), c.status, c.code)
+			}
+		})
+	}
+}
+
+// cannedAWS answers S3's PutObject and DeleteObject, and DynamoDB's PutItem
+// with a failed condition carrying item, and records each call.
+type cannedAWS struct {
+	mu    sync.Mutex
+	calls []string
+	item  string // the ConditionalCheckFailedException's Item, as JSON
+}
+
+func (c *cannedAWS) Do(r *http.Request) (*http.Response, error) {
+	if r.Body != nil {
+		_, _ = io.Copy(io.Discard, r.Body)
+	}
+	target := r.Header.Get("X-Amz-Target")
+	c.mu.Lock()
+	c.calls = append(c.calls, strings.TrimSpace(r.Method+" "+target+" "+r.URL.Path))
+	c.mu.Unlock()
+	status, body, ctype := http.StatusOK, "", "application/xml"
+	switch {
+	case strings.HasSuffix(target, ".PutItem"):
+		status, ctype = http.StatusBadRequest, "application/x-amz-json-1.0"
+		body = `{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"The conditional request failed","Item":` + c.item + `}`
+	case target != "":
+		return nil, fmt.Errorf("cannedAWS: no answer for %s", target)
+	case r.Method == http.MethodDelete:
+		status = http.StatusNoContent
+	}
+	return &http.Response{StatusCode: status, Status: http.StatusText(status), Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header: http.Header{"Content-Type": {ctype}, "X-Amzn-Requestid": {"t"}, "Etag": {`"e"`}},
+		Body:   io.NopCloser(strings.NewReader(body)), Request: r}, nil
+}
+
+// DynamoStore.PutMessage, in process against canned answers: a duplicate
+// whose PutItem finds the id's item acked deletes the body it just put, under
+// the key it put it at, and one that finds the item live deletes nothing
+// (IronGall-dev/irongall-server#16, #92). TestADuplicateAfterAnAckLeavesNoBody
+// holds the first on AWS.
+func TestADuplicatesWriteDeletesOnlyAnAckedBody(t *testing.T) {
+	var box, from protocol.Address
+	box[0], from[0] = 1, 2
+	body := []byte("the same bytes")
+	id := [32]byte{3}
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	recv := ms(now) - 1000
+	b64 := base64.StdEncoding.EncodeToString
+	for _, c := range []struct {
+		name    string
+		live    bool
+		deletes bool
+	}{{"acked", false, true}, {"live", true, false}} {
+		t.Run(c.name, func(t *testing.T) {
+			it := fmt.Sprintf(`{"box":{"B":%q},"id":{"B":%q},"from":{"B":%q},"size":{"N":"%d"},"received_at":{"N":"%d"},"expires_at":{"N":"%d"}`,
+				b64(box[:]), b64(id[:]), b64(from[:]), len(body), recv, ttlSeconds(recv+ttlMs))
+			if c.live {
+				it += fmt.Sprintf(`,"live":{"B":%q}`, b64(liveKey(recv, id)))
+			}
+			it += "}"
+			fake := &cannedAWS{item: it}
+			var logged bytes.Buffer
+			s := NewDynamoStore(DynamoConfig{AWS: aws.Config{Region: "us-east-1", Credentials: credentials.NewStaticCredentialsProvider("AKIDEXAMPLE", "x", ""),
+				HTTPClient: fake, BaseEndpoint: aws.String("http://127.0.0.1:1")}, BoxesTable: "b", MsgsTable: "m", AccountsTable: "a", Bucket: "s", Log: log.New(&logged, "", 0)})
+			h := &Header{ID: id, From: from, Size: len(body), ReceivedAt: now, ExpiresAt: now.Add(protocol.Retention)}
+			orig, err := s.PutMessage(context.Background(), box, h, body)
+			fake.mu.Lock()
+			calls := append([]string(nil), fake.calls...)
+			fake.mu.Unlock()
+			t.Logf("calls %q; logged %q", calls, logged.String())
+			if err != nil || orig == nil || orig.ID != id || orig.From != from {
+				t.Fatalf("a duplicate's write: %+v, %v; want the original's header", orig, err)
+			}
+			deleted := 0
+			for _, call := range calls {
+				if strings.HasPrefix(call, "DELETE ") {
+					deleted++
+					if !strings.HasSuffix(call, bodyKey(box, id)) {
+						t.Errorf("deleted %s, not the body it put at %s", call, bodyKey(box, id))
+					}
+				}
+			}
+			if (deleted == 1) != c.deletes || deleted > 1 {
+				t.Errorf("a duplicate that found the item %s deleted %d bodies", c.name, deleted)
+			}
+		})
 	}
 }
