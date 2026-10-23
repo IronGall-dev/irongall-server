@@ -134,17 +134,36 @@ func TestEveryCallToAWSEndsAtItsBound(t *testing.T) {
 			ended[i] <- result{err, time.Since(start)}
 		}()
 	}
-	deadline := time.Now().Add(storeTimeout + 3*time.Second)
+	// Each is waited for until storeTimeout and 3 s after they began, and a
+	// call that ended by then is judged by its end, however long the calls
+	// judged before it waited.
+	deadline := time.NewTimer(storeTimeout + 3*time.Second)
+	defer deadline.Stop()
+	late := false
 	for i, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			var r result
+			ok := false
 			select {
-			case r := <-ended[i]:
-				t.Logf("ended after %v: %v", r.took.Round(100*time.Millisecond), r.err)
-				if !errors.Is(r.err, context.DeadlineExceeded) {
-					t.Errorf("ended by %v, not by its bound", r.err)
+			case r = <-ended[i]:
+				ok = true
+			default:
+				if !late {
+					select {
+					case r = <-ended[i]:
+						ok = true
+					case <-deadline.C:
+						late = true
+					}
 				}
-			case <-time.After(time.Until(deadline)):
+			}
+			switch {
+			case !ok:
 				t.Errorf("still waiting after storeTimeout and 3 s: a call to AWS that never answers is not bounded by storeTimeout")
+			case !errors.Is(r.err, context.DeadlineExceeded):
+				t.Errorf("ended after %v by %v, not by its bound", r.took.Round(100*time.Millisecond), r.err)
+			default:
+				t.Logf("ended after %v: %v", r.took.Round(100*time.Millisecond), r.err)
 			}
 		})
 	}
