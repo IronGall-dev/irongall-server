@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -232,6 +234,67 @@ func TestAnACLsIfMatch(t *testing.T) {
 	if tag, _ := tagOf(); tag != paused {
 		t.Fatalf("the pause put again has the tag %q, want its own %q", tag, paused)
 	}
+}
+
+// onRead runs f once, at the first read of the body it wraps.
+type onRead struct {
+	io.ReadCloser
+	f    func()
+	done bool
+}
+
+func (o *onRead) Read(p []byte) (int, error) {
+	if !o.done {
+		o.done = true
+		o.f()
+	}
+	return o.ReadCloser.Read(p)
+}
+
+// A PUT's If-Match is held to the ACL its write replaces (PROTOCOL-SERVER.md
+// § 6.2): another writer's ACL that lands while the PUT reads its body, after
+// its If-Match was evaluated, makes the PUT 409 box_changed, and the other
+// writer's ACL stays; the same PUT sent again meets an If-Match that is
+// false (412), and one with the tag now held is taken
+// (IronGall-dev/irongall-server#88).
+func TestAnACLsIfMatchIsHeldToTheACLItsWriteReplaces(t *testing.T) {
+	e := newEnv(t, relaxed())
+	b, x := e.box(protocol.Classic), e.box(protocol.Classic)
+	path := "/v1/" + b.Address().String() + "/acl"
+	pass := e.pass(b)
+	tag := e.do("GET", path, nil, pass).header.Get("ETag")
+	other := &protocol.ACL{Allow: protocol.ACLList{Any: true}, Deny: protocol.NewACLList(false, []protocol.Address{x.Address()})}
+	var raced atomic.Int32
+	e.setMiddle(func(w http.ResponseWriter, r *http.Request, next http.Handler) {
+		if r.Method == http.MethodPut && raced.Load() == 0 {
+			r.Body = &onRead{ReadCloser: r.Body, f: func() {
+				cur, err := e.store.Box(context.Background(), b.Address())
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				cur.ACL = other
+				if err := e.store.UpdateBox(context.Background(), cur); err != nil {
+					t.Error(err)
+					return
+				}
+				raced.Add(1)
+			}}
+		}
+		next.ServeHTTP(w, r)
+	})
+	pause := aclOf([]string{}, []string{"*"})
+	r := e.doWith("PUT", path, pause, pass, "If-Match", tag)
+	e.setMiddle(nil)
+	now := e.do("GET", path, nil, pass)
+	if raced.Load() != 1 || r.status != http.StatusConflict || r.code() != protocol.CodeBoxChanged {
+		t.Errorf("a PUT whose record changed while it read its body: %d %s (raced %d); the ACL held after: %s", r.status, r.body, raced.Load(), now.body)
+	}
+	if !strings.Contains(string(now.body), x.Address().String()) || now.header.Get("ETag") == tag {
+		t.Fatalf("the other writer's ACL is not the one held: %s %s", now.body, now.header.Get("ETag"))
+	}
+	e.want(e.doWith("PUT", path, pause, pass, "If-Match", tag), http.StatusPreconditionFailed, protocol.CodePreconditionFailed)
+	e.want(e.doWith("PUT", path, pause, pass, "If-Match", now.header.Get("ETag")), http.StatusOK, "")
 }
 
 // A GET of the ACL reads its preconditions as a list does, in RFC 9110
