@@ -24,9 +24,11 @@ const hintDocument = "the identity document is \"irongall-v1\", LF, one SSH publ
 // register is PUT /v1/<address> (PROTOCOL.md §3). It is a call of a box that
 // does not exist yet, so its address pays for it: its body is read only once
 // the call has spent one of its address's flood budget at the gate, as a
-// revocation's is, and the statement and the pass it carries are checked only
-// for a box this process does not already hold, after the address's count of
-// registrations.
+// revocation's is. A box this process does not already hold is read only
+// after the address's count of registrations, and the statement and the pass
+// it carries are checked only once that read shows no box registered and the
+// address not revoked: either is answered from its record, in memory or read
+// (PROTOCOL.md §3 step 5).
 //
 // A registration is held to what is kept of the address, box or none: 410
 // while the address is revoked, and nothing under a certificate its identity
@@ -69,17 +71,21 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	// The counts just taken bound what follows: no count of misses is needed.
+	// What is kept of the address is read first, so a box registered, or an
+	// address revoked, is answered from it as one in memory is, whatever the
+	// statement (PROTOCOL.md §3 step 5).
+	cur, err := s.box(r.Context(), h)
+	if err != nil {
+		return err
+	}
+	if settled(cur) {
+		return s.registered(w, r, id, cur, &req, true)
+	}
 	p, cert, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
 	if err != nil {
 		return err
 	}
-	cur, err := s.box(r.Context(), h)
-	switch {
-	case err != nil:
-		return err
-	case settled(cur):
-		return s.registered(w, r, id, cur, &req, true)
-	case cur != nil:
+	if cur != nil { // an address with no box whose identity revoked certificates
 		if listed, err := cur.listed(cert.Serial()); err != nil {
 			return err
 		} else if listed {

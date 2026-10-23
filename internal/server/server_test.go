@@ -495,6 +495,57 @@ func TestRegistration(t *testing.T) {
 	}
 }
 
+// A registration of a registered box, or of a revoked address, is answered
+// from what is held of it before anything below is checked (PROTOCOL.md §3
+// step 5), whether this process's memory holds the box or it reads the
+// record, under the count of registrations (IronGall-dev/irongall-server#94):
+// another statement is 409 whatever pass it carries and however it is
+// signed, the box's current statement under its revoked current certificate
+// is certificate_revoked with no pass read, and a revoked address is 410.
+// Control: an address with no box has its statement and its pass read.
+func TestARegistrationOfARegisteredBoxIsAnsweredFromItsRecordFirst(t *testing.T) {
+	for name, with := range map[string][]func(*Config){
+		"a box this process holds":         nil,
+		"a box this process does not hold": {func(c *Config) { c.Store = unknownStore{c.Store} }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, relaxed(), with...)
+			c := e.raw()
+			c.prekey(5, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+			c.certify(1)
+			e.want(e.do("PUT", c.path(""), c.registration(5), c.pass(1)), 401, protocol.CodeCertificateNotCurrent)
+			bad := c.registration(5)
+			bad.PrekeySignature = c.sig[1]
+			e.want(e.do("PUT", c.path(""), bad, c.pass(5)), 400, protocol.CodeBadKey)
+
+			r := at3(e)
+			r.prekey(5, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+			for what, pass := range map[string]string{"no pass": "", "a pass under certificate 1": r.pass(1), "a pass under its certificate": r.pass(5)} {
+				if got := e.do("PUT", r.path(""), r.registration(5), pass); got.status != 409 || got.code() != protocol.CodeConflict {
+					t.Errorf("another statement, %s: %d %s, want 409 conflict", what, got.status, got.body)
+				}
+			}
+			bad = r.registration(5)
+			bad.PrekeySignature = r.sig[3]
+			r.prekey(6, e.clock.Now(), nil) // expired as it is made
+			for what, req := range map[string]protocol.RegisterRequest{"whose signature does not verify": bad, "that has expired": r.registration(6)} {
+				if got := e.do("PUT", r.path(""), req, r.pass(5)); got.status != 409 || got.code() != protocol.CodeConflict {
+					t.Errorf("a statement %s: %d %s, want 409 conflict", what, got.status, got.body)
+				}
+			}
+
+			e.want(e.do("PUT", r.path("/revocations"), r.certs(3), ""), 200, "")
+			e.want(e.do("PUT", r.path(""), r.registration(3), ""), 401, protocol.CodeCertificateRevoked)
+			rev, err := protocol.SignRevocation(r.signer, r.id.Address())
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.want(e.do("PUT", r.path("/revocations"), protocol.Revocations{Identity: r.id.Document(), Revocation: rev}, ""), 201, "")
+			e.want(e.do("PUT", r.path(""), bad, r.pass(5)), 410, protocol.CodeRevoked)
+		})
+	}
+}
+
 func TestOwnerCalls(t *testing.T) {
 	e := newEnv(t, relaxed())
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
