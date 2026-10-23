@@ -1,0 +1,22 @@
+# The lint AGENTS.md names, run as `golangci-lint run ./...` here and in CI.
+# irongall-server keeps the same file: change both together.
+version: "2"
+
+linters:
+  enable:
+    - gosec
+    - misspell
+    - revive
+    - unconvert
+    - unparam
+    - whitespace
+  exclusions:
+    # Test files are linted with the rest, but their findings are not reported:
+    # the gate is clean outside _test.go.
+    paths:
+      - _test\.go$
+
+issues:
+  # Every finding, never 3 of a kind: a new one must not hide behind old ones.
+  max-issues-per-linter: 0
+  max-same-issues: 0
