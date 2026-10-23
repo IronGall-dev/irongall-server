@@ -39,7 +39,7 @@
 When a change ships that its author is not confident in without a second reader (nobody else read it, or what was written after its review has not been read), a new issue with the label `needs-audit` is filed for it in the client repo, whichever repo changed. The issue the change fixes closes as usual.
 - 🛑 **The issue is the auditor's whole brief:** the commits, the claims to try to break, where to look first, what is already known and open, how to run it, and what closes it. An outside agent with no other context must be able to work from it.
 - **Nothing waits on one:** it is not a gate.
-- **Whoever audits closes it,** saying what was read, run and tried, with each finding as an issue of its own. The client repo's #45 is the pattern.
+- **Whoever audits closes it,** saying what was read, run and tried, and files what it found as one issue in the client repo, `findings: the audit of #N`, as the client repo's `AGENTS.md` says: each finding a numbered item; one of Medium or above, or one that breaks a `SECURITY.md` claim or the wire, also an issue of its own, here when it is this repo's code. The client repo's #45 is the pattern of a brief.
 
 ### The maintainers' own commits
 
