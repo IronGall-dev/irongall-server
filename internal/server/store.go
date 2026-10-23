@@ -440,6 +440,11 @@ type Store interface {
 	// returns, or nil for an address it holds as missing. ok is false when
 	// only a read can tell, which is what Box then does.
 	Known(a protocol.Address) (b *Box, ok bool)
+	// Begin returns a token of address a, which only grows: what Box
+	// answers once it is taken holds every write this process applied to a
+	// before it. A store with no memory but the store itself, whose Known is
+	// never behind, returns 0.
+	Begin(a protocol.Address) uint64
 	// CreateBox stores a new box's record at Rev 1, or returns ErrExists if
 	// the address has one.
 	CreateBox(ctx context.Context, b *Box) error

@@ -495,6 +495,8 @@ func (c *countingStore) Held(a protocol.Address) (Standing, bool) { return c.s.H
 
 func (c *countingStore) Known(a protocol.Address) (*Box, bool) { return c.s.Known(a) }
 
+func (c *countingStore) Begin(a protocol.Address) uint64 { return c.s.Begin(a) }
+
 func (c *countingStore) Count(ctx context.Context, box protocol.Address) (int, error) {
 	return c.s.Count(ctx, box)
 }
@@ -862,17 +864,17 @@ func TestBoxCache(t *testing.T) {
 	if b, _ := c.get(a1); b.Rev != 3 {
 		t.Fatalf("rev %d: an older record replaced a newer one", b.Rev)
 	}
-	c.refresh(a1, 3, func() (*Box, error) { return &Box{Addr: a1, Rev: 3, CertSerial: 9}, nil })
+	c.write(a1, c.image(3, func() (*Box, error) { return &Box{Addr: a1, Rev: 3, CertSerial: 9}, nil }))
 	if b, _ := c.get(a1); b.CertSerial == 9 {
 		t.Fatal("refreshed at the same rev")
 	}
-	c.refresh(a1, 4, func() (*Box, error) { return &Box{Addr: a1, Rev: 4}, nil })
+	c.write(a1, c.image(4, func() (*Box, error) { return &Box{Addr: a1, Rev: 4}, nil }))
 	if b, _ := c.get(a1); b.Rev != 4 {
 		t.Fatal("not refreshed to a newer rev")
 	}
-	c.refresh(a2, 1, func() (*Box, error) { return &Box{Addr: a2, Rev: 1}, nil })
+	c.write(a2, c.image(1, func() (*Box, error) { return &Box{Addr: a2, Rev: 1}, nil }))
 	if _, ok := c.get(a2); ok {
-		t.Fatal("refresh cached a record it did not hold")
+		t.Fatal("an image cached a record the cache did not hold")
 	}
 	c.put(&Box{Addr: a2, Rev: 1})
 	c.get(a1)

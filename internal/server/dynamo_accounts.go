@@ -72,12 +72,13 @@ func decodeAccount(it item) (*Account, error) {
 
 // Account implements Store: the cache, or a strongly consistent read, so a
 // change made before it is in it (one made after reaches the cache by the
-// stream).
+// stream, or, where it was counted after the read's token, keeps the fill
+// out: recCache.fill).
 func (s *DynamoStore) Account(ctx context.Context, id string) (*Account, error) {
 	if a, ok := s.accCache.get(id); ok {
 		return a, nil
 	}
-	seq := s.accWrites.Load()
+	tok := s.accCache.begin(id)
 	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.accts, Key: accountKey(id, skAccount), ConsistentRead: aws.Bool(true)})
 	if err != nil {
 		return nil, err
@@ -92,7 +93,7 @@ func (s *DynamoStore) Account(ctx context.Context, id string) (*Account, error) 
 	if err != nil {
 		return nil, err
 	}
-	s.accCache.fill(a, func() bool { return s.accWrites.Load() == seq })
+	s.accCache.fill(a, tok)
 	return a, nil
 }
 
@@ -277,7 +278,8 @@ func isTransactionConflict(err error) bool {
 }
 
 // applyAccountRecord applies one record of the -accounts-table stream to the
-// account cache. Only an account's record counts.
+// account cache, as a write (recCache.write). Only an account's record
+// counts.
 func (s *DynamoStore) applyAccountRecord(r stypes.Record) {
 	if r.Dynamodb == nil {
 		return
@@ -289,8 +291,7 @@ func (s *DynamoStore) applyAccountRecord(r stypes.Record) {
 			return
 		}
 		if rec {
-			s.accWrites.Add(1)
-			s.accCache.evict(id)
+			s.accCache.write(id, evicted[*Account])
 		}
 		return
 	}
@@ -303,11 +304,13 @@ func (s *DynamoStore) applyAccountRecord(r stypes.Record) {
 	if !rec {
 		return
 	}
-	s.accWrites.Add(1)
 	rev, err := it.uint("rev")
 	if err != nil {
 		s.logf("accounts: skipping an account record: %v", err)
+		// Counted all the same, so a read begun before it puts nothing; what
+		// is held stays.
+		s.accCache.write(id, func(cur *Account, held, _ bool) (*Account, bool) { return cur, held })
 		return
 	}
-	s.accCache.refresh(id, rev, func() (*Account, error) { return decodeAccount(it) })
+	s.accCache.write(id, s.accCache.image(rev, func() (*Account, error) { return decodeAccount(it) }))
 }

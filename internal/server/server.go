@@ -716,11 +716,19 @@ func (s *Server) box(ctx context.Context, a protocol.Address) (*Box, error) {
 // it, and keeps it only if the read finds no box (s.miss). Lookups of one
 // address made while its read is in flight share that read, and are counted
 // for nothing: it costs no more for them (IronGall-dev/irongall-server#6).
-// Each gets a copy of its own, since its caller may change the one it has.
+// One whose token (Store.Begin), taken once memory could not answer it, is
+// later than the token the read began at reads again: that read may be from
+// before a write this process applied before the lookup came, a revocation
+// among them (#95). Each gets a copy of its own, since its caller may change
+// the one it has.
 func (s *Server) lookup(r *http.Request, a protocol.Address) (*Box, error) {
-	for {
+	var since uint64
+	for first := true; ; first = false {
 		if b, ok := s.store.Known(a); ok {
 			return b, nil
+		}
+		if first {
+			since = s.store.Begin(a)
 		}
 		led := false
 		v, err, _ := s.reads.Do(string(a[:]), func() (any, error) {
@@ -736,11 +744,22 @@ func (s *Server) lookup(r *http.Request, a protocol.Address) (*Box, error) {
 		case err != nil:
 			return nil, err
 		}
-		if b, _ := v.(*Box); b != nil {
-			return cloneBox(b), nil
+		read, _ := v.(sharedRead)
+		if read.since < since {
+			continue // a read begun before a write this lookup came after: read again
+		}
+		if read.b != nil {
+			return cloneBox(read.b), nil
 		}
 		return nil, nil
 	}
+}
+
+// sharedRead is what a lookup's shared read found of an address, and the
+// token it began at.
+type sharedRead struct {
+	b     *Box
+	since uint64
 }
 
 // lead makes the read of a's record that lookups of a meanwhile share. It
@@ -748,22 +767,24 @@ func (s *Server) lookup(r *http.Request, a protocol.Address) (*Box, error) {
 // who hangs up fails none of them (IronGall-dev/irongall-server#32), and it
 // settles its reservation however it ends, a panic included (#36). A caller
 // refused before reading makes no read, and those waiting on it ask for
-// themselves (notRead).
-func (s *Server) lead(r *http.Request, a protocol.Address) (*Box, error) {
+// themselves (notRead). It takes its token before it reads, so every write
+// this process applied before the token is in what it finds.
+func (s *Server) lead(r *http.Request, a protocol.Address) (sharedRead, error) {
 	m, err := s.miss(r)
 	if err != nil {
-		return nil, notRead{err}
+		return sharedRead{}, notRead{err}
 	}
 	defer func() { m.release(s.now()) }() // settled below, but for a panic
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), storeTimeout)
 	defer cancel()
+	since := s.store.Begin(a)
 	b, err := s.box(ctx, a)
 	if err == nil && b == nil {
 		m.keep()
 	} else {
 		m.release(s.now())
 	}
-	return b, err
+	return sharedRead{b: b, since: since}, err
 }
 
 // notRead is what a shared read gives when its caller was refused before

@@ -430,15 +430,9 @@ func TestMissCache(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	var a1, a2, a3 protocol.Address
 	a1[1], a2[1], a3[1] = 1, 2, 3 // one shard
-	c := newMissCache(2)
-	miss := func(a protocol.Address) {
-		_, seq := c.has(a, now)
-		c.missed(a, seq, now)
-	}
-	has := func(a protocol.Address, at time.Time) bool {
-		m, _ := c.has(a, at)
-		return m
-	}
+	c := newBoxCache(2)
+	miss := func(a protocol.Address) { c.missed(a, c.begin(a), now) }
+	has := func(a protocol.Address, at time.Time) bool { return c.missingAt(a, at) }
 	if has(a1, now) {
 		t.Fatal("missing before any read")
 	}
@@ -450,27 +444,26 @@ func TestMissCache(t *testing.T) {
 		t.Fatal("remembered past its time")
 	}
 	miss(a1)
-	c.wrote(a1)
+	c.write(a1, evicted[*Box])
 	if has(a1, now) {
 		t.Fatal("still missing after a write")
 	}
 	// A read that began before a write must not record its miss after it.
-	_, seq := c.has(a1, now)
-	c.wrote(a2)
-	c.missed(a1, seq, now)
+	tok := c.begin(a1)
+	c.write(a2, evicted[*Box])
+	c.missed(a1, tok, now)
 	if has(a1, now) {
 		t.Fatal("a miss read before a write was recorded after it")
 	}
 	for _, a := range []protocol.Address{a1, a2, a3} {
 		miss(a)
 	}
-	if n := len(c.until); n > 2 || !has(a3, now) {
+	if n := len(c.missing.until); n > 2 || !has(a3, now) {
 		t.Fatalf("holds %d, over its size of 2, or not the newest", n)
 	}
-	off := newMissCache(0)
-	_, seq = off.has(a1, now)
-	off.missed(a1, seq, now)
-	if m, _ := off.has(a1, now); m {
+	off := newBoxCache(0)
+	off.missed(a1, off.begin(a1), now)
+	if off.missingAt(a1, now) {
 		t.Fatal("size 0 remembered a miss")
 	}
 }
@@ -485,7 +478,7 @@ func TestMissingBoxIsRememberedUntilItIsWritten(t *testing.T) {
 	if _, err := s.Box(ctx, a); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("an unregistered box: %v", err)
 	}
-	if m, _ := s.misses.has(a, e.clock.Now()); !m {
+	if !s.cache.missingAt(a, e.clock.Now()) {
 		t.Fatal("the miss was not remembered")
 	}
 	r.prekey(1, e.clock.Now().Add(24*time.Hour), nil)

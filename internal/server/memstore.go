@@ -119,6 +119,9 @@ func (s *MemStore) Known(a protocol.Address) (*Box, bool) {
 	return b, b != nil
 }
 
+// Begin implements Store: Known reads the store, so no read of it is older.
+func (s *MemStore) Begin(protocol.Address) uint64 { return 0 }
+
 // CreateBox implements Store.
 func (s *MemStore) CreateBox(_ context.Context, b *Box) error {
 	s.mu.Lock()

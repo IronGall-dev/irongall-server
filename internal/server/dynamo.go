@@ -56,19 +56,13 @@ type DynamoStore struct {
 	loads atomic.Int64
 
 	idx      *index
-	cache    *boxCache
-	misses   *missCache // boxes a read found missing
+	cache    *boxCache // with the boxes a read found missing
 	accCache *accountCache
 	boxFeed  *feed // the -boxes-table stream: the box cache and standing
 	msgFeed  *feed // the -msgs-table stream: layer 1's marks
 	accFeed  *feed // the -accounts-table stream: the account cache
 	fatal    func(error)
 	ready    atomic.Bool
-
-	// accWrites counts the changes to account records seen on the stream: an
-	// account's read begun at one count fills the cache only while it stands
-	// (recCache.fill). Accounts change seldom, so one count serves them all.
-	accWrites atomic.Uint64
 
 	// fault, in tests, fails a write sequence at a named point, as a crash
 	// there would leave it, or does there what a test needs to happen then.
@@ -118,7 +112,6 @@ func NewDynamoStore(c DynamoConfig) *DynamoStore {
 		consistent: c.ConsistentReads,
 		idx:        newIndex(),
 		cache:      newBoxCache(c.BoxCache),
-		misses:     newMissCache(c.BoxCache),
 		accCache:   newAccountCache(c.BoxCache),
 		fatal:      c.Fatal,
 	}
@@ -130,7 +123,7 @@ func NewDynamoStore(c DynamoConfig) *DynamoStore {
 	}
 	if m := c.Metrics; m != nil {
 		s.cache.note = func(e string) { m.cacheEvent("boxes", e) }
-		s.misses.note = func(e string) { m.cacheEvent("missing", e) }
+		s.cache.missing.note = func(e string) { m.cacheEvent("missing", e) }
 		s.accCache.note = func(e string) { m.cacheEvent("accounts", e) }
 	}
 	streams := dynamodbstreams.NewFromConfig(c.AWS)
@@ -689,17 +682,17 @@ func (s *DynamoStore) ensure(ctx context.Context, a protocol.Address) error {
 // readBox reads what memory holds of a box: its record's standing, its
 // identity's revocations and its live messages, strongly consistent, so a
 // change made before the read is in it (one made after reaches memory by a
-// stream). What it read joins the cache.
+// stream). What it read joins the cache, as of its token (recCache.fill).
 func (s *DynamoStore) readBox(ctx context.Context, a protocol.Address) (boxRead, error) {
 	s.loads.Add(1)
 	var r boxRead
-	seq := s.misses.seqOf(a)
+	tok := s.cache.begin(a)
 	rec, rv, err := s.readAddress(ctx, a, true)
 	if err != nil {
 		return r, err
 	}
 	if b := view(a, rec, rv); b != nil {
-		s.cache.fill(b, func() bool { return s.misses.seqOf(a) == seq })
+		s.cache.fill(b, tok)
 	}
 	if rv != nil {
 		r.revoked, r.through = len(rv.Address) > 0, rv.Through
@@ -751,13 +744,21 @@ func (s *DynamoStore) Held(a protocol.Address) (Standing, bool) { return s.idx.s
 
 // applyBox records a box record this process wrote: b is what is held of
 // its address, the record and the revocations read with it. Those were read
-// before the write, so b joins the cache only where the cache holds the
-// address, every image since applied to it, or where the read before a
-// registration found it missing and no write to it has been seen since
-// (recCache.fill). The write is recorded after, so that it ends that miss.
+// before the write, so in the step that counts the write (recCache.write)
+// b merges with what the cache holds of the address, every image since
+// applied to it, and where the cache holds nothing, joins it only where the
+// read before a registration found the address missing and no write to it
+// was counted since. A read begun before the write puts nothing after it.
 func (s *DynamoStore) applyBox(b *Box) {
-	s.cache.fill(b, func() bool { return s.misses.remembered(b.Addr) })
-	s.misses.wrote(b.Addr)
+	s.cache.write(b.Addr, func(cur *Box, held, missing bool) (*Box, bool) {
+		switch {
+		case held:
+			return mergeViews(cur, b), true
+		case missing:
+			return cloneBox(b), true
+		}
+		return nil, false
+	})
 	st, _, err := storedRecord(b).standing()
 	if err != nil { // a record this process just checked and wrote
 		s.logf("boxes: a record written with a bad identity: %v", err)
@@ -769,9 +770,11 @@ func (s *DynamoStore) applyBox(b *Box) {
 // applyRevocations records an address's revocations as they now are, from
 // this process's write or the stream.
 func (s *DynamoStore) applyRevocations(a protocol.Address, rv *Revocations) {
-	s.misses.wrote(a)
-	s.cache.modify(a, func(b *Box) (*Box, bool) {
-		m, err := b.withRevocations(rv)
+	s.cache.write(a, func(cur *Box, held, _ bool) (*Box, bool) {
+		if !held {
+			return nil, false
+		}
+		m, err := cur.withRevocations(rv)
 		return m, err == nil // one that fails is evicted: the next use reads it
 	})
 	s.idx.setRevocations(a, len(rv.Address) > 0, rv.Through)
@@ -782,8 +785,7 @@ func (s *DynamoStore) applyRevocations(a protocol.Address, rv *Revocations) {
 // of a record older than one this process has written since: the read after
 // it is what tells.
 func (s *DynamoStore) forget(a protocol.Address) {
-	s.misses.wrote(a)
-	s.cache.evict(a)
+	s.cache.write(a, evicted[*Box])
 	s.idx.forget(a)
 }
 
@@ -791,26 +793,26 @@ func (s *DynamoStore) forget(a protocol.Address) {
 // nothing of is remembered as missing for a while (missCache), so naming it
 // again costs no read. The read fills the cache, so it is strongly
 // consistent, as a box's load is: a write made before it is in it, and one
-// made after reaches the cache by the stream, or, where its image came
-// before the fill, keeps the fill out (recCache.fill).
+// made after reaches the cache by the stream, or, where it was counted
+// after the read's token, keeps the fill out (recCache.fill, missed).
 func (s *DynamoStore) Box(ctx context.Context, a protocol.Address) (*Box, error) {
 	if b, ok := s.cache.get(a); ok {
 		return b, nil
 	}
-	missing, seq := s.misses.has(a, s.now())
-	if missing {
+	if s.cache.missingAt(a, s.now()) {
 		return nil, ErrNotFound
 	}
+	tok := s.cache.begin(a)
 	rec, rv, err := s.readAddress(ctx, a, true)
 	if err != nil {
 		return nil, err
 	}
 	b := view(a, rec, rv)
 	if b == nil {
-		s.misses.missed(a, seq, s.now())
+		s.cache.missed(a, tok, s.now())
 		return nil, ErrNotFound
 	}
-	s.cache.fill(b, func() bool { return s.misses.seqOf(a) == seq })
+	s.cache.fill(b, tok)
 	return b, nil
 }
 
@@ -820,9 +822,11 @@ func (s *DynamoStore) Known(a protocol.Address) (*Box, bool) {
 	if b, ok := s.cache.get(a); ok {
 		return b, true
 	}
-	missing, _ := s.misses.has(a, s.now())
-	return nil, missing
+	return nil, s.cache.missingAt(a, s.now())
 }
+
+// Begin implements Store: a's token in the record cache (recCache.begin).
+func (s *DynamoStore) Begin(a protocol.Address) uint64 { return uint64(s.cache.begin(a)) }
 
 // CreateBox implements Store.
 func (s *DynamoStore) CreateBox(ctx context.Context, b *Box) error {
@@ -839,8 +843,9 @@ func (s *DynamoStore) CreateBox(ctx context.Context, b *Box) error {
 		ExpressionAttributeNames: map[string]string{"#a": "addr"},
 	})
 	if _, ok := isConditionFailed(err); ok {
-		s.misses.wrote(b.Addr) // it has a record, whoever wrote it
-		s.cache.evict(b.Addr)  // and what is cached of it is the stale view
+		// It has a record, whoever wrote it, and what is cached of it is the
+		// stale view.
+		s.cache.write(b.Addr, evicted[*Box])
 		return ErrExists
 	}
 	if err != nil {
@@ -1270,9 +1275,8 @@ func (s *DynamoStore) applyBoxImage(it item) {
 			s.forget(a)
 			return
 		}
-		s.misses.wrote(a)
+		s.cache.write(a, s.cache.image(rev, func() (*Box, error) { return decodeBox(it) }))
 		s.idx.setStanding(a, st, rev)
-		s.cache.refresh(a, rev, func() (*Box, error) { return decodeBox(it) })
 	case bytes.Equal(sk, []byte{skRevocations}):
 		rv, err := decodeRevocations(it)
 		if err != nil {
