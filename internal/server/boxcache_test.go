@@ -789,3 +789,68 @@ func TestALookupJoinedToAReadBegunBeforeARevocationReadsAgain(t *testing.T) {
 		})
 	}
 }
+
+// A box registered again once the TTL took its record starts at rev 1 again,
+// and its record is newer than the removed one whatever their revs: a
+// record's place in its address's history is when its box registered, then
+// its rev. So a read of the address begun before the removal, whose copy of
+// the removed record (rev 5) lands once the new registration is held, puts
+// nothing of it over the new one, and the new record's next image (rev 2) is
+// taken; and an index that held the removed box takes the registration's
+// standing (IronGall-dev/irongall-client#407 item 2). Memory alone.
+func TestARegistrationAfterTheTTLsRemovalIsNewerThanTheRemovedRecord(t *testing.T) {
+	e := newEnv(t, relaxed())
+	r := e.raw().register(protocol.MaxPrekeyLifetime)
+	a := r.id.Address()
+	rec, err := e.store.Box(t.Context(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := cloneBox(rec) // the record the TTL takes: registered 40 days before, renewed since
+	old.Rev, old.CertSerial, old.Created = 5, 3, rec.Created.Add(-40*24*time.Hour)
+	fresh := cloneBox(rec) // the identity's registration once the TTL took it
+	fresh.Rev, fresh.CertSerial = 1, 4
+	next := cloneBox(fresh) // the new box renews, and the stream brings it
+	next.Rev, next.CertSerial = 2, 5
+
+	t.Run("a read begun before the removal", func(t *testing.T) {
+		s := NewDynamoStore(DynamoConfig{BoxCache: 10})
+		tok := s.cache.begin(a)                      // a read of the address begins, and will find old
+		s.forget(a)                                  // the stream's removal of old, by the TTL
+		s.cache.missed(a, s.cache.begin(a), s.now()) // the registration's read finds nothing
+		s.applyBox(fresh)                            // its CreateBox, at rev 1
+		if b, ok := s.Known(a); !ok || b == nil || b.CertSerial != fresh.CertSerial {
+			t.Fatalf("control: memory holds %s, not the new registration", standsAt(b))
+		}
+		s.cache.fill(old, tok) // the first read's fill lands
+		if b, ok := s.Known(a); !ok || b == nil || b.CertSerial != fresh.CertSerial {
+			t.Errorf("memory answers %s in place of the new registration (rev 1, certificate serial %d): the removed record is rev 5, serial %d", standsAt(b), fresh.CertSerial, old.CertSerial)
+		}
+		s.applyBoxImage(item(boxItem(next)))
+		if b, ok := s.Known(a); !ok || b == nil || b.CertSerial != next.CertSerial {
+			t.Errorf("after the new box's image at rev 2 memory answers %s; want certificate serial %d", standsAt(b), next.CertSerial)
+		}
+	})
+	t.Run("an index that held the removed box", func(t *testing.T) {
+		s := NewDynamoStore(DynamoConfig{BoxCache: 10})
+		st, _, err := old.standing()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.idx.ensure(t.Context(), a, func() (boxRead, error) { return boxRead{exists: true, st: st, rev: old.Rev}, nil }); err != nil {
+			t.Fatal(err)
+		}
+		s.applyBox(fresh) // the registration, before the stream's removal of old arrives
+		if st, ok := s.Held(a); !ok || st.CertSerial != fresh.CertSerial {
+			t.Errorf("the index holds the box at certificate serial %d (%v) after its registration at serial %d: the removed record's standing", st.CertSerial, ok, fresh.CertSerial)
+		}
+	})
+}
+
+// standsAt is a record's rev and certificate serial, or that there is none.
+func standsAt(b *Box) string {
+	if b == nil {
+		return "no record"
+	}
+	return fmt.Sprintf("rev %d, certificate serial %d", b.Rev, b.CertSerial)
+}

@@ -800,3 +800,105 @@ func TestALeaveTheStoreMayHaveAppliedIsNot409(t *testing.T) {
 		})
 	}
 }
+
+// An adopt whose first attempt AWS applied, and answered with a fault or not
+// at all, may have been applied whatever came after it: throttles, a
+// TransactionInProgressException, which DynamoDB answers to an attempt with
+// the same token while the first is still in progress and the SDK retries as
+// a throttle, or the SDK's retry quota drained. Its transaction's calls share
+// one note of such an attempt, so the store states no refusal: the count is
+// kept, and memory forgets the box, the record cache and the index
+// (IronGall-dev/irongall-server#101). The control: a fault at every attempt.
+func TestAnAdoptAfterAnAmbiguousAttemptMayHaveBeenApplied(t *testing.T) {
+	_, _, box := heldRecord(t)
+	inProgress := answer{status: http.StatusBadRequest, body: dynErr("TransactionInProgressException", "")}
+	cases := []struct {
+		name    string
+		answers []answer
+		drained bool // the client's retry quota drained first
+	}{
+		{"applied and answered 500, then throttled twice", []answer{applied(answer500), answerPTEE, answerPTEE}, false},
+		{"applied and its answer lost, then in progress twice", []answer{applied(answer{drop: true}), inProgress, inProgress}, false},
+		{"applied and answered 500 on a drained retry quota", nil, true},
+		{"control: applied and answered 500 every attempt", []answer{applied(answer500), answer500, answer500}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFakeAWS()
+			f.dynamo = scripted("TransactWriteItems", c.answers...)
+			s := fakeStore(t, f)
+			ctx := context.WithoutCancel(t.Context())
+			if c.drained {
+				var phase atomic.Int32 // 0 draining, 1 the write
+				f.dynamo = func(string, int, []byte) answer {
+					if phase.Load() == 0 {
+						return answerPTEE
+					}
+					return applied(answer500)
+				}
+				var wg sync.WaitGroup
+				for range 60 {
+					wg.Go(func() { _ = s.Adopt(ctx, cloneBox(box), "acct", [32]byte{1}) })
+				}
+				wg.Wait()
+				phase.Store(1)
+			}
+			s.cache.fill(cloneBox(box), s.cache.begin(box.Addr))
+			st, _, err := box.standing()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.idx.ensure(t.Context(), box.Addr, func() (boxRead, error) { return boxRead{exists: true, st: st, rev: box.Rev}, nil }); err != nil {
+				t.Fatal(err)
+			}
+			calls0, applied0 := f.count("TransactWriteItems")
+			err = s.Adopt(ctx, cloneBox(box), "acct", [32]byte{1})
+			calls, applied := f.count("TransactWriteItems")
+			_, cached := s.cache.get(box.Addr)
+			_, held := s.Held(box.Addr)
+			t.Logf("%d attempts, %d applied; err %v; mayHaveApplied %v; the cache holds the record from before it %v; the index holds the box %v",
+				calls-calls0, applied-applied0, err, mayHaveApplied(err), cached, held)
+			if !mayHaveApplied(err) || cached || held {
+				t.Errorf("an adopt the fake applied: mayHaveApplied %v (the count kept), memory holds the record from before it %v, the index %v; want true, false, false", mayHaveApplied(err), cached, held)
+			}
+		})
+	}
+}
+
+// A registration whose write's outcome is unknown, its first attempt
+// applied and answered 500 and its retry's condition failed on that write,
+// is answered from the record, which it reads as it does after a failed
+// condition: with one registration an hour, neither it nor its client's
+// retry is 503, then 429 (IronGall-dev/irongall-client#411 item 2).
+func TestARegistrationWhoseOutcomeIsUnknownIsAnsweredFromTheRecord(t *testing.T) {
+	tb := &boxesTable{items: map[string]map[string]any{}}
+	var puts atomic.Int32
+	f := newFakeAWS()
+	f.dynamo = func(op string, n int, body []byte) answer {
+		var in struct {
+			TableName string
+			Item      map[string]any
+		}
+		_ = json.Unmarshal(body, &in)
+		if op == "PutItem" && in.TableName == "boxes" {
+			if puts.Add(1) == 1 {
+				tb.keep(in.Item)
+				return answer500
+			}
+			return answerCCF
+		}
+		return tb.answer(op, n, body)
+	}
+	s := fakeStore(t, f)
+	l := relaxed()
+	l.RegistrationsPerHour = 1
+	e := newEnv(t, l, func(cfg *Config) { cfg.Store, cfg.Ready = s, nil })
+	r := e.raw()
+	r.prekey(1, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	first := e.do("PUT", r.path(""), r.registration(1), r.pass(1))
+	again := e.do("PUT", r.path(""), r.registration(1), r.pass(1))
+	t.Logf("%d PutItem calls; the registration %d %s; its retry %d %s", puts.Load(), first.status, first.code(), again.status, again.code())
+	if first.status != http.StatusOK || again.status != http.StatusOK {
+		t.Errorf("a registration the store applied, its outcome unknown: %d %s, then its retry %d %s; want each answered from the record, 200", first.status, first.code(), again.status, again.code())
+	}
+}

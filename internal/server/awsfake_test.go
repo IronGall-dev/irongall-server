@@ -161,7 +161,7 @@ func (o onlyHost) RoundTrip(r *http.Request) (*http.Response, error) {
 
 // fakeStore is a DynamoStore on f, with a record cache and the SDK's default
 // retryer, as irongalld's config.LoadDefaultConfig leaves it.
-func fakeStore(t *testing.T, f *fakeAWS) *DynamoStore {
+func fakeStore(t testing.TB, f *fakeAWS) *DynamoStore {
 	t.Helper()
 	srv := httptest.NewServer(f)
 	t.Cleanup(func() {
