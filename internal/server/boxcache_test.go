@@ -210,8 +210,16 @@ func TestMergedCopiesKeepEveryRevocation(t *testing.T) {
 // record, and a PutItem with a failed condition, as a registration that
 // another made first meets. No AWS is called.
 type cannedTables struct {
+	mu      sync.Mutex
 	address []map[string]types.AttributeValue
 	account map[string]types.AttributeValue
+}
+
+// set makes the address's items it.
+func (c *cannedTables) set(it ...map[string]types.AttributeValue) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.address = it
 }
 
 // attrJSON is v in DynamoDB's JSON.
@@ -250,6 +258,8 @@ func (c *cannedTables) Do(r *http.Request) (*http.Response, error) {
 	body, _ := io.ReadAll(r.Body)
 	_ = json.Unmarshal(body, &q)
 	status, out := http.StatusOK, any(nil)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	switch op := strings.TrimPrefix(r.Header.Get("X-Amz-Target"), "DynamoDB_20120810."); {
 	case op == "Query" && q.TableName == "b":
 		var items []any

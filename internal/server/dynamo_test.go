@@ -774,16 +774,20 @@ func TestTheRecordAndTheRevocationsAreMemorys(t *testing.T) {
 	}
 }
 
-// A box record in a state this build never writes, as "deleted" was until
-// the box's delete was dropped (IronGall-dev/irongall-client#312), is no
-// record: reading it is an error, so nothing is served or taken for the
-// address, and its image on the stream makes memory forget the box rather
-// than keep answering for it as it was.
+// A box record this build cannot read whole is no record: one in a state it
+// never writes, as "deleted" was until the box's delete was dropped
+// (IronGall-dev/irongall-client#312), or an active one whose stored ACL does
+// not read. Reading it is an error, so nothing is served or taken for the
+// address, and its image on the stream makes memory forget the box wherever
+// it holds it, loaded or loading, its record cached, or its address
+// remembered missing, rather than keep answering for it as it was
+// (IronGall-dev/irongall-server#87). Control: an active image keeps it.
 func TestARecordInAStateNotWrittenIsRefused(t *testing.T) {
 	e := newEnv(t, relaxed())
 	ctx := context.Background()
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
-	rec, err := e.store.Box(ctx, r.id.Address())
+	a := r.id.Address()
+	rec, err := e.store.Box(ctx, a)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -791,19 +795,121 @@ func TestARecordInAStateNotWrittenIsRefused(t *testing.T) {
 	if _, err := decodeBox(it); err != nil {
 		t.Fatalf("an active record: %v", err)
 	}
-	it["state"] = str("deleted")
-	if b, err := decodeBox(it); err == nil {
-		t.Fatalf("a record in the state \"deleted\" read as %s", b.State)
+	at := func(rev uint64, set func(item)) item {
+		x := item(boxItem(rec))
+		x["rev"] = num(rev)
+		set(x)
+		return x
 	}
-	s := NewDynamoStore(DynamoConfig{BoxCache: 10})
-	if err := s.idx.ensure(ctx, r.id.Address(), func() (boxRead, error) {
-		return boxRead{exists: true, st: Standing{State: Active, CertSerial: rec.CertSerial}, rev: rec.Rev}, nil
-	}); err != nil {
+	deleted := at(rec.Rev+1, func(x item) { x["state"] = str("deleted") })
+	badACL := at(rec.Rev+1, func(x item) { x["acl"] = bin([]byte(`{"allow":"not a list"}`)) })
+	if _, _, err := decodeStanding(badACL); err != nil {
+		t.Fatalf("control: the standing of a record whose ACL does not read: %v", err)
+	}
+	read := func(rev uint64) func() (boxRead, error) {
+		return func() (boxRead, error) {
+			return boxRead{exists: true, st: Standing{State: Active, CertSerial: rec.CertSerial}, rev: rev}, nil
+		}
+	}
+	for _, im := range []struct {
+		name string
+		it   item
+	}{{"a record in the state \"deleted\"", deleted}, {"an active record whose ACL does not read", badACL}} {
+		if b, err := decodeBox(im.it); err == nil {
+			t.Fatalf("%s read as %s", im.name, b.State)
+		}
+		t.Run(im.name+", loaded and cached", func(t *testing.T) {
+			s := NewDynamoStore(DynamoConfig{BoxCache: 10})
+			if err := s.idx.ensure(ctx, a, read(rec.Rev)); err != nil {
+				t.Fatal(err)
+			}
+			s.cache.put(rec)
+			s.applyBoxImage(im.it)
+			if st, ok := s.Held(a); ok {
+				t.Errorf("the index kept the box as %s", st.State)
+			}
+			if b, ok := s.Known(a); ok {
+				t.Errorf("the record cache kept the box (%v), which Box serves with no read", b != nil)
+			}
+		})
+		t.Run(im.name+", remembered missing", func(t *testing.T) {
+			s := NewDynamoStore(DynamoConfig{BoxCache: 10})
+			s.cache.missed(a, s.cache.begin(a), s.now())
+			if _, ok := s.Known(a); !ok {
+				t.Fatal("control: the miss is not remembered")
+			}
+			s.applyBoxImage(im.it)
+			if _, ok := s.Known(a); ok {
+				t.Error("an image of a record left the address remembered as missing")
+			}
+		})
+		t.Run(im.name+", loading", func(t *testing.T) {
+			s := NewDynamoStore(DynamoConfig{BoxCache: 10})
+			reading, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+			go func() {
+				done <- s.idx.ensure(ctx, a, func() (boxRead, error) {
+					close(reading)
+					<-release
+					return read(rec.Rev)()
+				})
+			}()
+			<-reading
+			s.applyBoxImage(im.it)
+			close(release)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if st, ok := s.Held(a); ok {
+				t.Errorf("a load in flight when the image came kept the box as %s", st.State)
+			}
+		})
+	}
+	t.Run("control: an active image keeps it", func(t *testing.T) {
+		s := NewDynamoStore(DynamoConfig{BoxCache: 10})
+		if err := s.idx.ensure(ctx, a, read(rec.Rev)); err != nil {
+			t.Fatal(err)
+		}
+		s.cache.put(rec)
+		s.applyBoxImage(at(rec.Rev+1, func(item) {}))
+		if st, ok := s.Held(a); !ok || st.State != Active {
+			t.Errorf("an active image: the index holds the box %s, %v", st.State, ok)
+		}
+		if b, ok := s.Known(a); !ok || b == nil || b.Rev != rec.Rev+1 {
+			t.Errorf("an active image: the record cache holds the box %v (%v); want it at rev %d", b != nil, ok, rec.Rev+1)
+		}
+	})
+}
+
+// A process that served a box from its record cache, and then takes the
+// stream's image of the record in a state this build never writes, does not
+// serve it from the cache again: the read of the box after the image reads
+// the record, which fails (IronGall-dev/irongall-server#87). In process
+// over canned tables.
+func TestADeletedImageIsNotServedFromTheCache(t *testing.T) {
+	e0 := newEnv(t, relaxed())
+	r := e0.raw().register(protocol.MaxPrekeyLifetime)
+	a := r.id.Address()
+	rec, err := e0.store.Box(t.Context(), a)
+	if err != nil {
 		t.Fatal(err)
 	}
-	s.applyBoxImage(it)
-	if st, ok := s.idx.standing(r.id.Address()); ok {
-		t.Fatalf("memory kept the box as %+v after an image it cannot read", st)
+	tables := &cannedTables{address: []map[string]types.AttributeValue{boxItem(rec)}}
+	s := tables.store()
+	e := newEnv(t, relaxed(), func(c *Config) { c.Store = s })
+	r.e = e
+	e.want(e.do("GET", r.path(""), nil, ""), http.StatusOK, "")
+	if _, ok := s.Known(a); !ok {
+		t.Fatal("control: the read did not fill the record cache")
+	}
+	deleted := item(boxItem(rec))
+	deleted["state"] = str("deleted")
+	deleted["rev"] = num(rec.Rev + 1)
+	tables.set(deleted)
+	s.applyBoxImage(deleted)
+	got := e.do("GET", r.path(""), nil, "")
+	t.Logf("the read of the box after the image: %d %s", got.status, got.code())
+	if got.status == http.StatusOK {
+		t.Errorf("a box whose record is in a state this build never writes is served from the record cache: %d", got.status)
 	}
 }
 

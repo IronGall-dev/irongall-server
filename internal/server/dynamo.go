@@ -1256,11 +1256,13 @@ func (s *DynamoStore) Fetched(ctx context.Context, box protocol.Address, id [32]
 }
 
 // applyBoxImage applies an item of the -boxes-table table as it now is,
-// from the stream: a box's record, or an address's revocations. A record
-// this build cannot read, such as one in a state it never writes, is
-// forgotten, not skipped: memory then answers for none of it, and the
+// from the stream: a box's record, or an address's revocations. A record is
+// read whole, once, and its standing taken from the box it reads as. One
+// this build cannot read, such as one in a state it never writes or one
+// whose ACL does not read, is forgotten, not skipped: memory then answers
+// for none of it, the index, the record cache and a miss alike, and the
 // address's next use reads the record, which fails, so nothing is served or
-// taken for it on what memory held before.
+// taken for it on what memory held before (IronGall-dev/irongall-server#87).
 func (s *DynamoStore) applyBoxImage(it item) {
 	a, sk, err := boxItemKey(it)
 	if err != nil {
@@ -1269,14 +1271,18 @@ func (s *DynamoStore) applyBoxImage(it item) {
 	}
 	switch {
 	case bytes.Equal(sk, []byte{skBox}):
-		st, rev, err := decodeStanding(it)
+		b, err := decodeBox(it)
+		var st Standing
+		if err == nil {
+			st, _, err = b.standing()
+		}
 		if err != nil {
 			s.logf("boxes: forgetting a box record that does not read: %v", err)
 			s.forget(a)
 			return
 		}
-		s.cache.write(a, s.cache.image(rev, func() (*Box, error) { return decodeBox(it) }))
-		s.idx.setStanding(a, st, rev)
+		s.cache.write(a, s.cache.image(b.Rev, func() (*Box, error) { return b, nil }))
+		s.idx.setStanding(a, st, b.Rev)
 	case bytes.Equal(sk, []byte{skRevocations}):
 		rv, err := decodeRevocations(it)
 		if err != nil {
