@@ -158,7 +158,8 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	// first is in them waits for it, and is answered as step 6 answers a
 	// post of bytes the box holds, or with the first's own refusal, which it
 	// would meet as well. The call runs apart from the request that leads
-	// it, so its caller going fails none of the others.
+	// it, so its caller going fails none of the others, and each of its reads
+	// is bounded (deliver).
 	p := &post{from: from, to: to, id: sha256.Sum256(ciphertext), ciphertext: ciphertext, stanzas: stanzas, q: q, sender: sender, rcpt: rcpt, lim: lim, now: now}
 	led := false
 	v, err, _ := s.posts.Do(string(p.to[:])+string(p.id[:])+string(p.from[:])+p.q.Encode(), func() (any, error) {
@@ -198,7 +199,12 @@ type delivered struct {
 }
 
 // deliver is steps 6 to 9 of a send (send): the dedupe, whether the box
-// takes new mail, the counts, the write.
+// takes new mail, the counts, the write. It runs on a context apart from the
+// request that leads it, and every post of its ciphertext waits on it, so no
+// request's end cuts a read of it short: each read is bounded by
+// storeTimeout (bounded), on any store, as a lookup's shared read is
+// (Server.lead), and a read that never answers ends there. Its writes run to
+// their end, each call to AWS bounded by the store.
 func (s *Server) deliver(ctx context.Context, p *post) (delivered, error) {
 	from, to, msgID, rcpt, now, q := p.from, p.to, p.id, p.rcpt, p.now, p.q
 
@@ -206,7 +212,10 @@ func (s *Server) deliver(ctx context.Context, p *post) (delivered, error) {
 	// retry gets the original receipt, whatever has changed since it was
 	// stored, a renewal of the box's prekey included. What those checks
 	// keep from the box is new mail, and a retry is none.
-	if orig, err := s.store.Dedupe(ctx, to, msgID); err == nil {
+	read, cancel := bounded(ctx)
+	orig, err := s.store.Dedupe(read, to, msgID)
+	cancel()
+	if err == nil {
 		return delivered{h: orig}, nil
 	} else if !errors.Is(err, ErrNotFound) {
 		return delivered{}, err
@@ -265,7 +274,9 @@ func (s *Server) deliver(ctx context.Context, p *post) (delivered, error) {
 			}
 		}()
 	}
-	release, refused, err := s.reserveCaps(ctx, to, from)
+	read, cancel = bounded(ctx)
+	release, refused, err := s.reserveCaps(read, to, from)
+	cancel()
 	if err != nil {
 		return delivered{}, err
 	}
@@ -275,7 +286,9 @@ func (s *Server) deliver(ctx context.Context, p *post) (delivered, error) {
 	defer release()
 	// The box's own budget for new mail, from every sender together: what
 	// keeps one box from taking mail at any rate however many boxes send.
-	rlim, err := s.limitsFor(ctx, rcpt)
+	read, cancel = bounded(ctx)
+	rlim, err := s.limitsFor(read, rcpt)
+	cancel()
 	if err != nil {
 		return delivered{}, err
 	}
@@ -303,7 +316,7 @@ func (s *Server) deliver(ctx context.Context, p *post) (delivered, error) {
 		ReceivedAt: now.UTC().Truncate(time.Millisecond),
 		ExpiresAt:  now.UTC().Truncate(time.Millisecond).Add(protocol.Retention), // the TTL less the hour and a post's own time (PROTOCOL.md §0, §7)
 	}
-	orig, err := s.store.PutMessage(ctx, to, h, p.ciphertext)
+	orig, err = s.store.PutMessage(ctx, to, h, p.ciphertext)
 	if err != nil {
 		stored = mayHaveApplied(err)
 		return delivered{}, err
@@ -317,7 +330,10 @@ func (s *Server) deliver(ctx context.Context, p *post) (delivered, error) {
 	// send is answered as the box now stands (IronGall-dev/irongall-server#15).
 	// One process has the change in memory at once; with more, this is to be
 	// a strongly consistent read (ARCHITECTURE.md, stage 2).
-	if cur, err := s.box(ctx, to); err != nil {
+	read, cancel = bounded(ctx)
+	cur, err := s.box(read, to)
+	cancel()
+	if err != nil {
 		return delivered{}, err
 	} else if !cur.open() {
 		if err := s.store.DeleteMessage(ctx, to, msgID); err != nil && !errors.Is(err, ErrNotFound) {

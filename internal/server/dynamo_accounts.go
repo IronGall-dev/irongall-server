@@ -79,6 +79,8 @@ func (s *DynamoStore) Account(ctx context.Context, id string) (*Account, error) 
 		return a, nil
 	}
 	tok := s.accCache.begin(id)
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.accts, Key: accountKey(id, skAccount), ConsistentRead: aws.Bool(true)})
 	if err != nil {
 		return nil, err
@@ -100,6 +102,8 @@ func (s *DynamoStore) Account(ctx context.Context, id string) (*Account, error) 
 // CreateAccount implements Store.
 func (s *DynamoStore) CreateAccount(ctx context.Context, a *Account) error {
 	a.Rev = 1
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	_, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                &s.accts,
 		Item:                     accountItem(a),
@@ -118,6 +122,8 @@ func (s *DynamoStore) PutAdoptKey(ctx context.Context, k *AdoptKey) error {
 	it["uses"] = num(uint64(k.Uses)) //nolint:gosec // uses are not negative
 	it["expires"] = num(ms(k.Expires))
 	it["expires_at"] = num(ttlSeconds(ms(k.Expires)))
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	_, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                &s.accts,
 		Item:                     it,
@@ -132,6 +138,8 @@ func (s *DynamoStore) PutAdoptKey(ctx context.Context, k *AdoptKey) error {
 
 // AdoptKey implements Store.
 func (s *DynamoStore) AdoptKey(ctx context.Context, account string, hash [32]byte) (*AdoptKey, error) {
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.accts, Key: adoptKeyKey(account, hash), ConsistentRead: aws.Bool(true)})
 	if err != nil {
 		return nil, err

@@ -535,7 +535,9 @@ func (s *DynamoStore) readAddress(ctx context.Context, a protocol.Address, consi
 		ConsistentRead:            aws.Bool(consistent),
 	})
 	for p.HasMorePages() {
-		out, err := p.NextPage(ctx)
+		page, cancel := bounded(ctx)
+		out, err := p.NextPage(page)
+		cancel()
 		if err != nil {
 			return nil, nil, err
 		}
@@ -655,27 +657,32 @@ func IsThrottle(err error) bool {
 	return false
 }
 
-// storeTimeout bounds what runs apart from the request that started it: a
-// read that callers share, a box's load into memory (ensure) and a lookup's
-// read of a box's record (Server.lead), and each call to AWS of a write,
-// which runs to its end however its caller goes (bounded).
+// storeTimeout bounds each call to AWS the store makes, a read as a write,
+// whatever context its caller hands it (bounded), and each read that a call
+// shared by several callers makes apart from the request that started it: a
+// lookup's read of a box's record (Server.lead) and the reads of a send's
+// steps 6 to 9 (Server.deliver).
 const storeTimeout = 10 * time.Second
 
-// bounded is ctx bounded by storeTimeout, for one call to AWS of a write. A
+// bounded is ctx bounded by storeTimeout. The store bounds each of its calls
+// to AWS with it, so that no call outlasts it however its caller made ctx: a
 // handler hands every store write a context apart from its request
 // (detached), so that what a write changed is counted and reaches memory
-// whenever the write was made (IronGall-dev/irongall-server#14); this bounds
-// each call, not a whole delete of a box's mail, which is many.
+// whenever the write was made (IronGall-dev/irongall-server#14), and a call
+// that callers share reads on one (IronGall-dev/irongall-server#91). It bounds
+// each call, not a whole delete of a box's mail or a box's load, which are
+// many.
 func bounded(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, storeTimeout)
 }
 
-// ensure loads box a into memory on its first use by this process.
+// ensure loads box a into memory on its first use by this process. The
+// callers that come while it loads share the load, so it reads apart from
+// the context of the caller that began it, and each of its calls is bounded
+// (bounded).
 func (s *DynamoStore) ensure(ctx context.Context, a protocol.Address) error {
 	return s.idx.ensure(ctx, a, func() (boxRead, error) {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeTimeout)
-		defer cancel()
-		return s.readBox(ctx, a)
+		return s.readBox(context.WithoutCancel(ctx), a)
 	})
 }
 
@@ -706,7 +713,9 @@ func (s *DynamoStore) readBox(ctx context.Context, a protocol.Address) (boxRead,
 	r.exists, r.rev = true, rec.Rev
 	p := dynamodb.NewQueryPaginator(s.db, s.liveQuery(a, s.liveFrom(), true))
 	for p.HasMorePages() {
-		out, err := p.NextPage(ctx)
+		page, cancel := bounded(ctx)
+		out, err := p.NextPage(page)
+		cancel()
 		if err != nil {
 			return r, err
 		}
@@ -953,6 +962,8 @@ func (s *DynamoStore) Revoke(ctx context.Context, a protocol.Address, rv *Revoca
 // getMsg reads a message's item, acked or not; ErrNotFound if there is none
 // or it has expired.
 func (s *DynamoStore) getMsg(ctx context.Context, box protocol.Address, id [32]byte) (*Header, bool, error) {
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.msgs, Key: msgKey(box, id), ConsistentRead: aws.Bool(s.consistent)})
 	if err != nil {
 		return nil, false, err
@@ -1084,7 +1095,9 @@ func (s *DynamoStore) Message(ctx context.Context, box protocol.Address, id [32]
 	if from > 0 && from < int64(h.Size) {
 		in.Range = aws.String(protocol.RangeAsk(from))
 	}
-	out, err := s.s3.GetObject(ctx, in)
+	get, cancel := bounded(ctx) // the call, and the read of its body below
+	defer cancel()
+	out, err := s.s3.GetObject(get, in)
 	if isNoSuchKey(err) {
 		if err := s.retire(ctx, box, id); err != nil && !errors.Is(err, ErrNotFound) {
 			return nil, nil, err
@@ -1194,7 +1207,9 @@ func (s *DynamoStore) List(ctx context.Context, box protocol.Address, after *Cur
 	var hs []Header
 	for len(hs) < limit {
 		in.Limit = aws.Int32(int32(limit - len(hs))) //nolint:gosec // a page is small
-		out, err := s.db.Query(ctx, in)
+		page, cancel := bounded(ctx)
+		out, err := s.db.Query(page, in)
+		cancel()
 		if err != nil {
 			return nil, err
 		}
