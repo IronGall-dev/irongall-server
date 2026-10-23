@@ -1069,8 +1069,10 @@ func (s *DynamoStore) deleteBody(ctx context.Context, box protocol.Address, id [
 
 // Message implements Store. A live message whose body is gone (a
 // half-finished ack, or a body the lifecycle rule took early) is retired and
-// answered as gone.
-func (s *DynamoStore) Message(ctx context.Context, box protocol.Address, id [32]byte) (*Header, []byte, error) {
+// answered as gone. The body's bytes from byte from on are read with the
+// same range (GetObject's Range, RFC 9110 §14.2), so a fetch that resumes
+// moves only the rest out of S3.
+func (s *DynamoStore) Message(ctx context.Context, box protocol.Address, id [32]byte, from int64) (*Header, []byte, error) {
 	h, live, err := s.getMsg(ctx, box, id)
 	if err != nil {
 		return nil, nil, err
@@ -1078,7 +1080,11 @@ func (s *DynamoStore) Message(ctx context.Context, box protocol.Address, id [32]
 	if !live {
 		return nil, nil, ErrNotFound
 	}
-	out, err := s.s3.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: aws.String(bodyKey(box, id))})
+	in := &s3.GetObjectInput{Bucket: &s.bucket, Key: aws.String(bodyKey(box, id))}
+	if from > 0 && from < int64(h.Size) {
+		in.Range = aws.String(protocol.RangeAsk(from))
+	}
+	out, err := s.s3.GetObject(ctx, in)
 	if isNoSuchKey(err) {
 		if err := s.retire(ctx, box, id); err != nil && !errors.Is(err, ErrNotFound) {
 			return nil, nil, err

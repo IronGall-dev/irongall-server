@@ -198,7 +198,7 @@ A send signs the envelope with the recipient bound into the signature, then encr
 **Receiving, B**
 
 1. Poll with the pass. An empty mailbox is answered from memory: about 34 µs of server CPU, no storage I/O.
-2. Fetch a message: the ciphertext's bytes alone, no more than the size its list entry gave, which is at most the protocol's largest ciphertext, and refused if not exactly that size. Its `from`, on the server's word and checked below, and its times are the list entry's.
+2. Fetch a message: the ciphertext's bytes alone, no more than the size its list entry gave, which is at most the protocol's largest ciphertext, and refused if not exactly that size. A fetch that was cut resumes by range, asking for the bytes after those it kept, and the whole is held to that size and to the message's id, the ciphertext's SHA-256 (`PROTOCOL.md` §5 check 9), as a body read whole is: bytes a server splices in are a wrong ciphertext. Its `from`, on the server's word and checked below, and its times are the list entry's.
 3. Decrypt with every retained prekey.
 4. **The layout:** line 1 is the envelope, line 2 begins the one signature block, which ends at its first END line, and a line feed must follow that line or the message is refused: no later END line is looked for. Nothing after it is read, and nothing is searched for.
 5. **Whose it is:** the envelope is one JSON object, read as every reader reads JSON (`PROTOCOL.md` §0b): no key twice in any object in it, nested at most 32 deep; it carries an identity document, and its `from` must be that document's SHA-256.

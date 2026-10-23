@@ -258,16 +258,20 @@ func (s *MemStore) List(_ context.Context, box protocol.Address, after *Cursor, 
 	return all, nil
 }
 
-// Message implements Store.
-func (s *MemStore) Message(_ context.Context, box protocol.Address, id [32]byte) (*Header, []byte, error) {
+// Message implements Store: the body, or its bytes from byte from on, a
+// slice of what memory keeps.
+func (s *MemStore) Message(_ context.Context, box protocol.Address, id [32]byte, from int64) (*Header, []byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m, ok := s.live(box)[id]
 	if !ok {
 		return nil, nil, ErrNotFound
 	}
-	h := m.h
-	return &h, bytes.Clone(m.body), nil
+	h, body := m.h, m.body
+	if from > 0 && from < int64(len(body)) {
+		body = body[from:]
+	}
+	return &h, bytes.Clone(body), nil
 }
 
 // DeleteMessage implements Store.

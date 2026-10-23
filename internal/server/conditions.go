@@ -22,9 +22,10 @@ import (
 // a list true when one of its tags is tag, compared strongly, and so false
 // for a target with no tag. If-None-Match is false only for a target that
 // exists, where it names tag or is "*", as protocol.IfNoneMatch reads it. The
-// conditions on dates (If-Unmodified-Since, If-Modified-Since) and If-Range
-// are not evaluated: no answer here carries a Last-Modified, and none is a
-// range (§13.1.3, §13.1.4, §13.1.5).
+// conditions on dates (If-Unmodified-Since, If-Modified-Since) are not
+// evaluated: no answer here carries a Last-Modified (§13.1.3, §13.1.4). An
+// If-Range is read beside a fetch's Range alone, by protocol.RangeAsked, and
+// is false there, since a fetch carries no validator (§13.1.5).
 //
 // It returns nil to go on; a false If-Match, or a false If-None-Match on any
 // method but GET or HEAD, as 412 precondition_failed with hint; and a false

@@ -235,13 +235,13 @@ func TestHeaderWithoutBodyIsGone(t *testing.T) {
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	ctx := context.Background()
 	id := idOf(t, send(t, a, b, "its body expires early"))
-	if _, _, err := s.Message(ctx, b.Address(), id); err != nil {
+	if _, _, err := s.Message(ctx, b.Address(), id, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.deleteBody(ctx, b.Address(), id); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.Message(ctx, b.Address(), id); !errors.Is(err, ErrNotFound) {
+	if _, _, err := s.Message(ctx, b.Address(), id, 0); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("fetch: %v, want gone", err)
 	}
 	if s.listed(t, b.Address(), id) {
@@ -266,7 +266,7 @@ func TestAckedMessageWithABodyAgainIsGone(t *testing.T) {
 	if _, err := s.s3.PutObject(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: aws.String(bodyKey(b.Address(), id)), Body: strings.NewReader("ciphertext")}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.Message(ctx, b.Address(), id); !errors.Is(err, ErrNotFound) {
+	if _, _, err := s.Message(ctx, b.Address(), id, 0); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("fetch of an acked message: %v", err)
 	}
 }
@@ -557,9 +557,9 @@ func (c *countingStore) List(ctx context.Context, box protocol.Address, after *C
 	return c.s.List(ctx, box, after, limit)
 }
 
-func (c *countingStore) Message(ctx context.Context, box protocol.Address, id [32]byte) (*Header, []byte, error) {
+func (c *countingStore) Message(ctx context.Context, box protocol.Address, id [32]byte, from int64) (*Header, []byte, error) {
 	c.count()
-	return c.s.Message(ctx, box, id)
+	return c.s.Message(ctx, box, id, from)
 }
 
 func (c *countingStore) DeleteMessage(ctx context.Context, box protocol.Address, id [32]byte) error {

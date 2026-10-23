@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
@@ -223,7 +224,11 @@ func (s *Server) notHeld(r *http.Request, a protocol.Address) error {
 
 // fetch is GET /v1/<address>/messages/<id>: the ciphertext's bytes and
 // nothing else, read through this endpoint, never a redirect. Who sent it,
-// on this server's word, and when, are in the list.
+// on this server's word, and when, are in the list. A Range of one
+// open-ended byte range that begins inside the ciphertext is answered 206,
+// the bytes from there on, read from the store with the same range, and any
+// other with the whole body (PROTOCOL.md §5.2; protocol.RangeAsked): a fetch
+// that was cut resumes so. A ranged fetch is counted as any fetch is.
 func (s *Server) fetch(w http.ResponseWriter, r *http.Request) error {
 	box, err := s.owner(r)
 	if err != nil {
@@ -284,18 +289,31 @@ func (s *Server) fetch(w http.ResponseWriter, r *http.Request) error {
 			return fetchedAlready(wait)
 		}
 	}
-	_, body, err := s.store.Message(r.Context(), box, id)
+	// Read after the preconditions, as RFC 9110 §14.2 has a Range read: a
+	// false one answered above leaves it unread.
+	from, ranged := protocol.RangeAsked(r.Header.Values("Range"), r.Header.Values("If-Range"))
+	m, body, err := s.store.Message(r.Context(), box, id, from)
 	if errors.Is(err, ErrNotFound) {
 		return gone()
 	}
 	if err != nil {
 		return err
 	}
+	size := int64(m.Size)
+	ranged = ranged && from < size
+	if ranged && int64(len(body)) != size-from {
+		return fmt.Errorf("the store read %d bytes of a message of %d from byte %d", len(body), size, from)
+	}
 	s.metrics.fetch(again)
 	h := w.Header()
 	h.Set("Content-Type", protocol.CiphertextContentType)
 	h.Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(http.StatusOK)
+	status := http.StatusOK
+	if ranged {
+		h.Set("Content-Range", protocol.ContentRange(from, size))
+		status = http.StatusPartialContent
+	}
+	w.WriteHeader(status)
 	_, _ = w.Write(body) //nolint:gosec // an age file, as application/octet-stream, to the box that holds it: no page renders it
 	return nil
 }

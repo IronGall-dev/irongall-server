@@ -470,8 +470,11 @@ type Store interface {
 	// List returns up to limit live headers, oldest first by (ReceivedAt,
 	// ID), after the given key (nil: from the start).
 	List(ctx context.Context, box protocol.Address, after *Cursor, limit int) ([]Header, error)
-	// Message returns a live message and its body, or ErrNotFound.
-	Message(ctx context.Context, box protocol.Address, id [32]byte) (*Header, []byte, error)
+	// Message returns a live message and its body, or ErrNotFound: the body
+	// from byte from on where from is inside it, above 0 and below its Size,
+	// and otherwise whole, as a fetch answers a range (PROTOCOL.md §5.2).
+	// So a fetch that resumes reads only the rest from where a body is kept.
+	Message(ctx context.Context, box protocol.Address, id [32]byte, from int64) (*Header, []byte, error)
 	// DeleteMessage acks a message: its body goes, then it leaves the list;
 	// its dedupe record stays until it expires. ErrNotFound if it is not
 	// live.
