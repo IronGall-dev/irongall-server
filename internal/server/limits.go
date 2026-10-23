@@ -35,8 +35,8 @@ type Limits struct {
 	RequestRefill time.Duration
 
 	// Budgets: a burst at once and one more each refill (LIMITS.md).
-	ReceiveBurst                 int           // per box: new messages it takes, from all senders together (decided: 50, on); an account lifts it
-	ReceiveRefill                time.Duration // (decided: 6 s, ten a minute)
+	ReceiveBurst                 int           // per box: new messages it takes, from all senders together (decided: 50, on, and never off: ReceiveCeiling)
+	ReceiveRefill                time.Duration // (decided: 6 s, ten a minute; never shorter than ReceiveCeiling, which an account lifts it to)
 	DrainBurst                   int           // per box: its first fetches of held messages, spent only by its own calls (decided: 50, on); an account lifts it
 	DrainRefill                  time.Duration // (decided: 6 s, ten a minute)
 	CallBurst                    int           // per box: its calls with its pass that no other budget counts [tunable]; an account lifts it
@@ -109,6 +109,17 @@ func DefaultLimits() Limits {
 
 // ceiling is the largest ciphertext any sender may send.
 func (l Limits) ceiling() int { return max(l.MaxSize, l.AccountMaxSize) }
+
+// ReceiveCeiling is the shortest refill of any box's budget of new mail: no
+// box takes new mail faster than one each, ten a second, whatever its account
+// lifts, and irongalld serve does not start with flags that would (decided
+// 2026-10-23). A box's messages are one item collection of the messages
+// table, which its LSI holds to 10 GB on one partition, and every message
+// leaves an item there until it expires (PROTOCOL-SERVER.md §7).
+const ReceiveCeiling = time.Second / 10
+
+// liftedReceives is the refill of new mail an account lifts a box's to.
+func (l Limits) liftedReceives() time.Duration { return min(l.ReceiveRefill, ReceiveCeiling) }
 
 // uncappedPages is how many list pages a box is taken to hold when no box
 // cap bounds it.

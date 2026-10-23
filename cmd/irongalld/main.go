@@ -91,6 +91,19 @@ func sizeCaps(l server.Limits) error {
 	return nil
 }
 
+// receiveRate refuses a budget of new mail that would let a box take mail
+// faster than server.ReceiveCeiling: one turned off, or one refilled faster.
+// serve checks it before anything starts.
+func receiveRate(l server.Limits) error {
+	switch {
+	case l.ReceiveBurst <= 0:
+		return fmt.Errorf("-receive-burst: %d is no budget, and no box takes new mail faster than one each %v (server.ReceiveCeiling)", l.ReceiveBurst, server.ReceiveCeiling)
+	case l.ReceiveRefill < server.ReceiveCeiling:
+		return fmt.Errorf("-receive-refill: %v is shorter than %v, the fastest any box takes new mail (server.ReceiveCeiling)", l.ReceiveRefill, server.ReceiveCeiling)
+	}
+	return nil
+}
+
 func serve(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	dev := fs.Bool("dev", false, "keep everything in memory, with no AWS")
@@ -122,8 +135,8 @@ func serve(args []string) error {
 	fs.IntVar(&l.MissesPerMinute, "misses-per-minute", l.MissesPerMinute, "calls per IP that named no box or carried nothing that verified (0: off)")
 	fs.IntVar(&l.RequestBurst, "request-burst", l.RequestBurst, "per IP, at once: every call but a box's own with a pass this process has checked, a new pass among them, and every request no route matches, the link page and the site's pages among them; a budget for floods alone (0: off)")
 	fs.DurationVar(&l.RequestRefill, "request-refill", l.RequestRefill, "one more such request each")
-	fs.IntVar(&l.ReceiveBurst, "receive-burst", l.ReceiveBurst, "new messages a box takes at once, from all senders together (0: off)")
-	fs.DurationVar(&l.ReceiveRefill, "receive-refill", l.ReceiveRefill, "one more new message each")
+	fs.IntVar(&l.ReceiveBurst, "receive-burst", l.ReceiveBurst, "new messages a box takes at once, from all senders together; never off, or serve does not start")
+	fs.DurationVar(&l.ReceiveRefill, "receive-refill", l.ReceiveRefill, "one more new message each: at least "+server.ReceiveCeiling.String()+", the fastest any box takes new mail, or serve does not start; an account lifts it to that")
 	fs.IntVar(&l.DrainBurst, "drain-burst", l.DrainBurst, "a box's first fetches of held messages, at once: the new mail it takes out (0: off)")
 	fs.DurationVar(&l.DrainRefill, "drain-refill", l.DrainRefill, "one more first fetch each")
 	fs.IntVar(&l.CallBurst, "call-burst", l.CallBurst, "a box's calls with its pass that no other budget counts, at once (0: off)")
@@ -143,6 +156,9 @@ func serve(args []string) error {
 		return err
 	}
 	if err := sizeCaps(l); err != nil {
+		return err
+	}
+	if err := receiveRate(l); err != nil {
 		return err
 	}
 	logger := log.New(server.Redacting(os.Stderr), "", log.LstdFlags|log.LUTC)

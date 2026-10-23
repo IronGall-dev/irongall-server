@@ -22,7 +22,7 @@ func account(cmd string, args []string) error {
 	switch cmd {
 	case "create":
 		id := fs.String("id", "", "the account's id: a name of ours (echo), or none to mint one")
-		unmetered := fs.Bool("unmetered", false, "its boxes have no daily limit and the largest cap, never charged (the echo account)")
+		unmetered := fs.Bool("unmetered", false, "its boxes have no daily limit, the largest cap and new mail at the fastest any box takes it, never charged (the echo account)")
 		run = func(ctx context.Context, s *server.DynamoStore) error {
 			if *id == "" {
 				var err error

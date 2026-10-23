@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -156,5 +158,51 @@ func TestMetricsCountTheStoresCalls(t *testing.T) {
 	}
 	if got := testutil.CollectAndCount(m.storeTime); got != 1 {
 		t.Errorf("the calls' times: %d series, want 1", got)
+	}
+}
+
+// collectionsWant is the exposition of irongalld_item_collection_estimate_bytes
+// after one observation of gb, DynamoDB's GB.
+func collectionsWant(gb float64) string {
+	const name = "irongalld_item_collection_estimate_bytes"
+	var b strings.Builder
+	fmt.Fprintf(&b, "# HELP %s After each message written, the upper bound of DynamoDB's estimate of its box's item collection, the box's items and their LSI entries, at 2^30 bytes a GB: past 10 GB, the box takes no more mail.\n# TYPE %s histogram\n", name, name)
+	for _, le := range gigabytes {
+		n := 0
+		if gb*(1<<30) <= le {
+			n = 1
+		}
+		fmt.Fprintf(&b, "%s_bucket{le=\"%g\"} %d\n", name, le, n)
+	}
+	fmt.Fprintf(&b, "%s_bucket{le=\"+Inf\"} 1\n%s_sum %g\n%s_count 1\n", name, name, gb*(1<<30), name)
+	return b.String()
+}
+
+// A message write asks DynamoDB for the size of its box's item collection,
+// and the upper bound of the estimate is observed, in GB: AWS's advice for a
+// table with an LSI, whose item collections are capped at 10 GB.
+func TestMetricsObserveTheItemCollectionAMessageWriteGrew(t *testing.T) {
+	f := newFakeAWS()
+	var asked atomic.Bool
+	f.dynamo = func(op string, _ int, body []byte) answer {
+		if op != "PutItem" {
+			return answer{status: http.StatusOK, body: "{}"}
+		}
+		asked.Store(strings.Contains(string(body), `"ReturnItemCollectionMetrics":"SIZE"`))
+		return answer{status: http.StatusOK, body: `{"ItemCollectionMetrics":{"ItemCollectionKey":{"box":{"B":"BA=="}},"SizeEstimateRangeGB":[8.0,9.0]}}`}
+	}
+	s := fakeStore(t, f)
+	m := NewMetrics(prometheus.NewRegistry())
+	s.metrics = m
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	h := &Header{ID: [32]byte{7}, From: protocol.Address{6}, Size: 3, ReceivedAt: now, ExpiresAt: now.Add(protocol.Retention)}
+	if _, err := s.PutMessage(t.Context(), protocol.Address{4}, h, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if !asked.Load() {
+		t.Error("the message write did not ask for its item collection's size")
+	}
+	if err := testutil.CollectAndCompare(m.collections, strings.NewReader(collectionsWant(9)), "irongalld_item_collection_estimate_bytes"); err != nil {
+		t.Error(err)
 	}
 }

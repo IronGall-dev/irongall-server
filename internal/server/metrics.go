@@ -29,25 +29,32 @@ import (
 // route is the router's pattern, a code the protocol's, a limit the name a
 // refusal gives it. A nil *Metrics counts nothing.
 type Metrics struct {
-	reg       prometheus.Registerer
-	requests  *prometheus.CounterVec
-	latency   *prometheus.HistogramVec
-	limits    *prometheus.CounterVec
-	passes    *prometheus.CounterVec
-	fetches   *prometheus.CounterVec
-	lists     *prometheus.CounterVec
-	store     *prometheus.CounterVec
-	storeTime *prometheus.HistogramVec
-	caches    *prometheus.CounterVec
-	largeRead *prometheus.CounterVec
-	cut       prometheus.Counter
-	conns     prometheus.Gauge
-	streamAge *prometheus.GaugeVec
+	reg         prometheus.Registerer
+	requests    *prometheus.CounterVec
+	latency     *prometheus.HistogramVec
+	limits      *prometheus.CounterVec
+	passes      *prometheus.CounterVec
+	fetches     *prometheus.CounterVec
+	lists       *prometheus.CounterVec
+	store       *prometheus.CounterVec
+	storeTime   *prometheus.HistogramVec
+	caches      *prometheus.CounterVec
+	largeRead   *prometheus.CounterVec
+	cut         prometheus.Counter
+	conns       prometheus.Gauge
+	streamAge   *prometheus.GaugeVec
+	collections prometheus.Histogram
 }
 
 // seconds are the latency buckets: from the 34 µs of a poll answered from
 // memory to the seconds of a large body or a throttled store.
 var seconds = []float64{.0001, .00025, .0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
+
+// gigabytes are the item collection's buckets, in bytes, as Prometheus
+// names a size, from the GB DynamoDB estimates in and caps an item
+// collection at, 10, each taken as 2^30 bytes: so the alert AWS advises, at
+// 8 GB, fires early if a GB is 10^9 bytes, never late.
+var gigabytes = []float64{1 << 30, 2 << 30, 4 << 30, 6 << 30, 8 << 30, 9 << 30, 10 << 30}
 
 // NewMetrics makes the server's metrics and registers them with reg.
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -80,8 +87,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help: "Connections open on the API's listener."}),
 		streamAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: ns, Name: "stream_record_age_seconds",
 			Help: "How old the last record applied from each table's stream was when it was applied: how far behind memory follows."}, []string{"table"}),
+		collections: prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: ns, Name: "item_collection_estimate_bytes",
+			Help: "After each message written, the upper bound of DynamoDB's estimate of its box's item collection, the box's items and their LSI entries, at 2^30 bytes a GB: past 10 GB, the box takes no more mail.", Buckets: gigabytes}),
 	}
-	reg.MustRegister(m.requests, m.latency, m.limits, m.passes, m.fetches, m.lists, m.store, m.storeTime, m.caches, m.largeRead, m.cut, m.conns, m.streamAge)
+	reg.MustRegister(m.requests, m.latency, m.limits, m.passes, m.fetches, m.lists, m.store, m.storeTime, m.caches, m.largeRead, m.cut, m.conns, m.streamAge, m.collections)
 	return m
 }
 
@@ -91,8 +100,10 @@ func (m *Metrics) watch(s *Server) {
 	if m == nil {
 		return
 	}
-	for _, bs := range s.limitsByName() {
-		bs.m = m
+	for _, sets := range s.limitsByName() {
+		for _, bs := range sets {
+			bs.m = m
+		}
 	}
 	// A second server on one registry, in a test, counts on the first's keys.
 	_ = m.reg.Register(keyCounts{s: s, desc: prometheus.NewDesc("irongalld_limit_keys",
@@ -109,10 +120,13 @@ type keyCounts struct {
 func (k keyCounts) Describe(ch chan<- *prometheus.Desc) { ch <- k.desc }
 
 func (k keyCounts) Collect(ch chan<- prometheus.Metric) {
-	for name, bs := range k.s.limitsByName() {
-		bs.mu.Lock()
-		n := len(bs.full)
-		bs.mu.Unlock()
+	for name, sets := range k.s.limitsByName() {
+		n := 0
+		for _, bs := range sets {
+			bs.mu.Lock()
+			n += len(bs.full)
+			bs.mu.Unlock()
+		}
 		ch <- prometheus.MustNewConstMetric(k.desc, prometheus.GaugeValue, float64(n), name)
 	}
 }
@@ -224,6 +238,16 @@ func (m *Metrics) applied(table string, made time.Time, now time.Time) {
 		return
 	}
 	m.streamAge.WithLabelValues(table).Set(max(now.Sub(made), 0).Seconds())
+}
+
+// collection records the upper bound of DynamoDB's estimate of the item
+// collection a message write grew, given in GB (ReturnItemCollectionMetrics):
+// AWS's advice for a table with an LSI, whose item collections are capped.
+func (m *Metrics) collection(gb float64) {
+	if m == nil {
+		return
+	}
+	m.collections.Observe(gb * (1 << 30))
 }
 
 // ConnState counts the API listener's open connections, as http.Server's

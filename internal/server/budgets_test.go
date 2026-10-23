@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -86,7 +87,8 @@ func TestASendersCallsBoundTheDedupeRead(t *testing.T) {
 
 // A box takes new mail at a rate of its own, from every sender together
 // (Limits.ReceiveBurst): past it a send is mailbox_busy and waits in its
-// sender's outbox. A retry spends none of it, and an account can lift it.
+// sender's outbox. A retry spends none of it, and an account lifts it to
+// ReceiveCeiling, never past it.
 func TestTheReceiveBudget(t *testing.T) {
 	ctx := context.Background()
 	l := relaxed()
@@ -112,14 +114,26 @@ func TestTheReceiveBudget(t *testing.T) {
 		t.Fatalf("the box holds %d messages (%v), want 3", n, err)
 	}
 
-	// An unmetered account's box takes mail with no budget.
+	// An unmetered account's box takes mail at the ceiling: the same burst,
+	// then one each ReceiveCeiling, and never with no budget.
 	_, key := accountEnv(t, e, true, 1)
 	echo := e.box(protocol.Classic)
 	adopt(t, echo, key)
-	for i, s := range []*client.Box{s1, s2, s3, b} {
+	for i, s := range []*client.Box{s1, s2} {
 		if _, err := s.Send(ctx, echo.Address(), "to the unmetered box"); err != nil {
 			t.Fatalf("send %d to an unmetered box: %v", i+1, err)
 		}
+	}
+	_, err = s3.Send(ctx, echo.Address(), "past its burst")
+	if codeOf(err) != protocol.CodeMailboxBusy || !errorsAs(err, &ae) || ae.RetryAfter != time.Second {
+		t.Fatalf("a third new message to the unmetered box at once: %v, want mailbox_busy after a second", err)
+	}
+	if top, ok := e.server.Top(string(protocol.CodeMailboxBusy), 10); !ok || !slices.ContainsFunc(top, func(d Indebted) bool { return d.Key == echo.Address().String() }) {
+		t.Errorf("the operator's top of mailbox_busy, %v, does not list the unmetered box", top)
+	}
+	e.clock.Add(ReceiveCeiling)
+	if rs, err := s3.Flush(ctx); err != nil || len(rs) != 1 {
+		t.Fatalf("the waiting message after one refill at the ceiling: %v, %v", rs, err)
 	}
 }
 

@@ -140,9 +140,10 @@ func (s *Server) leave(w http.ResponseWriter, r *http.Request) error {
 }
 
 // limitsFor returns the limits a box gets: the server's, unless it is in an
-// unmetered account, whose boxes have no daily limit, the largest cap, and
-// no budget of calls or of mail received or drained. A box whose account is gone has the
-// server's. These are the volume levers (LIMITS.md): what an account may lift.
+// unmetered account, whose boxes have no daily limit, the largest cap, no
+// budget of calls or of mail drained, and new mail at ReceiveCeiling. A box
+// whose account is gone has the server's. These are the volume levers
+// (LIMITS.md): what an account may lift.
 func (s *Server) limitsFor(ctx context.Context, b *Box) (Limits, error) {
 	l := s.limits
 	if b.Account == "" {
@@ -156,7 +157,18 @@ func (s *Server) limitsFor(ctx context.Context, b *Box) (Limits, error) {
 		return l, err
 	}
 	if acc.Unmetered {
-		l.SendsPerDay, l.MaxSize, l.CallBurst, l.ReceiveBurst, l.DrainBurst = 0, l.ceiling(), 0, 0, 0
+		l.SendsPerDay, l.MaxSize, l.CallBurst, l.DrainBurst = 0, l.ceiling(), 0, 0
+		l.ReceiveRefill = l.liftedReceives()
 	}
 	return l, nil
+}
+
+// receivesAt is the budget of new mail of a box with limits l: the server's,
+// or the one an account lifts it to. Each refill has buckets of its own
+// (LIMITS.md § Accounts).
+func (s *Server) receivesAt(l Limits) *buckets {
+	if l.ReceiveRefill == s.limits.ReceiveRefill {
+		return s.receives
+	}
+	return s.lifted
 }

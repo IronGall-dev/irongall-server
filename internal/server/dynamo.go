@@ -61,6 +61,7 @@ type DynamoStore struct {
 	boxFeed  *feed // the -boxes-table stream: the box cache and standing
 	msgFeed  *feed // the -msgs-table stream: layer 1's marks
 	accFeed  *feed // the -accounts-table stream: the account cache
+	metrics  *Metrics
 	fatal    func(error)
 	ready    atomic.Bool
 
@@ -92,8 +93,9 @@ type DynamoConfig struct {
 	// Memory can no longer be shown current; the process must restart, which
 	// rebuilds it from the tables.
 	Fatal func(error)
-	// Metrics, if set, count the caches' hits, misses and evictions and how
-	// far behind each stream memory follows. Calls to AWS are counted by
+	// Metrics, if set, count the caches' hits, misses and evictions, how far
+	// behind each stream memory follows, and how large each box's item
+	// collection a message write grows is. Calls to AWS are counted by
 	// Metrics.InstrumentAWS on the AWS config.
 	Metrics *Metrics
 }
@@ -113,6 +115,7 @@ func NewDynamoStore(c DynamoConfig) *DynamoStore {
 		idx:        newIndex(),
 		cache:      newBoxCache(c.BoxCache),
 		accCache:   newAccountCache(c.BoxCache),
+		metrics:    c.Metrics,
 		fatal:      c.Fatal,
 	}
 	if s.now == nil {
@@ -1094,13 +1097,14 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 	item, cancelItem := bounded(ctx)
 	defer cancelItem()
 	seen := new(atomic.Bool)
-	_, err := s.db.PutItem(item, &dynamodb.PutItemInput{
+	out, err := s.db.PutItem(item, &dynamodb.PutItemInput{
 		TableName:                           &s.msgs,
 		Item:                                msgItem(box, h),
 		ConditionExpression:                 aws.String("attribute_not_exists(#id) OR #r <= :cutoff"),
 		ExpressionAttributeNames:            map[string]string{"#id": "id", "#r": "received_at"},
 		ExpressionAttributeValues:           map[string]types.AttributeValue{":cutoff": num(now - ttlMs)},
 		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		ReturnItemCollectionMetrics:         types.ReturnItemCollectionMetricsSize,
 	}, notingRetries(seen))
 	if ccf, ok := isConditionFailed(err); ok {
 		orig, live, err := decodeMsg(ccf.Item) // a send of the same ciphertext got there first
@@ -1126,6 +1130,9 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 	}
 	if err != nil {
 		return nil, err
+	}
+	if c := out.ItemCollectionMetrics; c != nil && len(c.SizeEstimateRangeGB) == 2 {
+		s.metrics.collection(c.SizeEstimateRangeGB[1])
 	}
 	s.idx.insert(box, s.idx.newMark(h.ID, h.From, ms(h.ReceivedAt)+ttlMs), now)
 	return nil, nil

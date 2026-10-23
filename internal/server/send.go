@@ -293,7 +293,7 @@ func (s *Server) deliver(ctx context.Context, p *post) (delivered, error) {
 		return delivered{}, err
 	}
 	if rlim.ReceiveBurst > 0 {
-		recv, ok, wait := s.receives.reserve(ctx, to.String(), s.now)
+		recv, ok, wait := s.receivesAt(rlim).reserve(ctx, to.String(), s.now)
 		if !ok {
 			busy := fail(protocol.CodeMailboxBusy, "the box takes only so much new mail at a time: post it again after Retry-After (irongall outbox flush does)", "the box has taken as much new mail as it takes for now")
 			busy.retryAfter = wait

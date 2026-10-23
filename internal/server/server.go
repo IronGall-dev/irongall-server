@@ -88,6 +88,7 @@ type Server struct {
 	requests  *buckets // per IP: every call with no pass this process has checked, and every request no route matches
 	calls     *buckets // per box: its calls with its pass that no other budget counts
 	receives  *buckets // per box: new messages it takes
+	lifted    *buckets // per box whose account lifts its new mail: at ReceiveCeiling
 	drained   *buckets // per box: its first fetches of held messages
 	sends     *buckets // per sender, a number a day
 	renewals  *buckets // per box, a number a day: renewals under its current certificate
@@ -142,6 +143,7 @@ func New(c Config) *Server {
 		requests:      newBuckets(string(protocol.QuotaRequests), c.Limits.RequestBurst, c.Limits.RequestRefill),
 		calls:         newBuckets(string(protocol.QuotaCalls), c.Limits.CallBurst, c.Limits.CallRefill),
 		receives:      newBuckets(string(protocol.CodeMailboxBusy), c.Limits.ReceiveBurst, c.Limits.ReceiveRefill),
+		lifted:        newBuckets(string(protocol.CodeMailboxBusy), c.Limits.ReceiveBurst, c.Limits.liftedReceives()),
 		drained:       newBuckets(string(protocol.CodeFetchPaced), c.Limits.DrainBurst, c.Limits.DrainRefill),
 		sends:         perPeriod(string(protocol.QuotaSends), c.Limits.SendsPerDay, day),
 		renewals:      perPeriod(string(protocol.QuotaRenewals), c.Limits.RenewalsPerDay, day),

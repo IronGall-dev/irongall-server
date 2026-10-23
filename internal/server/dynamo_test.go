@@ -24,6 +24,8 @@ import (
 	stypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // The suite runs against the in-memory store, or, with
@@ -1035,5 +1037,19 @@ func TestTheBoxsStateAnswersBeforeItsPass(t *testing.T) {
 		if r := poll(d.Address(), p); r.code() != protocol.CodeRevoked {
 			t.Fatalf("revoked box: %d %s", r.status, r.body)
 		}
+	}
+}
+
+// On DynamoDB the answer to a message write carries its box's item
+// collection's size, which the metric observes: the messages table has its
+// LSI, so the metric is not blind, and a new box's estimate tops out at 1 GB.
+func TestDynamoObservesTheItemCollection(t *testing.T) {
+	e, s := dynamoEnv(t)
+	m := NewMetrics(prometheus.NewRegistry())
+	s.metrics = m
+	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
+	send(t, a, b, "sized")
+	if err := testutil.CollectAndCompare(m.collections, strings.NewReader(collectionsWant(1)), "irongalld_item_collection_estimate_bytes"); err != nil {
+		t.Error(err)
 	}
 }

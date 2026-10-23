@@ -45,11 +45,12 @@ func (s *Server) ClearAddress(ip string) (key string, cleared []string, ok bool)
 }
 
 // limitsByName are the server's limits, each by its name: the quota a
-// rate_limited names, or the code its refusal has of its own.
-func (s *Server) limitsByName() map[string]*buckets {
-	m := map[string]*buckets{}
-	for _, bs := range []*buckets{s.polls, s.pages, s.repeats, s.regs, s.rangeRegs, s.sendIPs, s.misses, s.requests, s.calls, s.receives, s.drained, s.sends, s.renewals, s.certs, s.raises} {
-		m[bs.name] = bs
+// rate_limited names, or the code its refusal has of its own. A limit with a
+// refill an account lifts to has the buckets of each (receivesAt).
+func (s *Server) limitsByName() map[string][]*buckets {
+	m := map[string][]*buckets{}
+	for _, bs := range []*buckets{s.polls, s.pages, s.repeats, s.regs, s.rangeRegs, s.sendIPs, s.misses, s.requests, s.calls, s.receives, s.lifted, s.drained, s.sends, s.renewals, s.certs, s.raises} {
+		m[bs.name] = append(m[bs.name], bs)
 	}
 	return m
 }
@@ -66,7 +67,7 @@ type Indebted struct {
 // and keeps nothing (IronGall-dev/irongall-server#59). ok is false for a
 // name that is no limit's.
 func (s *Server) Top(name string, n int) (top []Indebted, ok bool) {
-	bs, ok := s.limitsByName()[name]
+	sets, ok := s.limitsByName()[name]
 	if !ok {
 		return nil, false
 	}
@@ -74,15 +75,23 @@ func (s *Server) Top(name string, n int) (top []Indebted, ok bool) {
 		key string
 		in  time.Duration // until the key's bucket is full again
 	}
-	var debts []debt
+	// A box that has just joined or left an account is in the buckets of
+	// each refill: the deeper debt is its.
+	deepest := map[string]time.Duration{}
 	now := s.now()
-	bs.mu.Lock()
-	for k, full := range bs.full {
-		if full.After(now) {
-			debts = append(debts, debt{k, full.Sub(now)})
+	for _, bs := range sets {
+		bs.mu.Lock()
+		for k, full := range bs.full {
+			if in := full.Sub(now); in > deepest[k] {
+				deepest[k] = in
+			}
 		}
+		bs.mu.Unlock()
 	}
-	bs.mu.Unlock()
+	debts := make([]debt, 0, len(deepest))
+	for k, in := range deepest {
+		debts = append(debts, debt{k, in})
+	}
 	// By the exact time, and only what is shown rounded: rounded first, keys
 	// within a second of each other would be listed by name
 	// (IronGall-dev/irongall-server#63).

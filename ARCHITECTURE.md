@@ -223,6 +223,7 @@ What changes:
 | `irongalld_store_calls_total`, `irongalld_store_call_duration_seconds` | `service`, `operation`, `outcome` (`ok`, `conditional`, `not_found`, `throttled`, `error`) | every call to DynamoDB, its streams and S3, with its retries |
 | `irongalld_cache_events_total` | `cache` (`boxes`, `accounts`, `missing`), `event` (`hit`, `miss`, `eviction`) | the record caches |
 | `irongalld_stream_record_age_seconds` | `table` (`boxes`, `messages`, `accounts`) | how old the last record applied from each stream was: how far behind memory follows |
+| `irongalld_item_collection_estimate_bytes` | | after each message written, the upper bound of DynamoDB's estimate of its box's item collection, at 2^30 bytes a GB: AWS advises an alert at 8 GB, before the 10 GB past which the box takes no mail (`PROTOCOL-SERVER.md` §7) |
 | `irongalld_large_reads_total`, `irongalld_bodies_cut_total`, `irongalld_connections_open` | `outcome` (`taken`, `timed_out`, `gone`) | the one large read's waits, bodies cut off at their deadline, connections open |
 | the Go runtime's and the process's | | `client_golang`'s collectors |
 
