@@ -387,22 +387,55 @@ func tallyOf(as []rawAnswer) string {
 	return strings.Join(ks, ", ")
 }
 
+// leadDedupe holds the first dedupe read until a second begins, or until wait
+// has passed, and the second until the first has read: a post that leads its
+// flight reads first, and one that comes while it is in flight, if it makes
+// a flight of its own, reads after it.
+type leadDedupe struct {
+	Store
+	wait                  time.Duration
+	n                     atomic.Int32
+	entered, second, read chan struct{}
+}
+
+func (s *leadDedupe) Dedupe(ctx context.Context, box protocol.Address, id [32]byte) (*Header, error) {
+	switch s.n.Add(1) {
+	case 1:
+		close(s.entered)
+		select {
+		case <-s.second:
+		case <-time.After(s.wait):
+		}
+		defer close(s.read)
+	case 2:
+		close(s.second)
+		<-s.read
+	}
+	return s.Store.Dedupe(ctx, box, id)
+}
+
 // Posts of the same bytes from one sender naming other serials are posts of
 // their own: the single flight's key holds the query (send). A post naming a
 // stale serial, which leads, is refused stale_prekey; one naming the current
-// serials, in flight at the same time, is stored, never handed the stale
-// one's refusal (IronGall-dev/irongall-server#92).
+// serials, which comes while it is in flight, is stored, never handed the
+// stale one's refusal (IronGall-dev/irongall-server#92).
 func TestAStaleSerialIsAPostOfItsOwn(t *testing.T) {
-	for trial := range 5 {
-		e := newEnv(t, relaxed(), func(cfg *Config) { cfg.Store = slowDedupe{cfg.Store, 100 * time.Millisecond} })
-		to, from := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
-		ct := sealFor(t, to, 1)
-		pass := from.pass(1)
-		stale, cur := rawPost(e, to, ct, 2, 1, pass), rawPost(e, to, ct, 1, 1, pass)
-		got := allAtOnce(stale, func() rawAnswer { time.Sleep(20 * time.Millisecond); return cur() })
-		if got[0].code != protocol.CodeStalePrekey || got[1].status != http.StatusCreated {
-			t.Errorf("trial %d: the same bytes naming a stale and the current serials at once: %s and %s; want 409 stale_prekey and 201", trial, got[0], got[1])
-		}
+	s := &leadDedupe{wait: time.Second, entered: make(chan struct{}), second: make(chan struct{}), read: make(chan struct{})}
+	e := newEnv(t, relaxed(), func(cfg *Config) { s.Store, cfg.Store = cfg.Store, s })
+	to, from := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
+	ct := sealFor(t, to, 1)
+	pass := from.pass(1)
+	stale, cur := rawPost(e, to, ct, 2, 1, pass), rawPost(e, to, ct, 1, 1, pass)
+	led := make(chan rawAnswer, 1)
+	go func() { led <- stale() }()
+	select {
+	case <-s.entered: // the stale post leads its flight, held at its dedupe
+	case a := <-led:
+		t.Fatalf("the stale post was answered before its dedupe: %s", a)
+	}
+	got := cur()
+	if first := <-led; first.code != protocol.CodeStalePrekey || got.status != http.StatusCreated {
+		t.Errorf("the same bytes naming a stale and the current serials at once: %s and %s; want 409 stale_prekey and 201", first, got)
 	}
 }
 
