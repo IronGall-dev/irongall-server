@@ -7,10 +7,12 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -51,38 +53,51 @@ func applied(a answer) answer { a.apply = true; return a }
 // them (IronGall-dev/irongall-server#89): the fake applies the first
 // UpdateItem and answers it with a 500, or drops its answer, and the retry is
 // answered as DynamoDB answers a retry of an applied conditional write, or
-// throttled. The controls: every attempt a fault; a failed condition or
-// throttles alone, nothing applied.
+// throttled; and the same for a send's PutItem, throttled after a 500. The
+// controls: every attempt a fault; a failed condition or throttles alone,
+// nothing applied.
 func TestAWriteRetriedAfterAnAmbiguousAttemptMayHaveBeenApplied(t *testing.T) {
 	_, _, box := heldRecord(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	msg := &Header{ID: [32]byte{7}, From: box.Addr, Size: 3, ReceivedAt: now, ExpiresAt: now.Add(protocol.Retention)}
 	cases := []struct {
 		name    string
-		answers []answer // the n-th UpdateItem's
+		op      string   // UpdateItem, by UpdateBox, or PutItem, by PutMessage
+		answers []answer // the n-th call's
 		want    bool     // mayHaveApplied
 	}{
-		{"applied and answered 500, then the retry's failed condition", []answer{applied(answer500), answerCCF}, true},
-		{"applied and its answer lost, then the retry's failed condition", []answer{applied(answer{drop: true}), answerCCF}, true},
-		{"applied and answered 500, then throttled twice", []answer{applied(answer500), answerPTEE, answerPTEE}, true},
-		{"control: applied and answered 500 three times", []answer{applied(answer500), answer500, answer500}, true},
-		{"control: a failed condition, nothing applied", []answer{answerCCF}, false},
-		{"control: throttled three times, nothing applied", []answer{answerPTEE, answerPTEE, answerPTEE}, false},
+		{"applied and answered 500, then the retry's failed condition", "UpdateItem", []answer{applied(answer500), answerCCF}, true},
+		{"applied and its answer lost, then the retry's failed condition", "UpdateItem", []answer{applied(answer{drop: true}), answerCCF}, true},
+		{"applied and answered 500, then throttled twice", "UpdateItem", []answer{applied(answer500), answerPTEE, answerPTEE}, true},
+		{"a send's item applied and answered 500, then throttled twice", "PutItem", []answer{applied(answer500), answerPTEE, answerPTEE}, true},
+		{"control: applied and answered 500 three times", "UpdateItem", []answer{applied(answer500), answer500, answer500}, true},
+		{"control: a failed condition, nothing applied", "UpdateItem", []answer{answerCCF}, false},
+		{"control: throttled three times, nothing applied", "UpdateItem", []answer{answerPTEE, answerPTEE, answerPTEE}, false},
+		{"control: a send's item throttled three times, nothing applied", "PutItem", []answer{answerPTEE, answerPTEE, answerPTEE}, false},
 	}
 	fakes, errs := make([]*fakeAWS, len(cases)), make([]error, len(cases))
 	var wg sync.WaitGroup // every write at once, each on a fake of its own, then each judged
 	for i, c := range cases {
 		fakes[i] = newFakeAWS()
-		fakes[i].dynamo = scripted("UpdateItem", c.answers...)
+		fakes[i].dynamo = scripted(c.op, c.answers...)
 		s := fakeStore(t, fakes[i])
-		wg.Go(func() { errs[i] = s.UpdateBox(context.WithoutCancel(t.Context()), cloneBox(box)) })
+		ctx := context.WithoutCancel(t.Context())
+		wg.Go(func() {
+			if c.op == "PutItem" {
+				_, errs[i] = s.PutMessage(ctx, box.Addr, msg, []byte("abc"))
+				return
+			}
+			errs[i] = s.UpdateBox(ctx, cloneBox(box))
+		})
 	}
 	wg.Wait()
 	for i, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			err := errs[i]
-			calls, applied := fakes[i].count("UpdateItem")
+			calls, applied := fakes[i].count(c.op)
 			got := mayHaveApplied(err)
-			t.Logf("%d UpdateItem calls, %d applied; err %v (ErrStale %v, %s, throttle %v); mayHaveApplied %v",
-				calls, applied, err, errors.Is(err, ErrStale), faultOf(err), IsThrottle(err), got)
+			t.Logf("%d %s calls, %d applied; err %v (ErrStale %v, %s, throttle %v); mayHaveApplied %v",
+				calls, c.op, applied, err, errors.Is(err, ErrStale), faultOf(err), IsThrottle(err), got)
 			if got != c.want {
 				t.Errorf("mayHaveApplied %v for a write the fake applied %d times: the count would be %s", got, applied, map[bool]string{true: "kept", false: "given back"}[got])
 			}
@@ -150,8 +165,15 @@ func TestADrainedRetryQuotaHidesNoAppliedWrite(t *testing.T) {
 // later one with a failed condition that returns, as ALL_OLD, the item the
 // first wrote: what DynamoDB answers a retry of a conditional put it applied.
 func putItemOfItsOwn(first answer) func(string, int, []byte) answer {
+	return putItemMeets(applied(first), nil)
+}
+
+// putItemMeets answers the first PutItem with first, and every later one
+// with a failed condition that returns, as ALL_OLD, the item the first
+// carried, changed by change if it is not nil.
+func putItemMeets(first answer, change func(item map[string]any)) func(string, int, []byte) answer {
 	var mu sync.Mutex
-	var item json.RawMessage
+	var item []byte
 	return func(op string, n int, body []byte) answer {
 		if op != "PutItem" {
 			return answer{status: http.StatusBadRequest, body: dynErr("ValidationException", "")}
@@ -159,10 +181,13 @@ func putItemOfItsOwn(first answer) func(string, int, []byte) answer {
 		mu.Lock()
 		defer mu.Unlock()
 		if n == 1 {
-			var in struct{ Item json.RawMessage }
+			var in struct{ Item map[string]any }
 			_ = json.Unmarshal(body, &in)
-			item = in.Item
-			return applied(first)
+			if change != nil {
+				change(in.Item)
+			}
+			item, _ = json.Marshal(in.Item)
+			return first
 		}
 		return answer{status: http.StatusBadRequest, body: dynErr(codeCCF, `,"Item":`+string(item))}
 	}
@@ -171,18 +196,36 @@ func putItemOfItsOwn(first answer) func(string, int, []byte) answer {
 // A send's PutItem applied and answered 500 meets, retried, its own item:
 // the failed condition returns the item this write made (its sender, its
 // time), so the message is stored, and memory has its mark
-// (IronGall-dev/irongall-server#89). The control is the same write answered
-// 200.
+// (IronGall-dev/irongall-server#89). The controls: the same write answered
+// 200, stored; and a retry whose failed condition returns a live item of
+// another sender at the same time, or of the same sender at another, a send
+// of those bytes that got there first, which this write did not make.
 func TestAPutRetriedOntoItsOwnItemIsStored(t *testing.T) {
 	_, from, _ := heldRecord(t)
 	to := protocol.Address{1, 2, 3}
-	for _, retried := range []bool{false, true} {
-		t.Run(fmt.Sprintf("retried=%v", retried), func(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		dynamo func() func(string, int, []byte) answer
+		stored bool
+	}{
+		{"answered 200", func() func(string, int, []byte) answer {
+			return scripted("PutItem", applied(answer{status: http.StatusOK, body: "{}"}))
+		}, true},
+		{"applied and answered 500, then its own item", func() func(string, int, []byte) answer { return putItemOfItsOwn(answer500) }, true},
+		{"control: answered 500, then a live item of another sender at the same time", func() func(string, int, []byte) answer {
+			return putItemMeets(answer500, func(it map[string]any) {
+				it["from"] = map[string]string{"B": base64.StdEncoding.EncodeToString(make([]byte, 32))}
+			})
+		}, false},
+		{"control: answered 500, then a live item of its sender at another time", func() func(string, int, []byte) answer {
+			return putItemMeets(answer500, func(it map[string]any) {
+				it["received_at"] = map[string]string{"N": strconv.FormatUint(ms(time.Now())-1000, 10)}
+			})
+		}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
 			f := newFakeAWS()
-			f.dynamo = putItemOfItsOwn(answer500)
-			if !retried {
-				f.dynamo = scripted("PutItem", applied(answer{status: http.StatusOK, body: "{}"}))
-			}
+			f.dynamo = c.dynamo()
 			s := fakeStore(t, f)
 			if err := s.idx.ensure(t.Context(), to, func() (boxRead, error) { return boxRead{exists: true, st: Standing{State: Active}, rev: 1}, nil }); err != nil {
 				t.Fatal(err)
@@ -193,8 +236,8 @@ func TestAPutRetriedOntoItsOwnItemIsStored(t *testing.T) {
 			calls, applied := f.count("PutItem")
 			marks := s.idx.count(to, s.nowMs())
 			t.Logf("%d PutItem calls, %d applied; orig %v; err %v; marks in memory %d", calls, applied, orig != nil, err, marks)
-			if orig != nil || err != nil || marks != 1 {
-				t.Errorf("a write the fake applied is answered as orig %v, err %v, with %d marks in memory; want stored, with its mark", orig != nil, err, marks)
+			if err != nil || (orig == nil) != c.stored || (marks == 1) != c.stored || marks > 1 {
+				t.Errorf("answered as orig %v, err %v, with %d marks in memory; want stored %v", orig != nil, err, marks, c.stored)
 			}
 		})
 	}
@@ -273,25 +316,28 @@ func TestAWriteThatMayHaveBeenAppliedIsCountedByTheCache(t *testing.T) {
 		answers         []answer
 		write           func(context.Context, *DynamoStore) error
 		evicted, counts bool
+		timeout         time.Duration // the write's caller's, if not 0
 	}{
-		{"UpdateBox answered 500 every attempt", "UpdateItem", []answer{applied(answer500), answer500, answer500}, update, true, true},
-		{"UpdateBox applied, answered 500, then the retry's failed condition", "UpdateItem", []answer{applied(answer500), answerCCF}, update, true, true},
-		{"UpdateBox's answer lost every attempt", "UpdateItem", []answer{applied(answer{drop: true}), {drop: true}, {drop: true}}, update, true, true},
-		{"a raise answered 500 every attempt", "UpdateItem", []answer{applied(answer500), answer500, answer500}, raise, true, true},
-		{"a raise applied, answered 500, then the retry's failed condition", "UpdateItem", []answer{applied(answer500), answerCCF}, raise, true, true},
+		{"UpdateBox timed out, its one attempt unanswered", "UpdateItem", []answer{{hang: true}}, update, true, true, 300 * time.Millisecond},
+		{"a raise timed out, its one attempt unanswered", "UpdateItem", []answer{{hang: true}}, raise, true, true, 300 * time.Millisecond},
+		{"UpdateBox answered 500 every attempt", "UpdateItem", []answer{applied(answer500), answer500, answer500}, update, true, true, 0},
+		{"UpdateBox applied, answered 500, then the retry's failed condition", "UpdateItem", []answer{applied(answer500), answerCCF}, update, true, true, 0},
+		{"UpdateBox's answer lost every attempt", "UpdateItem", []answer{applied(answer{drop: true}), {drop: true}, {drop: true}}, update, true, true, 0},
+		{"a raise answered 500 every attempt", "UpdateItem", []answer{applied(answer500), answer500, answer500}, raise, true, true, 0},
+		{"a raise applied, answered 500, then the retry's failed condition", "UpdateItem", []answer{applied(answer500), answerCCF}, raise, true, true, 0},
 		{"CreateBox answered 500 every attempt", "PutItem", []answer{applied(answer500), answer500, answer500},
-			func(ctx context.Context, s *DynamoStore) error { return s.CreateBox(ctx, cloneBox(box)) }, true, true},
+			func(ctx context.Context, s *DynamoStore) error { return s.CreateBox(ctx, cloneBox(box)) }, true, true, 0},
 		{"DeleteBox answered 500 every attempt", "DeleteItem", []answer{applied(answer500), answer500, answer500},
-			func(ctx context.Context, s *DynamoStore) error { return s.DeleteBox(ctx, box.Addr) }, true, true},
+			func(ctx context.Context, s *DynamoStore) error { return s.DeleteBox(ctx, box.Addr) }, true, true, 0},
 		{"Adopt answered 500 every attempt", "TransactWriteItems", []answer{applied(answer500), answer500, answer500},
 			func(ctx context.Context, s *DynamoStore) error {
 				return s.Adopt(ctx, cloneBox(box), "acct", [32]byte{1})
-			}, true, true},
+			}, true, true, 0},
 		{"Leave answered 500 every attempt", "UpdateItem", []answer{applied(answer500), answer500, answer500},
-			func(ctx context.Context, s *DynamoStore) error { return s.Leave(ctx, cloneBox(box)) }, true, true},
-		{"control: UpdateBox refused, a ResourceNotFoundException", "UpdateItem", []answer{notFound}, update, false, false},
-		{"control: UpdateBox refused, a ValidationException, which the SDK gives no fault", "UpdateItem", []answer{validation}, update, false, false},
-		{"control: UpdateBox's failed condition, nothing applied", "UpdateItem", []answer{answerCCF}, update, true, false},
+			func(ctx context.Context, s *DynamoStore) error { return s.Leave(ctx, cloneBox(box)) }, true, true, 0},
+		{"control: UpdateBox refused, a ResourceNotFoundException", "UpdateItem", []answer{notFound}, update, false, false, 0},
+		{"control: UpdateBox refused, a ValidationException, which the SDK gives no fault", "UpdateItem", []answer{validation}, update, false, false, 0},
+		{"control: UpdateBox's failed condition, nothing applied", "UpdateItem", []answer{answerCCF}, update, true, false, 0},
 	}
 	// Every write at once, each on a fake of its own, then each judged.
 	type outcome struct {
@@ -307,9 +353,14 @@ func TestAWriteThatMayHaveBeenAppliedIsCountedByTheCache(t *testing.T) {
 		s := fakeStore(t, f)
 		s.cache.fill(cloneBox(box), s.cache.begin(box.Addr))
 		_, outs[i].cachedFirst = s.cache.get(box.Addr)
+		ctx, cancel := context.WithoutCancel(t.Context()), func() {}
+		if c.timeout > 0 {
+			ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		}
 		wg.Go(func() {
+			defer cancel()
 			tok := s.cache.begin(box.Addr) // a read of the address begun before the write
-			outs[i].err = c.write(context.WithoutCancel(t.Context()), s)
+			outs[i].err = c.write(ctx, s)
 			_, outs[i].held = s.cache.get(box.Addr)
 			s.cache.fill(cloneBox(box), tok) // that read's copy, from before the write
 			_, outs[i].filled = s.cache.get(box.Addr)

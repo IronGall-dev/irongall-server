@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -31,7 +32,8 @@ import (
 // (from 1) of an operation, s3 the n-th of a method: a status and a body, or
 // drop to close the connection once the request is read (an answer lost
 // after the request went out), or hang to answer nothing until the request
-// or the test ends. With no dynamo, every DynamoDB call is answered 200 {};
+// or the test ends, or stall to send the status, the headers and the body,
+// and then hold the rest of a body it says is longer. With no dynamo, every DynamoDB call is answered 200 {};
 // with no s3, every S3 call is answered 200 and applied.
 type fakeAWS struct {
 	mu      sync.Mutex
@@ -48,6 +50,7 @@ type answer struct {
 	body   string
 	drop   bool
 	hang   bool
+	stall  bool
 	apply  bool // the call's write is applied, whatever is answered
 }
 
@@ -103,8 +106,18 @@ func (f *fakeAWS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(op, "S3 ") && a.status == http.StatusOK {
 		w.Header().Set("ETag", `"0"`)
 	}
+	if a.stall {
+		w.Header().Set("Content-Length", strconv.Itoa(len(a.body)+1))
+	}
 	w.WriteHeader(a.status)
 	_, _ = io.WriteString(w, a.body)
+	if a.stall {
+		w.(http.Flusher).Flush()
+		select {
+		case <-f.release:
+		case <-r.Context().Done():
+		}
+	}
 }
 
 // dynErr is DynamoDB's error body for code, as its JSON protocol writes it;

@@ -74,6 +74,12 @@ func TestEveryCallToAWSEndsAtItsBound(t *testing.T) {
 				_, _, err := s.Message(ctx, box.Addr, msg.ID, 0)
 				return err
 			}},
+		{name: "Message's read of the body's bytes", dynamo: first("GetItem", answered(map[string]any{"Item": itemJSON(msgItem(box.Addr, msg))})),
+			s3: func(string, int) answer { return answer{status: http.StatusOK, body: "ab", stall: true} },
+			call: func(ctx context.Context, s *DynamoStore) error {
+				_, _, err := s.Message(ctx, box.Addr, msg.ID, 0)
+				return err
+			}},
 		{name: "Account", call: func(ctx context.Context, s *DynamoStore) error { _, err := s.Account(ctx, "acct"); return err }},
 		{name: "AdoptKey", call: func(ctx context.Context, s *DynamoStore) error {
 			_, err := s.AdoptKey(ctx, "acct", [32]byte{1})
