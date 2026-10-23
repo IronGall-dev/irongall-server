@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -18,11 +19,19 @@ import (
 
 	"filippo.io/age"
 	"github.com/IronGall-dev/irongall-client/protocol"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
+	stypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
 )
 
+// streamOp is the prefix of a DynamoDB Streams operation's name, as the fake
+// of AWS sees it.
+const streamOp = "DynamoDBStreams_20120810."
+
 // Every call DynamoStore makes to AWS ends at storeTimeout, on a context its
-// caller handed it with no deadline and no end, against a DynamoDB and an S3
-// that never answer: the reads as the writes, whoever calls them. Where a
+// caller handed it with no deadline and no end, against a DynamoDB, its
+// streams and an S3 that never answer: the reads as the writes, whoever calls
+// them, and a stream follower's (IronGall-dev/irongall-server#91). Where a
 // call comes after another, the fake answers the first and holds the one
 // named.
 func TestEveryCallToAWSEndsAtItsBound(t *testing.T) {
@@ -47,6 +56,11 @@ func TestEveryCallToAWSEndsAtItsBound(t *testing.T) {
 			return hang
 		}
 	}
+	// What a table's stream answers: its description, and one open shard.
+	described := answered(map[string]any{"Table": map[string]any{"LatestStreamArn": "fake-stream",
+		"StreamSpecification": map[string]any{"StreamEnabled": true, "StreamViewType": "NEW_IMAGE"}}})
+	oneShard := answered(map[string]any{"StreamDescription": map[string]any{"Shards": []any{
+		map[string]any{"ShardId": "s", "SequenceNumberRange": map[string]any{"StartingSequenceNumber": "0"}}}}})
 	s3ok := func(method string, _ int) answer {
 		if method == http.MethodDelete {
 			return answer{status: http.StatusNoContent}
@@ -110,6 +124,23 @@ func TestEveryCallToAWSEndsAtItsBound(t *testing.T) {
 			return s.Adopt(ctx, cloneBox(box), "acct", [32]byte{1})
 		}},
 		{name: "Leave", call: func(ctx context.Context, s *DynamoStore) error { return s.Leave(ctx, cloneBox(box)) }},
+		{name: "Start's DescribeTable", call: func(ctx context.Context, s *DynamoStore) error { return s.Start(ctx) }},
+		{name: "a stream's DescribeStream", dynamo: first("DescribeTable", described),
+			call: func(ctx context.Context, s *DynamoStore) error { return s.Start(ctx) }},
+		{name: "a stream's GetShardIterator at the start", dynamo: func(op string, n int, b []byte) answer {
+			if op == streamOp+"DescribeStream" && n == 1 {
+				return oneShard
+			}
+			return first("DescribeTable", described)(op, n, b)
+		}, call: func(ctx context.Context, s *DynamoStore) error { return s.Start(ctx) }},
+		{name: "a stream's GetShardIterator in a read", call: func(ctx context.Context, s *DynamoStore) error {
+			s.boxFeed.arn = "fake-stream"
+			return s.boxFeed.read(ctx, &shard{id: "s", seq: "1"})
+		}},
+		{name: "a stream's GetRecords", call: func(ctx context.Context, s *DynamoStore) error {
+			s.boxFeed.arn = "fake-stream"
+			return s.boxFeed.read(ctx, &shard{id: "s", iter: aws.String("i")})
+		}},
 	}
 	// Every call at once, each on a fake of its own, then each judged.
 	type result struct {
@@ -444,5 +475,73 @@ func TestEveryReadOfASendsSharedCallIsBounded(t *testing.T) {
 		if !ok || d <= 0 || d > storeTimeout {
 			t.Errorf("the send's %s read, made apart from its request, is handed deadline %v (made %v); want at most %v", read, d, ok, storeTimeout)
 		}
+	}
+}
+
+// boundedFirstRead is a stream whose first GetRecords records the deadline
+// it was handed and fails as a call that reached it does.
+type boundedFirstRead struct {
+	*fakeStream
+	mu       sync.Mutex
+	read     bool
+	deadline time.Duration
+}
+
+func (b *boundedFirstRead) GetRecords(ctx context.Context, in *dynamodbstreams.GetRecordsInput, opts ...func(*dynamodbstreams.Options)) (*dynamodbstreams.GetRecordsOutput, error) {
+	b.mu.Lock()
+	first := !b.read
+	if first {
+		b.read, b.deadline = true, deadlineOf(ctx)
+	}
+	b.mu.Unlock()
+	if first {
+		return nil, context.DeadlineExceeded
+	}
+	return b.fakeStream.GetRecords(ctx, in, opts...)
+}
+
+// A stream follower's read is handed a bound of its own, and one that ends
+// there is no lost place: the follower logs it and reads the shard again at
+// its next pass, as after any failed read (IronGall-dev/irongall-server#91).
+func TestAFollowersReadEndedAtItsBoundIsReadAgain(t *testing.T) {
+	fs, f, s, box, now := feedFixture(t)
+	b := &boundedFirstRead{fakeStream: fs}
+	var mu sync.Mutex
+	var logged []string
+	f.streams, f.interval = b, 10*time.Millisecond
+	f.logf = func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+	fs.open("a", "")
+	if err := f.position(t.Context(), "arn"); err != nil {
+		t.Fatal(err)
+	}
+	fs.write("a", msgEvent(stypes.OperationTypeInsert, box, 1, now))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var lost atomic.Value
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.run(ctx, func(err error) { lost.Store(err) })
+	}()
+	for until := time.Now().Add(2 * time.Second); s.countOf(box) == 0 && time.Now().Before(until); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	b.mu.Lock()
+	d := b.deadline
+	b.mu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
+	t.Logf("the first read's deadline %v (-1: none); logged %q; the record applied %v; lost %v", d, logged, s.countOf(box) == 1, lost.Load())
+	if d <= 0 || d > storeTimeout {
+		t.Errorf("the follower's read is handed deadline %v; want at most %v", d, storeTimeout)
+	}
+	if lost.Load() != nil || s.countOf(box) != 1 || len(logged) == 0 {
+		t.Errorf("after a read that ended at its bound the follower lost its place %v, applied the record %v, logged %d lines; want it read again", lost.Load(), s.countOf(box) == 1, len(logged))
 	}
 }

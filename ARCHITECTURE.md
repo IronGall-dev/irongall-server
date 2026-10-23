@@ -244,7 +244,7 @@ What changes:
 | A writer dies right after its commit | The stream still delivers the change to everyone | Automatic |
 | A process falls behind the stream | Stage 2, not built: it fails `/readyz` and leaves rotation. Today a follower that loses its place exits the process | It catches up. More than 24 h behind (stream retention) means a restart: memory starts empty, and each box is read again on its first use (§ Startup) |
 | DynamoDB or its stream unavailable | Processes can't prove they're current: `503` + `Retry-After` | Wait |
-| A call to DynamoDB or S3 that never answers | Each call the store makes to AWS ends at a bound of its own (`storeTimeout`), a read as a write, whatever context its caller handed it, and so does each read a call shared by several callers makes apart from its request (a lookup's, a send's steps 6 to 9): its caller is answered `503`, and whoever waits on a shared call waits no longer | Automatic; its caller retries |
+| A call to DynamoDB, its streams or S3 that never answers | Each call the store makes to AWS ends at a bound of its own (`storeTimeout`), a read as a write, a stream follower's among them, whatever context its caller handed it, and so does each read a call shared by several callers makes apart from its request (a lookup's, a send's steps 6 to 9): its caller is answered `503`, whoever waits on a shared call waits no longer, and a follower whose read ended there reads again at its next pass, as after any failed read | Automatic; its caller retries |
 | S3 Express AZ outage | Sends and fetches fail; polls and lists still work | Wait. Losing the AZ loses unacked bodies (accepted) |
 | Process restart | Ready once the streams are positioned (§ Startup) | Each box's first call reads it once |
 

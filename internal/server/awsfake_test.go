@@ -95,6 +95,11 @@ func (f *fakeAWS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-f.release:
 		case <-r.Context().Done():
 		}
+		// Never an answer, even as the test ends: a handler that returned
+		// would answer 200 with no body, which the SDK reads as a success.
+		if c, _, err := w.(http.Hijacker).Hijack(); err == nil {
+			_ = c.Close()
+		}
 		return
 	case a.drop:
 		if c, _, err := w.(http.Hijacker).Hijack(); err == nil {

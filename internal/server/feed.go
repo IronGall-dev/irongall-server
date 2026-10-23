@@ -19,7 +19,9 @@ import (
 // its children (AWS docs, DynamoDB Streams, reading and processing a stream),
 // applying each change to the process's memory. It keeps no position across
 // restarts: a restart rebuilds memory from the tables and follows the streams
-// from then on.
+// from then on. Each of its calls to AWS is bounded as the store's are
+// (bounded): one that never answers ends there, and fails its pass as any
+// failed read does, so the follower reads again at its next pass.
 type feed struct {
 	streams  streamsAPI
 	interval time.Duration
@@ -68,6 +70,8 @@ func lost(err error) bool {
 
 // streamARN returns a table's stream, which must carry new images.
 func streamARN(ctx context.Context, db *dynamodb.Client, table string) (string, error) {
+	ctx, cancel := bounded(ctx)
+	defer cancel()
 	t, err := db.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: &table})
 	if err != nil {
 		return "", err
@@ -95,9 +99,11 @@ func (f *feed) position(ctx context.Context, arn string) error {
 		if s.SequenceNumberRange != nil && s.SequenceNumberRange.EndingSequenceNumber != nil {
 			sh.done = true
 		} else {
-			out, err := f.streams.GetShardIterator(ctx, &dynamodbstreams.GetShardIteratorInput{
+			call, cancel := bounded(ctx)
+			out, err := f.streams.GetShardIterator(call, &dynamodbstreams.GetShardIteratorInput{
 				StreamArn: &f.arn, ShardId: s.ShardId, ShardIteratorType: stypes.ShardIteratorTypeLatest,
 			})
+			cancel()
 			if err != nil {
 				return err
 			}
@@ -113,7 +119,9 @@ func (f *feed) list(ctx context.Context) ([]stypes.Shard, error) {
 	var all []stypes.Shard
 	in := &dynamodbstreams.DescribeStreamInput{StreamArn: &f.arn}
 	for {
-		out, err := f.streams.DescribeStream(ctx, in)
+		call, cancel := bounded(ctx)
+		out, err := f.streams.DescribeStream(call, in)
+		cancel()
 		if err != nil {
 			return nil, err
 		}
@@ -225,7 +233,9 @@ func (f *feed) read(ctx context.Context, sh *shard) error {
 		default:
 			in.ShardIteratorType = stypes.ShardIteratorTypeTrimHorizon
 		}
-		out, err := f.streams.GetShardIterator(ctx, in)
+		call, cancel := bounded(ctx)
+		out, err := f.streams.GetShardIterator(call, in)
+		cancel()
 		if lost(err) {
 			return &errLost{err}
 		}
@@ -238,7 +248,9 @@ func (f *feed) read(ctx context.Context, sh *shard) error {
 		}
 	}
 	for {
-		out, err := f.streams.GetRecords(ctx, &dynamodbstreams.GetRecordsInput{ShardIterator: sh.iter, Limit: aws.Int32(1000)})
+		call, cancel := bounded(ctx)
+		out, err := f.streams.GetRecords(call, &dynamodbstreams.GetRecordsInput{ShardIterator: sh.iter, Limit: aws.Int32(1000)})
+		cancel()
 		var expired *stypes.ExpiredIteratorException
 		if errors.As(err, &expired) {
 			sh.iter = nil // re-positioned after the last record, next pass
