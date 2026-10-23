@@ -189,7 +189,7 @@ func (s *DynamoStore) Adopt(ctx context.Context, b *Box, account string, key [32
 		}},
 	}
 	if err := s.transact(ctx, b, items, map[int]error{0: ErrStale, 1: ErrKeyRefused}); err != nil {
-		return err
+		return s.unsettled(b.Addr, err)
 	}
 	b.Account, b.Rev = account, b.Rev+1
 	s.applyBox(b)
@@ -214,7 +214,7 @@ func (s *DynamoStore) Leave(ctx context.Context, b *Box) error {
 		return ErrStale
 	}
 	if err != nil {
-		return err
+		return s.unsettled(b.Addr, err)
 	}
 	b.Account, b.Rev = "", b.Rev+1
 	s.applyBox(b)

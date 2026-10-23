@@ -688,10 +688,15 @@ func detached(ctx context.Context) context.Context { return context.WithoutCance
 // mayHaveApplied reports whether a store write that returned err may have
 // been applied all the same: anything but a refusal the store stated, its
 // own (ErrStale, ErrExists, ErrNotFound, ErrKeyRefused) or AWS's to the call
-// itself (a throttle, or another fault of the caller's side). A count
-// reserved for the write is kept then, never given back
-// (IronGall-dev/irongall-server#14).
+// itself (a throttle, or another fault of the caller's side). A write the
+// SDK retried after an attempt that left open whether it was applied
+// (retriedAfter) is no stated refusal, whatever its last attempt answered. A
+// count reserved for the write is kept then, never given back
+// (IronGall-dev/irongall-server#14, #89).
 func mayHaveApplied(err error) bool {
+	if errors.As(err, new(retriedAfter)) {
+		return true
+	}
 	if errors.Is(err, ErrStale) || errors.Is(err, ErrExists) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrKeyRefused) || IsThrottle(err) {
 		return false
 	}

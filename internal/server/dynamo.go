@@ -657,6 +657,62 @@ func IsThrottle(err error) bool {
 	return false
 }
 
+// retriedAfter is a write's error when the SDK retried it after an attempt
+// that left open whether it was applied (a fault of AWS's own, an answer
+// lost, a timeout): the write may have been applied whatever the last
+// attempt answered, a failed condition or a throttle among them, since a
+// failed condition may be the one that attempt's own write makes
+// (IronGall-dev/irongall-server#89). mayHaveApplied takes none for a
+// refusal.
+type retriedAfter struct{ err error }
+
+func (r retriedAfter) Error() string {
+	return "after an attempt that may have been applied: " + r.err.Error()
+}
+
+func (r retriedAfter) Unwrap() error { return r.err }
+
+// noting is the SDK's retryer, noting in seen each failed attempt it would
+// retry for an error that is not a throttle: one that leaves open whether
+// the attempt was applied. It is asked of every failed attempt, the last
+// included, and of one whose retry the retry quota then refuses.
+type noting struct {
+	aws.RetryerV2
+	seen *atomic.Bool
+}
+
+func (n noting) IsErrorRetryable(err error) bool {
+	ok := n.RetryerV2.IsErrorRetryable(err)
+	if ok && !IsThrottle(err) {
+		n.seen.Store(true)
+	}
+	return ok
+}
+
+// notingRetries is the option of one call that notes in seen an attempt
+// that left open whether it was applied (noting). The SDK's retryers,
+// retry.Standard and retry.AdaptiveMode, are each a RetryerV2.
+func notingRetries(seen *atomic.Bool) func(*dynamodb.Options) {
+	return func(o *dynamodb.Options) {
+		if v2, ok := o.Retryer.(aws.RetryerV2); ok {
+			o.Retryer = noting{RetryerV2: v2, seen: seen}
+		}
+	}
+}
+
+// unsettled returns err, the error of a write to what is held of address a,
+// once the record cache has taken what the write may have done: one that
+// may have been applied all the same (mayHaveApplied) is counted as a write
+// is and leaves nothing of a cached, so a read begun before it puts nothing
+// after it, and the next read reads the table (recCache.write). A refusal
+// stated changes nothing there.
+func (s *DynamoStore) unsettled(a protocol.Address, err error) error {
+	if mayHaveApplied(err) {
+		s.cache.write(a, evicted[*Box])
+	}
+	return err
+}
+
 // storeTimeout bounds each call to AWS the store makes, a read as a write,
 // whatever context its caller hands it (bounded), and each read that a call
 // shared by several callers makes apart from the request that started it: a
@@ -858,7 +914,7 @@ func (s *DynamoStore) CreateBox(ctx context.Context, b *Box) error {
 		return ErrExists
 	}
 	if err != nil {
-		return err
+		return s.unsettled(b.Addr, err)
 	}
 	s.applyBox(b)
 	return nil
@@ -883,6 +939,7 @@ func (s *DynamoStore) UpdateBox(ctx context.Context, b *Box) error {
 	slices.Sort(sets)
 	ctx, cancel := bounded(ctx)
 	defer cancel()
+	seen := new(atomic.Bool)
 	_, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.boxes,
 		Key:                       boxKey(b.Addr),
@@ -890,13 +947,16 @@ func (s *DynamoStore) UpdateBox(ctx context.Context, b *Box) error {
 		ConditionExpression:       aws.String("#rev = :old"),
 		ExpressionAttributeNames:  names,
 		ExpressionAttributeValues: values,
-	})
+	}, notingRetries(seen))
+	if err != nil && seen.Load() {
+		return s.unsettled(b.Addr, retriedAfter{err})
+	}
 	if _, ok := isConditionFailed(err); ok || isTransactionConflict(err) {
 		s.cache.evict(b.Addr) // the cached record may be the stale one
 		return ErrStale
 	}
 	if err != nil {
-		return err
+		return s.unsettled(b.Addr, err)
 	}
 	b.Rev = next.Rev
 	s.applyBox(b)
@@ -908,7 +968,7 @@ func (s *DynamoStore) DeleteBox(ctx context.Context, a protocol.Address) error {
 	ctx, cancel := bounded(ctx)
 	defer cancel()
 	if _, err := s.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &s.boxes, Key: boxKey(a)}); err != nil {
-		return err
+		return s.unsettled(a, err)
 	}
 	s.forget(a)
 	return nil
@@ -935,6 +995,7 @@ func (s *DynamoStore) Revoke(ctx context.Context, a protocol.Address, rv *Revoca
 	}
 	ctx, cancel := bounded(ctx)
 	defer cancel()
+	seen := new(atomic.Bool)
 	out, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.boxes,
 		Key:                       revocationsKey(a),
@@ -943,13 +1004,16 @@ func (s *DynamoStore) Revoke(ctx context.Context, a protocol.Address, rv *Revoca
 		ExpressionAttributeNames:  names,
 		ExpressionAttributeValues: values,
 		ReturnValues:              types.ReturnValueAllNew,
-	})
+	}, notingRetries(seen))
+	if err != nil && seen.Load() {
+		return s.unsettled(a, retriedAfter{err})
+	}
 	if _, ok := isConditionFailed(err); ok {
 		s.cache.evict(a) // what it holds may be the stale one
 		return ErrStale
 	}
 	if err != nil {
-		return err
+		return s.unsettled(a, err)
 	}
 	held, err := decodeRevocations(out.Attributes)
 	if err != nil {
@@ -990,7 +1054,9 @@ func (s *DynamoStore) Dedupe(ctx context.Context, box protocol.Address, id [32]b
 
 // PutMessage implements Store (PROTOCOL-SERVER.md §7): the body, then the item, if
 // no live one has this id. A crash after the body leaves an orphan the
-// lifecycle rule reaps, and the retry writes both again.
+// lifecycle rule reaps, and the retry writes both again. An item whose
+// condition fails on the item this write made, which an attempt the SDK
+// retried applied, is stored.
 func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *Header, body []byte) (*Header, error) {
 	put, cancel := bounded(ctx)
 	defer cancel()
@@ -1007,6 +1073,7 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 	now := s.nowMs()
 	item, cancelItem := bounded(ctx)
 	defer cancelItem()
+	seen := new(atomic.Bool)
 	_, err := s.db.PutItem(item, &dynamodb.PutItemInput{
 		TableName:                           &s.msgs,
 		Item:                                msgItem(box, h),
@@ -1014,9 +1081,15 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 		ExpressionAttributeNames:            map[string]string{"#id": "id", "#r": "received_at"},
 		ExpressionAttributeValues:           map[string]types.AttributeValue{":cutoff": num(now - ttlMs)},
 		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
-	})
+	}, notingRetries(seen))
 	if ccf, ok := isConditionFailed(err); ok {
 		orig, live, err := decodeMsg(ccf.Item) // a send of the same ciphertext got there first
+		if err == nil && live && orig.From == h.From && orig.ReceivedAt.Equal(h.ReceivedAt) {
+			// This send's own item, from an attempt the SDK retried
+			// (IronGall-dev/irongall-server#89): it is stored.
+			s.idx.insert(box, s.idx.newMark(h.ID, h.From, ms(h.ReceivedAt)+ttlMs), now)
+			return nil, nil
+		}
 		if err == nil && !live {
 			// Acked since this send's dedupe read missed it: the PUT above
 			// made its body again, which nothing would serve, and only the
@@ -1027,6 +1100,9 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 			}
 		}
 		return orig, err
+	}
+	if err != nil && seen.Load() {
+		return nil, retriedAfter{err}
 	}
 	if err != nil {
 		return nil, err
