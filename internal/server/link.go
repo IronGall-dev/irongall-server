@@ -82,7 +82,7 @@ func (s *Server) scheme(r *http.Request) string {
 	}
 	if s.fromProxy(r) {
 		first, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
-		if p := strings.ToLower(strings.TrimSpace(first)); p == "https" || p == "http" {
+		if p := protocol.LowerASCII(strings.TrimSpace(first)); p == "https" || p == "http" {
 			return p
 		}
 	}

@@ -3,7 +3,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -1026,7 +1025,7 @@ func redact(line []byte) []byte {
 // 16 hex characters of the SHA-256 of the value in lower case, the name
 // redact gives a run of hex.
 func logName(v []byte) string {
-	h := sha256.Sum256(bytes.ToLower(v))
+	h := sha256.Sum256([]byte(protocol.LowerASCII(string(v))))
 	return "#" + hex.EncodeToString(h[:8])
 }
 

@@ -152,7 +152,7 @@ func (s *Server) revokedAt(a protocol.Address, b *Box) *problem {
 // and the name is not sent with it: checked against a name that is not ours,
 // a pass made for another server would pass here.
 func (s *Server) serverName(r *http.Request) (string, bool) {
-	name := strings.ToLower(r.Host)
+	name := protocol.LowerASCII(r.Host)
 	if i := strings.LastIndexByte(name, ':'); i > strings.LastIndexByte(name, ']') {
 		switch n, err := strconv.ParseUint(name[i+1:], 10, 16); {
 		case i == len(name)-1, err == nil && (n == 443 || n == 80):

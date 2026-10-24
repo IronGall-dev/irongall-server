@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
 // Compression: gzip, where it saves bytes for little CPU, and nowhere else
@@ -81,7 +83,7 @@ func acceptsGzip(fields []string) bool {
 	for _, f := range fields {
 		for c := range strings.SplitSeq(f, ",") {
 			name, params, _ := strings.Cut(c, ";")
-			switch strings.ToLower(strings.TrimSpace(name)) {
+			switch protocol.LowerASCII(strings.TrimSpace(name)) {
 			case "gzip", "x-gzip":
 				named, gz = true, weighted(params)
 			case "*":
@@ -105,7 +107,7 @@ func weighted(params string) bool {
 		return true
 	}
 	name, q, ok := strings.Cut(params, "=")
-	if !ok || !strings.EqualFold(strings.TrimSpace(name), "q") {
+	if !ok || protocol.LowerASCII(strings.TrimSpace(name)) != "q" {
 		return false
 	}
 	n, err := strconv.ParseFloat(strings.TrimSpace(q), 64)

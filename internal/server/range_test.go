@@ -78,6 +78,10 @@ func TestAFetchResumesByRange(t *testing.T) {
 			t.Errorf("bytes=%d-: the store read %v, want from %d, %d bytes", from, got, from, size-from)
 		}
 	}
+	// The unit is read in any ASCII case (RFC 9110 §5.6.2, §14.1).
+	if r := e2.doWith(http.MethodGet, path, nil, tok, "Range", "BYTES=5-"); r.status != http.StatusPartialContent {
+		t.Errorf("BYTES=5-: %d, want 206", r.status)
+	}
 	for _, hdr := range [][]string{
 		{"Range", "bytes=1-" + strconv.FormatInt(size-1, 10)},
 		{"Range", "bytes=-5"},
@@ -86,6 +90,9 @@ func TestAFetchResumesByRange(t *testing.T) {
 		{"Range", protocol.RangeAsk(size + 5)},
 		{"Range", "bytes=99999999999999999999999-"},
 		{"Range", "items=5-"},
+		// A unit is a token, ASCII: U+017F is no s, though Unicode folds it
+		// to one (IronGall-dev/irongall-client#405).
+		{"Range", "byte\u017f=5-"},
 		{"Range", "bytes=5-", "If-Range", `"x"`},
 		{"Range", "bytes=5-", "If-Range", "Sun, 18 Oct 2026 00:00:00 GMT"},
 		{"Range", "bytes=5-", "Range", "bytes=6-"},
