@@ -8,7 +8,13 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
+	"reflect"
+	"slices"
+	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/IronGall-dev/irongall-client/protocol"
@@ -287,4 +293,455 @@ func (f *faults) DeleteMessage(ctx context.Context, box protocol.Address, id [32
 
 func (f *faults) DeleteFrom(ctx context.Context, box protocol.Address, from func(protocol.Address) bool, retired func([32]byte, time.Time)) error {
 	return f.write("DeleteFrom", func() error { return f.Backend.DeleteFrom(ctx, box, from, retired) })
+}
+
+// holdsBox reports whether the index holds box a loaded, with a record or
+// none.
+func (x *index) holdsBox(a protocol.Address) bool {
+	sh := x.shard(a)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	return sh.held(a) != nil
+}
+
+// heldWorld is a store over the in-memory backend, with the injector
+// between them, that holds: box a, registered, its record cached and the
+// box loaded, with two live messages from sender from, in no account; an
+// account, acct, its record cached, with an adopt key; and an address n
+// with no box, read, remembered missing, and loaded. Every change the setup
+// made has reached memory, so the write a test makes next is the only one
+// counted after it.
+type heldWorld struct {
+	s        *Memory
+	f        *faults
+	rec      *Box // a's record, as read
+	a, n     protocol.Address
+	from     protocol.Address
+	msgs     [2]*Header
+	acct     string
+	key      [32]byte // the adopt key's hash
+	now      time.Time
+	inAcct   bool // a is in acct
+	backend  *memBackend
+	standing Standing // a's in the index, before the write
+}
+
+func newHeldWorld(t *testing.T, inAccount bool) *heldWorld {
+	t.Helper()
+	_, _, rec := heldRecord(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	w := &heldWorld{s: NewMemStore(func() time.Time { return now }), a: rec.Addr, n: protocol.Address{0xee, 1}, from: protocol.Address{0xf0, 2},
+		acct: "acct", key: [32]byte{0xad}, now: now, inAcct: inAccount}
+	w.backend = w.s.backend.(*memBackend)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(w.s.CreateBox(ctx, cloneBox(rec)))
+	must(w.s.CreateAccount(ctx, &Account{ID: w.acct}))
+	must(w.s.PutAdoptKey(ctx, &AdoptKey{Account: w.acct, Hash: w.key, Uses: 5, Expires: now.Add(time.Hour)}))
+	for i := range w.msgs {
+		w.msgs[i] = &Header{ID: [32]byte{0x1d, byte(i)}, From: w.from, Size: 3, ReceivedAt: now.Add(-time.Duration(i+1) * time.Minute)}
+		w.msgs[i].ExpiresAt = w.msgs[i].ReceivedAt.Add(protocol.Retention)
+		_, err := w.s.PutMessage(ctx, w.a, w.msgs[i], []byte("abc"))
+		must(err)
+	}
+	if inAccount {
+		b, err := w.s.Box(ctx, w.a)
+		must(err)
+		must(w.s.Adopt(ctx, b, w.acct, w.key))
+	}
+	w.backend.deliver()
+	var err error
+	w.rec, err = w.s.Box(ctx, w.a)
+	must(err)
+	if _, err := w.s.Count(ctx, w.a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.s.Account(ctx, w.acct); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.s.Box(ctx, w.n); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("control: an address with no box: %v", err)
+	}
+	if _, err := w.s.Count(ctx, w.n); err != nil {
+		t.Fatal(err)
+	}
+	w.f = injectFaults(w.s)
+	var ok bool
+	if w.standing, ok = w.s.Held(w.a); !ok || !w.s.idx.holdsBox(w.n) {
+		t.Fatal("control: the box is not loaded, or the address with no box")
+	}
+	if b, ok := w.s.Known(w.a); !ok || b == nil || (b.Account == w.acct) != inAccount {
+		t.Fatalf("control: the record is not cached as set up: %v", b)
+	}
+	if b, ok := w.s.Known(w.n); !ok || b != nil {
+		t.Fatal("control: the address with no box is not remembered missing")
+	}
+	if _, ok := w.s.accCache.get(w.acct); !ok {
+		t.Fatal("control: the account is not cached")
+	}
+	return w
+}
+
+// marks is how many live messages the index holds of box a, with no load.
+func (w *heldWorld) marks() int { return w.s.idx.count(w.a, ms(w.now)) }
+
+// A write's target: what memory holds that it may change.
+const (
+	onBox     = "the box"
+	onNew     = "an address with no box"
+	onAccount = "a new account"
+	onNothing = "nothing memory holds"
+)
+
+// backendWrite is a write of the Backend, as the store makes it.
+type backendWrite struct {
+	on string // its target
+	// inAccount sets the world up with the box in its account.
+	inAccount bool
+	// run makes the write through the store; dup is a send answered with
+	// another's header.
+	run func(ctx context.Context, w *heldWorld) (dup *Header, err error)
+	// refusals are the refusals it states.
+	refusals []error
+	// applied reports what memory holds once it was applied, or what is
+	// wrong.
+	applied func(w *heldWorld) string
+}
+
+// backendWrites is every write of the Backend: TestEveryWriteOfTheBackend
+// ReachesMemoryByItsOutcome holds it to the interface's methods.
+func backendWrites() map[string]backendWrite {
+	cached := func(w *heldWorld) *Box { b, _ := w.s.Known(w.a); return b }
+	return map[string]backendWrite{
+		"CreateBox": {on: onNew, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			b := cloneBox(w.rec)
+			b.Addr, b.Account = w.n, ""
+			return nil, w.s.CreateBox(ctx, b)
+		}, refusals: []error{ErrExists}, applied: func(w *heldWorld) string {
+			if b, ok := w.s.Known(w.n); !ok || b == nil || b.Rev != 1 {
+				return "the new record is not cached"
+			}
+			if _, ok := w.s.Held(w.n); !ok {
+				return "the index holds no standing of the new box"
+			}
+			return ""
+		}},
+		"UpdateBox": {on: onBox, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			b := cloneBox(w.rec)
+			b.CertSerial += 10
+			return nil, w.s.UpdateBox(ctx, b)
+		}, refusals: []error{ErrStale}, applied: func(w *heldWorld) string {
+			if b := cached(w); b == nil || b.Rev != w.rec.Rev+1 || b.CertSerial != w.rec.CertSerial+10 {
+				return "the cache does not hold the record written"
+			}
+			if st, _ := w.s.Held(w.a); st.CertSerial != w.rec.CertSerial+10 {
+				return "the index does not hold the standing written"
+			}
+			return ""
+		}},
+		"DeleteBox": {on: onBox, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			return nil, w.s.DeleteBox(ctx, w.a)
+		}, refusals: []error{errStated}, applied: func(w *heldWorld) string {
+			if _, ok := w.s.Known(w.a); ok || w.s.idx.holdsBox(w.a) {
+				return "memory holds the box whose record was deleted"
+			}
+			return ""
+		}},
+		"Revoke": {on: onBox, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			return nil, w.s.Revoke(ctx, w.a, &Revocations{Identity: w.rec.Identity, Address: []byte("the identity's revocation")})
+		}, refusals: []error{ErrStale}, applied: func(w *heldWorld) string {
+			if b := cached(w); b == nil || b.State != Revoked {
+				return "the cache does not hold the revocation"
+			}
+			if st, _ := w.s.Held(w.a); st.State != Revoked {
+				return "the index does not hold the revocation"
+			}
+			return ""
+		}},
+		"Adopt": {on: onBox, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			return nil, w.s.Adopt(ctx, cloneBox(w.rec), w.acct, w.key)
+		}, refusals: []error{ErrStale, ErrKeyRefused}, applied: func(w *heldWorld) string {
+			if b := cached(w); b == nil || b.Account != w.acct {
+				return "the cache does not hold the box in its account"
+			}
+			if st, _ := w.s.Held(w.a); !st.InAccount {
+				return "the index does not hold the box in an account"
+			}
+			return ""
+		}},
+		"Leave": {on: onBox, inAccount: true, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			return nil, w.s.Leave(ctx, cloneBox(w.rec))
+		}, refusals: []error{ErrStale}, applied: func(w *heldWorld) string {
+			if b := cached(w); b == nil || b.Account != "" {
+				return "the cache holds the box in its account"
+			}
+			if st, _ := w.s.Held(w.a); st.InAccount {
+				return "the index holds the box in an account"
+			}
+			return ""
+		}},
+		"CreateAccount": {on: onAccount, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			return nil, w.s.CreateAccount(ctx, &Account{ID: "acct2"})
+		}, refusals: []error{ErrExists}, applied: func(*heldWorld) string { return "" }},
+		"PutAdoptKey": {on: onNothing, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			return nil, w.s.PutAdoptKey(ctx, &AdoptKey{Account: w.acct, Hash: [32]byte{9}, Uses: 1, Expires: w.now.Add(time.Hour)})
+		}, refusals: []error{ErrExists}, applied: func(*heldWorld) string { return "" }},
+		"PutMessage": {on: onBox, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			h := &Header{ID: [32]byte{0x1d, 9}, From: w.from, Size: 3, ReceivedAt: w.now, ExpiresAt: w.now.Add(protocol.Retention)}
+			return w.s.PutMessage(ctx, w.a, h, []byte("abc"))
+		}, refusals: []error{errNotStored, duplicate{}}, applied: func(w *heldWorld) string {
+			if n := w.marks(); n != 3 {
+				return fmt.Sprintf("the index counts %d messages, want 3", n)
+			}
+			return ""
+		}},
+		"Retire": {on: onBox, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			return nil, w.s.retire(ctx, w.a, w.msgs[0].ID)
+		}, refusals: []error{ErrNotFound}, applied: func(w *heldWorld) string {
+			if n := w.marks(); n != 1 {
+				return fmt.Sprintf("the index counts %d messages, want 1", n)
+			}
+			return ""
+		}},
+		"DeleteMessage": {on: onBox, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			return nil, w.s.DeleteMessage(ctx, w.a, w.msgs[0].ID)
+		}, refusals: []error{ErrNotFound}, applied: func(w *heldWorld) string {
+			if n := w.marks(); n != 1 {
+				return fmt.Sprintf("the index counts %d messages, want 1", n)
+			}
+			return ""
+		}},
+		"DeleteFrom": {on: onBox, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
+			return nil, w.s.DeleteFrom(ctx, w.a, func(a protocol.Address) bool { return a == w.from })
+		}, refusals: []error{errStated}, applied: func(w *heldWorld) string {
+			if n := w.marks(); n != 0 {
+				return fmt.Sprintf("the index counts %d messages, want none", n)
+			}
+			return ""
+		}},
+	}
+}
+
+// backendReads are the Backend's reads, and its feed's methods: every other
+// method is a write, and in backendWrites.
+var backendReads = []string{"ReadAddress", "ReadLive", "List", "Message", "Dedupe", "Account", "AdoptKey", "Start", "Ready"}
+
+// Every write of the Backend, whatever the backend, has one of three
+// outcomes, and the store's one choke point (Memory.write) makes each what
+// it is in memory, in the count reserved for the write and in its answer:
+// applied, memory holds the write and the count is kept; refused as the
+// store stated, memory is as it was, but for a refusal of a condition on
+// the box's record (ErrStale, ErrExists), which evicts the copy held,
+// counted as a write so that a read begun before it puts nothing, and the
+// count is given back; unknown, before or after the backend applied it,
+// memory forgets what it held of the write's target, the record cache and
+// the index, or the account, a read begun before puts nothing, the answer is
+// ErrUnknown and the count is kept (IronGall-dev/irongall-client#411 item
+// 3). The writes are held to the interface's methods: one added there and
+// not here fails.
+func TestEveryWriteOfTheBackendReachesMemoryByItsOutcome(t *testing.T) {
+	writes := backendWrites()
+	bt := reflect.TypeFor[Backend]()
+	for i := range bt.NumMethod() {
+		name := bt.Method(i).Name
+		if _, ok := writes[name]; !ok && !slices.Contains(backendReads, name) {
+			t.Errorf("the Backend's %s is neither a read nor a write this test makes", name)
+		}
+	}
+	for name := range writes {
+		if _, ok := bt.MethodByName(name); !ok {
+			t.Errorf("the test makes a write the Backend has none of: %s", name)
+		}
+	}
+	ctx := context.Background()
+	for _, name := range slices.Sorted(maps.Keys(writes)) {
+		c := writes[name]
+		type outcome struct {
+			fault   fault
+			refusal error
+		}
+		outcomes := []outcome{{fault: asIs}, {fault: unknownBefore}, {fault: unknownAfter}}
+		for _, r := range c.refusals {
+			outcomes = append(outcomes, outcome{refusedBefore, r})
+		}
+		for _, o := range outcomes {
+			label := o.fault.String()
+			if o.refusal != nil {
+				label += ": " + strings.TrimPrefix(o.refusal.Error(), "refused: ")
+			}
+			t.Run(name+"/"+label, func(t *testing.T) {
+				w := newHeldWorld(t, c.inAccount)
+				refusal := o.refusal
+				if _, ok := refusal.(duplicate); ok {
+					refusal = duplicate{w.msgs[1]}
+				}
+				w.f.set(name, o.fault)
+				w.f.refuse[name] = refusal
+				addr := w.a
+				if c.on == onNew {
+					addr = w.n
+				}
+				tok, atok := w.s.cache.begin(addr), w.s.accCache.begin("acct2")
+				dup, err := c.run(ctx, w)
+
+				applied, unknown := o.fault == asIs, o.fault == unknownBefore || o.fault == unknownAfter
+				kept := mayHaveApplied(err) || err == nil && dup == nil
+				t.Logf("err %v, a duplicate's header %v; the count kept %v", err, dup != nil, kept)
+				switch {
+				case applied && (err != nil || dup != nil):
+					t.Fatalf("applied, the write answers %v, %v", dup, err)
+				case unknown && (!errors.Is(err, ErrUnknown) || isRefusal(err) || errors.Is(err, ErrStale) || errors.Is(err, ErrExists) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrKeyRefused)):
+					t.Fatalf("unknown, the write answers %v, not ErrUnknown alone", err)
+				case refusal != nil:
+					if d, ok := refusal.(duplicate); ok {
+						if err != nil || dup == nil || dup.ID != d.h.ID {
+							t.Fatalf("refused as a duplicate, the send answers %v, %v; want the other's header", dup, err)
+						}
+					} else if !errors.Is(err, refusal) || errors.Is(err, ErrUnknown) {
+						t.Fatalf("refused, the write answers %v; want %v", err, refusal)
+					}
+				}
+				if kept != !(refusal != nil) {
+					t.Errorf("the count reserved for the write is kept %v; want %v", kept, refusal == nil)
+				}
+
+				// What memory holds of the write's target.
+				stale := (c.on == onBox || c.on == onNew) && (errors.Is(refusal, ErrStale) || errors.Is(refusal, ErrExists))
+				keptOut := func() bool { // a read begun before the write puts nothing
+					switch c.on {
+					case onAccount:
+						w.s.accCache.fill(&Account{ID: "acct2", Rev: 1}, atok)
+						_, held := w.s.accCache.get("acct2")
+						return !held
+					case onNothing:
+						return true
+					}
+					b := cloneBox(w.rec)
+					b.Addr = addr
+					w.s.cache.missed(addr, tok, w.now)
+					w.s.cache.fill(b, tok)
+					_, held := w.s.Known(addr)
+					return !held
+				}
+				switch c.on {
+				case onBox, onNew:
+					loaded := w.s.idx.holdsBox(addr)
+					b, cachedOK := w.s.Known(addr)
+					switch {
+					case unknown:
+						if loaded || cachedOK {
+							t.Errorf("unknown: memory still holds the address: the index %v, the record cache %v", loaded, cachedOK)
+						}
+					case refusal != nil:
+						if !loaded {
+							t.Errorf("refused: the index dropped the box")
+						}
+						if st, _ := w.s.Held(w.a); c.on == onBox && st != w.standing {
+							t.Errorf("refused: the index holds the box's standing %+v, not %+v as before", st, w.standing)
+						}
+						if stale && cachedOK {
+							t.Errorf("refused for its condition: the record cache still holds the copy from before it")
+						}
+						if !stale && c.on == onBox && (!cachedOK || b == nil || b.Rev != w.rec.Rev) {
+							t.Errorf("refused: the record cache does not hold the record as before")
+						}
+					default:
+						if msg := c.applied(w); msg != "" {
+							t.Errorf("applied: %s", msg)
+						}
+					}
+				case onNothing:
+					if !w.s.idx.holdsBox(w.a) {
+						t.Error("a write memory holds nothing of dropped the box")
+					}
+					if _, ok := w.s.Known(w.a); !ok {
+						t.Error("a write memory holds nothing of dropped the record")
+					}
+					if _, ok := w.s.accCache.get(w.acct); !ok {
+						t.Error("a write memory holds nothing of dropped the account")
+					}
+				}
+				// What an applied write puts is TestEveryOrderOfAFillAndAWrite's.
+				if want := unknown || stale; !applied && c.on != onNothing && keptOut() != want {
+					t.Errorf("a read begun before the write puts nothing after it: %v; want %v", !want, want)
+				}
+			})
+		}
+	}
+}
+
+// An item of the backend's that does not read is applied as one gone,
+// whatever its kind: the address forgotten, the record cache and the index
+// both, or the account evicted, each counted so that a read begun before it
+// puts nothing (IronGall-dev/irongall-client#407 item 1). Each kind's item
+// comes as the DynamoDB backend decodes its stream's record. Every kind of
+// change is here: one added and not here fails.
+func TestAnItemThatDoesNotReadIsGoneWhateverItsKind(t *testing.T) {
+	b := func(v []byte) stypes.AttributeValue { return &stypes.AttributeValueMemberB{Value: v} }
+	s := func(v string) stypes.AttributeValue { return &stypes.AttributeValueMemberS{Value: v} }
+	modify := func(img map[string]stypes.AttributeValue) stypes.Record {
+		return stypes.Record{EventName: stypes.OperationTypeModify, Dynamodb: &stypes.StreamRecord{NewImage: img}}
+	}
+	// Each kind's record of an item of world w that does not read, and the
+	// decoder of its stream.
+	cases := map[ChangeKind]func(w *heldWorld) (func(stypes.Record) (Change, error), stypes.Record){
+		RecordChange: func(w *heldWorld) (func(stypes.Record) (Change, error), stypes.Record) {
+			img := toStream(boxItem(w.rec))
+			img["state"] = s("deleted") // a state this build never writes
+			return boxStreamChange, modify(img)
+		},
+		RevocationsChange: func(w *heldWorld) (func(stypes.Record) (Change, error), stypes.Record) {
+			return boxStreamChange, modify(map[string]stypes.AttributeValue{"addr": b(w.a[:]), "sk": b([]byte{skRevocations}),
+				"identity": s("not the bytes of an identity document"), "revocation": b([]byte("the identity's revocation"))})
+		},
+		MessageChange: func(w *heldWorld) (func(stypes.Record) (Change, error), stypes.Record) {
+			return msgStreamChange, modify(map[string]stypes.AttributeValue{"box": b(w.a[:]), "id": b(make([]byte, 32)), "from": b(make([]byte, 32)),
+				"size": &stypes.AttributeValueMemberN{Value: "3"}, "received_at": s("not a number")})
+		},
+		AccountChange: func(w *heldWorld) (func(stypes.Record) (Change, error), stypes.Record) {
+			return accountStreamChange, modify(map[string]stypes.AttributeValue{"account": b([]byte(w.acct)), "sk": b([]byte{skAccount}),
+				"rev": s("two"), "unmetered": &stypes.AttributeValueMemberBOOL{Value: true}})
+		},
+	}
+	for k := ChangeKind(1); int(k) <= numChangeKinds; k++ {
+		t.Run(k.String(), func(t *testing.T) {
+			c, ok := cases[k]
+			if !ok {
+				t.Fatalf("no item of kind %d that does not read", k)
+			}
+			w := newHeldWorld(t, false)
+			decode, r := c(w)
+			ch, err := decode(r)
+			if err != nil || ch.Kind != k || ch.Err == nil {
+				t.Fatalf("control: the record decodes as %v of kind %d, error %v; want its kind, and an image that does not read", err, ch.Kind, ch.Err)
+			}
+			tok, atok := w.s.cache.begin(w.a), w.s.accCache.begin(w.acct)
+			w.s.apply(ch)
+			if k == AccountChange {
+				if _, ok := w.s.accCache.get(w.acct); ok {
+					t.Error("the account is still cached")
+				}
+				w.s.accCache.fill(&Account{ID: w.acct, Rev: 1}, atok)
+				if _, ok := w.s.accCache.get(w.acct); ok {
+					t.Error("a read of the account begun before the item puts its copy after it")
+				}
+				return
+			}
+			if w.s.idx.holdsBox(w.a) {
+				t.Error("the index still holds the box")
+			}
+			if _, ok := w.s.Known(w.a); ok {
+				t.Error("the record cache still answers for the address")
+			}
+			w.s.cache.fill(w.rec, tok)
+			if _, ok := w.s.Known(w.a); ok {
+				t.Error("a read of the address begun before the item puts its copy after it")
+			}
+		})
+	}
 }

@@ -33,8 +33,10 @@ const streamOp = "DynamoDBStreams_20120810."
 // DynamoDB, its streams and an S3 that never answer: the reads as the
 // writes, whoever calls them, and a stream follower's
 // (IronGall-dev/irongall-server#91). The bound is in one place for each
-// client (bound, boundedStreams), not at each call. Where a call comes after
-// another, the fake answers the first and holds the one named.
+// client (bound, boundedStreams), not at each call
+// (IronGall-dev/irongall-client#411 item 4). Where a call comes after
+// another, the fake answers the first and holds the one named: a delete of
+// a box's mail reaches its delete of the bodies so.
 func TestEveryCallToAWSEndsAtItsBound(t *testing.T) {
 	_, _, box := heldRecord(t)
 	hang := answer{hang: true}
@@ -121,6 +123,8 @@ func TestEveryCallToAWSEndsAtItsBound(t *testing.T) {
 		{name: "DeleteMessage's body", call: func(ctx context.Context, s *Memory) error { return s.DeleteMessage(ctx, box.Addr, msg.ID) }},
 		{name: "DeleteMessage's item", s3: s3ok, call: func(ctx context.Context, s *Memory) error { return s.DeleteMessage(ctx, box.Addr, msg.ID) }},
 		{name: "DeleteFrom", call: func(ctx context.Context, s *Memory) error { return s.DeleteMessages(ctx, box.Addr) }},
+		{name: "DeleteFrom's delete of the bodies", dynamo: first("Query", answered(map[string]any{"Items": []any{itemJSON(msgItem(box.Addr, msg))}, "Count": 1, "ScannedCount": 1})),
+			call: func(ctx context.Context, s *Memory) error { return s.DeleteMessages(ctx, box.Addr) }},
 		{name: "Adopt", call: func(ctx context.Context, s *Memory) error {
 			return s.Adopt(ctx, cloneBox(box), "acct", [32]byte{1})
 		}},

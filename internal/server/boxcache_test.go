@@ -854,3 +854,33 @@ func standsAt(b *Box) string {
 	}
 	return fmt.Sprintf("rev %d, certificate serial %d", b.Rev, b.CertSerial)
 }
+
+// A fill's check of its token and its put are one step under the cache's
+// lock, and so are a miss's check and its record: no write can be counted
+// between them, which would leave a copy from before it kept
+// (IronGall-dev/irongall-server#95). The hook between the check and the put
+// sees the lock held, by the same taking of it as the check
+// (IronGall-dev/irongall-client#407 item 3).
+func TestAFillAndAMissAreEachOneStepUnderTheLock(t *testing.T) {
+	var a, other protocol.Address
+	a[0], other[0] = 7, 8
+	c := newBoxCache(10)
+	steps := 0
+	c.between = func(checked uint64) {
+		steps++
+		if c.mu.TryLock() {
+			c.mu.Unlock()
+			t.Error("between a check and its put the cache's lock is not held")
+		} else if c.mu.n != checked {
+			t.Errorf("between a check and its put the cache's lock was let go and taken again (%d takings since the check)", c.mu.n-checked)
+		}
+	}
+	c.fill(&Box{Addr: a, Rev: 1}, c.begin(a))
+	c.missed(other, c.begin(other), time.Now())
+	if steps != 2 {
+		t.Fatalf("control: the hook ran %d times for a fill and a miss whose tokens stand, want 2", steps)
+	}
+	if _, ok := c.get(a); !ok || !c.missingAt(other, time.Now()) {
+		t.Fatal("control: the fill or the miss was not kept")
+	}
+}
