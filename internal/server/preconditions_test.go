@@ -574,74 +574,78 @@ func TestAFalsePreconditionIsACallThatDoesNothingElse(t *testing.T) {
 			continue
 		}
 		for _, st := range reaches {
-			for _, f := range []struct{ name, field, value string }{
-				{`If-Match: "x"`, "If-Match", `"x"`},
-				{"If-Match: *", "If-Match", "*"},
-				{"If-None-Match: *", "If-None-Match", "*"},
-				{"If-None-Match: its tag", "If-None-Match", ""},
-			} {
-				_, path, _ := strings.Cut(rt.pattern, " ")
-				t.Run(rt.method+" "+path+"/"+st.name+"/"+f.name, func(t *testing.T) {
-					var inj *faults
-					e := newEnv(t, l, func(c *Config) { inj = injectFaults(c.Store.(*Memory)) })
-					q, tag := st.setup(e)
-					value := f.value
-					switch {
-					case f.name == "If-Match: *" && st.exists, f.name == "If-None-Match: *" && !st.exists:
-						t.Skip("a condition that holds here")
-					case f.name == "If-None-Match: its tag" && tag == "":
-						t.Skip("a target with no tag")
-					case f.name == "If-None-Match: its tag":
-						value = tag
+			_, path, _ := strings.Cut(rt.pattern, " ")
+			t.Run(rt.method+" "+path+"/"+st.name, func(t *testing.T) {
+				// Which conditions are false in this state: its target exists
+				// or not, and has a tag or none, as its setup makes it. One
+				// that holds here, or a tag it has none of, is no case of it.
+				_, tagged := st.setup(newEnv(t, l))
+				for _, f := range []struct{ name, field, value string }{
+					{`If-Match: "x"`, "If-Match", `"x"`},
+					{"If-Match: *", "If-Match", "*"},
+					{"If-None-Match: *", "If-None-Match", "*"},
+					{"If-None-Match: its tag", "If-None-Match", ""},
+				} {
+					if f.name == "If-Match: *" && st.exists || f.name == "If-None-Match: *" && !st.exists || f.name == "If-None-Match: its tag" && tagged == "" {
+						continue
 					}
-					want := http.StatusPreconditionFailed
-					if f.field == "If-None-Match" && (rt.method == http.MethodGet || rt.method == http.MethodHead) {
-						want = http.StatusNotModified
-					}
-					spends := maps.Clone(st.spends)
-					if rt.gate {
-						spends[string(protocol.QuotaRequests)]++
-					}
-					mem := e.store.(*Memory)
-					before, cursors, marks, wrote := debts(e.server, e.clock.Now()), e.server.drains.cursors(), mem.idx.served(), inj.wrote.Load()
-					var status int
-					if rt.method == http.MethodHead {
-						status = e.head(q.path, q.pass, f.field, value).StatusCode
-					} else {
-						got := e.doWith(q.method, q.path, q.body, q.pass, f.field, value)
-						status = got.status
-						switch {
-						case want == http.StatusPreconditionFailed && got.code() != protocol.CodePreconditionFailed:
-							t.Errorf("a 412 that is not precondition_failed: %s", got.body)
-						case want == http.StatusNotModified && len(got.body) != 0:
-							t.Errorf("a 304 with %d bytes", len(got.body))
+					t.Run(f.name, func(t *testing.T) {
+						var inj *faults
+						e := newEnv(t, l, func(c *Config) { inj = injectFaults(c.Store.(*Memory)) })
+						q, tag := st.setup(e)
+						value := f.value
+						if f.name == "If-None-Match: its tag" {
+							value = tag
 						}
-					}
-					if status != want {
-						t.Fatalf("%d, want %d", status, want)
-					}
-					after := debts(e.server, e.clock.Now())
-					for name := range after {
-						if _, ok := before[name]; !ok {
-							before[name] = 0
+						want := http.StatusPreconditionFailed
+						if f.field == "If-None-Match" && (rt.method == http.MethodGet || rt.method == http.MethodHead) {
+							want = http.StatusNotModified
 						}
-					}
-					for name, n := range before {
-						if got := after[name] - n; got != spends[name] {
-							t.Errorf("%s: %d spent, want %d", name, got, spends[name])
+						spends := maps.Clone(st.spends)
+						if rt.gate {
+							spends[string(protocol.QuotaRequests)]++
 						}
-					}
-					if got := e.server.drains.cursors(); !maps.Equal(got, cursors) {
-						t.Errorf("the cursors handed out went from %v to %v", cursors, got)
-					}
-					if got := mem.idx.served(); !maps.Equal(got, marks) {
-						t.Errorf("the messages' marks went from %v to %v", marks, got)
-					}
-					if got := inj.wrote.Load(); got != wrote {
-						t.Errorf("%d writes of the store", got-wrote)
-					}
-				})
-			}
+						mem := e.store.(*Memory)
+						before, cursors, marks, wrote := debts(e.server, e.clock.Now()), e.server.drains.cursors(), mem.idx.served(), inj.wrote.Load()
+						var status int
+						if rt.method == http.MethodHead {
+							status = e.head(q.path, q.pass, f.field, value).StatusCode
+						} else {
+							got := e.doWith(q.method, q.path, q.body, q.pass, f.field, value)
+							status = got.status
+							switch {
+							case want == http.StatusPreconditionFailed && got.code() != protocol.CodePreconditionFailed:
+								t.Errorf("a 412 that is not precondition_failed: %s", got.body)
+							case want == http.StatusNotModified && len(got.body) != 0:
+								t.Errorf("a 304 with %d bytes", len(got.body))
+							}
+						}
+						if status != want {
+							t.Fatalf("%d, want %d", status, want)
+						}
+						after := debts(e.server, e.clock.Now())
+						for name := range after {
+							if _, ok := before[name]; !ok {
+								before[name] = 0
+							}
+						}
+						for name, n := range before {
+							if got := after[name] - n; got != spends[name] {
+								t.Errorf("%s: %d spent, want %d", name, got, spends[name])
+							}
+						}
+						if got := e.server.drains.cursors(); !maps.Equal(got, cursors) {
+							t.Errorf("the cursors handed out went from %v to %v", cursors, got)
+						}
+						if got := mem.idx.served(); !maps.Equal(got, marks) {
+							t.Errorf("the messages' marks went from %v to %v", marks, got)
+						}
+						if got := inj.wrote.Load(); got != wrote {
+							t.Errorf("%d writes of the store", got-wrote)
+						}
+					})
+				}
+			})
 		}
 	}
 }
