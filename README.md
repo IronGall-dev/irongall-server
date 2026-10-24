@@ -12,9 +12,8 @@ The server of [irongall.dev](https://irongall.dev): end-to-end encrypted, sender
 |---|---|
 | `cmd/irongalld/` | The command: `irongalld serve`, and `irongalld account` and `irongalld limits` for the operator |
 | `internal/server/` | The API (every route under `/v1/`, and `/to/<address>`, the page a box's link opens), a deployment's site when it gives one (`-site`), what each process holds in memory, the DynamoDB stream followers, the two stores (DynamoDB with S3 Express One Zone, and in memory) and the limits |
-| [`PROTOCOL-SERVER.md`](PROTOCOL-SERVER.md) | How this server does each step of the specification, under the specification's section numbers |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Processes, memory, request paths, failure modes and the stages of scale |
-| [`LIMITS.md`](LIMITS.md) | Every limit this server enforces, who pays for it, the order of checks, and where it is weak: there to be checked |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | How this server is built: processes, memory, the pass check, request paths, storage, failure modes and the stages of scale |
+| [`LIMITS.md`](LIMITS.md) | Every limit this server enforces, who pays for it, and where it is weak: there to be checked |
 | [`CRYPTO-ANALYSIS.md`](CRYPTO-ANALYSIS.md) | The design summarised for a reviewer: threat model, primitives, properties, limits and open questions |
 | [`SECURITY.md`](SECURITY.md) | How to report a vulnerability privately, and what this server must get right beside the code and tests that hold it |
 | `test/interop.sh` | The stock-tools client and the Go client, together, against a real `irongalld` |
@@ -40,7 +39,7 @@ go run ./cmd/irongalld serve --dev
 
 `test/interop.sh` runs both clients from the checkout beside this one against a real `serve --dev`: mail both ways, renewal, revocation, certificates and the sender ACL. Its header says what it needs, and how to test post-quantum boxes when the packaged age is older than 1.3.
 
-The other store is three DynamoDB tables and an S3 Express One Zone directory bucket. `irongalld serve -h` lists every flag, and `PROTOCOL-SERVER.md` §7 has the layout. That mode also needs `-names`, the names clients call the server by: a box's pass is made for one server by name, and the server takes one only on a request that calls it by a name of its own (`PROTOCOL-SERVER.md` §6.1b).
+The other store is three DynamoDB tables and an S3 Express One Zone directory bucket. `irongalld serve -h` lists every flag, and `ARCHITECTURE.md` § Storage has the layout. That mode also needs `-names`, the names clients call the server by: a box's pass is made for one server by name, and the server takes one only on a request that calls it by a name of its own (`ARCHITECTURE.md` § The pass check).
 
 `-metrics-listen <address>` serves the operator's metrics at `/metrics` in Prometheus' text format, on a listener of its own: what they count is `ARCHITECTURE.md` § Metrics. Keep it off the internet: it is for the operator.
 
