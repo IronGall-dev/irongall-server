@@ -470,17 +470,15 @@ func (s *Server) handle(h func(http.ResponseWriter, *http.Request) error) http.H
 // moved, so a slow link that keeps sending is let through, and a peer that
 // stops is cut off. It is the outermost wrapper, so no answer goes without
 // it: a refusal at the gate, the router's own, the link page's, a site's
-// (IronGall-dev/irongall-server#31, #77). A body the handler leaves unread
-// is drained by net/http before the answer is written, as go1.27's
-// chunkWriter.writeHeader does unless the connection is to close after the
-// answer, up to a bound of net/http's own. It reads with its own reader,
-// which pacedBody never sees, so no byte of the drain moves the read
-// deadline, and the drain is cut there. The answer then goes out, under a
-// write deadline that runs from the later of when it is written and that
-// read deadline (pacedBody.drained): it is set before each piece of each
-// write the handler makes (pacedWriter), and once more as the handler
-// returns, for an answer with no body or a body's last bytes, which
-// net/http writes then (#82). Off when either is zero.
+// (IronGall-dev/irongall-server#31, #77). What the handler leaves of a body
+// is drained through the body itself before the answer's first byte goes
+// out (pacedBody.drain), so the drain is cut and counted as the handler's
+// reads are, at the deadline they left, and the answer's time runs from
+// its end (#82): the write
+// deadline is set for each piece of each write the handler makes
+// (pacedWriter), and once more as the handler returns, for an answer with
+// no body or a body's last bytes, which net/http writes then. Off when
+// either is zero.
 func (s *Server) paced(h http.Handler) http.Handler {
 	if s.limits.BodyTimeout <= 0 || s.limits.BodyMinRate <= 0 {
 		return h
@@ -490,12 +488,16 @@ func (s *Server) paced(h http.Handler) http.Handler {
 		start := time.Now()
 		var body *pacedBody // nil for a request with no body
 		if r.Body != nil && r.Body != http.NoBody {
-			body = &pacedBody{ReadCloser: r.Body, rc: rc, start: start, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate), m: s.metrics, deadline: start.Add(s.limits.BodyTimeout)}
+			// net/http wraps a body to send 100 Continue only so, and
+			// answers any other Expect 417 before a handler runs.
+			waits := r.Header.Get("Expect") != "" && r.ProtoAtLeast(1, 1) && r.ContentLength != 0
+			body = &pacedBody{ReadCloser: r.Body, rc: rc, start: start, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate), m: s.metrics, deadline: start.Add(s.limits.BodyTimeout), length: r.ContentLength, undrained: r.Close || waits}
 			_ = rc.SetReadDeadline(body.deadline)
 			r.Body = body
 		}
 		h.ServeHTTP(&pacedWriter{ResponseWriter: w, rc: rc, body: body, timeout: s.limits.BodyTimeout, rate: int64(s.limits.BodyMinRate)}, r)
-		_ = rc.SetWriteDeadline(body.drained(time.Now()).Add(s.limits.BodyTimeout))
+		body.drain()
+		_ = rc.SetWriteDeadline(time.Now().Add(s.limits.BodyTimeout))
 	})
 }
 
@@ -513,16 +515,24 @@ type pacedBody struct {
 	rate    int64
 	m       *Metrics
 	// deadline is the read deadline set last, and ended whether a read has
-	// returned the body's end or an error: after that, net/http drains
-	// nothing of it.
+	// returned the body's end or an error. draining is whether drain is
+	// reading, whose bytes move no deadline.
 	deadline time.Time
 	ended    bool
+	draining bool
+	// length is the request's Content-Length, -1 if it gave none, and
+	// undrained whether net/http drains none of the body: its request asks
+	// to close the connection, or waits for 100 Continue. drained is
+	// whether drain has run.
+	length    int64
+	undrained bool
+	drained   bool
 }
 
 func (p *pacedBody) Read(b []byte) (int, error) {
 	n, err := p.ReadCloser.Read(b)
 	p.got += int64(n)
-	if n > 0 && err == nil {
+	if n > 0 && err == nil && !p.draining {
 		p.deadline = p.start.Add(p.timeout + time.Duration(p.got/p.rate)*time.Second)
 		_ = p.rc.SetReadDeadline(p.deadline)
 	}
@@ -543,26 +553,45 @@ func (p *pacedBody) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// drained is when net/http's drain of what the handler left of the body ends
-// at the latest, for an answer written at now: the read deadline, if the
-// body is still open and that is later, and now otherwise. A write deadline
-// runs from it, so the drain takes none of the answer's time (#82).
-func (p *pacedBody) drained(now time.Time) time.Time {
-	if p == nil || p.ended || !p.deadline.After(now) {
-		return now
+// drainBound is the most of a body its handler left that drain reads,
+// net/http's own bound (go1.27's maxPostHandlerReadBytes).
+const drainBound = 256 << 10
+
+// drain reads what the handler left of the body, before the answer's first
+// byte goes out, through Read, so a cut of it is counted where every cut is
+// (IronGall-dev/irongall-client#413 item 3): net/http would otherwise drain
+// it with a reader of its own, whose cut is no cut here (go1.27's
+// chunkWriter.writeHeader, and body.Close once the handler returns). No byte
+// of the drain moves the read deadline, as none of net/http's did: the body
+// has the timeout from its head, and what the handler's reads earned, and no
+// more (#82). It drains what net/http would: to drainBound, and none of a
+// body net/http drains none of, or whose Content-Length leaves more than
+// that. What it leaves is read by nobody: the read deadline is set to now,
+// so net/http's reads of it fail at once, and the connection is closed
+// after the answer, as net/http closes one whose body it does not drain.
+// It runs before the first write and as the handler returns, once.
+func (p *pacedBody) drain() {
+	if p == nil || p.drained {
+		return
 	}
-	return p.deadline
+	p.drained = true
+	if !p.ended && !p.undrained && (p.length < 0 || p.length-p.got < drainBound) {
+		p.draining = true
+		_, _ = io.CopyN(io.Discard, p, drainBound+1)
+	}
+	if !p.ended {
+		_ = p.rc.SetReadDeadline(time.Now())
+	}
 }
 
-// pacedWriter writes each write in pieces of at most rate bytes, and sets
-// the write deadline before each: the timeout from when the write began,
-// or from when net/http's drain of the body ends at the latest if that is
-// later (pacedBody.drained), which the first write that reaches the
-// connection waits for, and a second for each rate bytes of the write
-// already written, as a read is credited only for the bytes it has read
+// pacedWriter drains what the handler left of the body before the first
+// write (pacedBody.drain), and writes each write in pieces of at most
+// rate bytes, setting the write deadline before each: the timeout from
+// when the write began, and a second for each rate bytes of it already
+// written, as a read is credited only for the bytes it has read
 // (IronGall-dev/irongall-client#413 item 2). So a peer that takes none of
 // an answer holds the connection the timeout and what the buffers between
-// took, whatever the answer's size would earn.
+// took, whatever the answer's size.
 type pacedWriter struct {
 	http.ResponseWriter
 	rc      *http.ResponseController
@@ -572,7 +601,8 @@ type pacedWriter struct {
 }
 
 func (p *pacedWriter) Write(b []byte) (int, error) {
-	start, n := p.body.drained(time.Now()), 0
+	p.body.drain()
+	start, n := time.Now(), 0
 	for {
 		_ = p.rc.SetWriteDeadline(start.Add(p.timeout + time.Duration(int64(n)/p.rate)*time.Second))
 		m, err := p.ResponseWriter.Write(b[n : n+int(min(int64(len(b)-n), p.rate))])

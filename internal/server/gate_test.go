@@ -21,13 +21,19 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
-// recorded is a request body that records whether anything read it.
+// recorded is a request body that records whether anything read it, and
+// whether anything read it before counted reported its call counted.
 type recorded struct {
-	r    io.Reader
-	read bool
+	r       io.Reader
+	read    bool
+	early   bool
+	counted func() bool
 }
 
 func (b *recorded) Read(p []byte) (int, error) {
+	if !b.read && b.counted != nil && !b.counted() {
+		b.early = true
+	}
 	b.read = true
 	return b.r.Read(p)
 }
@@ -90,7 +96,10 @@ func respelled(t *testing.T, pass string) string {
 // and one the server holds nothing of), the link page, a site's page and a
 // request no route answers are refused 429 requests, whatever the call
 // carries, with nothing else done: no other count of any limit taken, no
-// pass parsed or checked, no box looked up, no body read. The one call that
+// pass parsed or checked, no box looked up, nothing of its body read before
+// it was counted. What is read of the body after, the drain before its
+// answer (pacedBody.drain), is the connection's, as net/http's own drain
+// was (IronGall-dev/irongall-client#413 item 3). The one call that
 // goes on is a box's: a pass this process has checked, of a box that is
 // live, to a route that takes that box's pass (a send takes any box's, a
 // call about a box only its own, and the read of a box none:
@@ -216,6 +225,9 @@ func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 				req.Header.Set("Authorization", v.auth)
 			}
 			limits, passes := counts(t, reg, "irongalld_limit_requests_total"), counts(t, reg, "irongalld_passes_total")
+			body.counted = func() bool {
+				return moved(limits, counts(t, reg, "irongalld_limit_requests_total"))["decision=denied,limit=requests,subject=ip"] == 1
+			}
 			w := httptest.NewRecorder()
 			if tg.direct {
 				direct.ServeHTTP(w, req)
@@ -243,8 +255,8 @@ func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 			if d := moved(passes, counts(t, reg, "irongalld_passes_total")); len(d) != 0 {
 				t.Errorf("%s: passes looked at: %v", what, d)
 			}
-			if body.read {
-				t.Errorf("%s: its body was read", what)
+			if body.early {
+				t.Errorf("%s: its body was read before it was counted", what)
 			}
 		}
 	}
