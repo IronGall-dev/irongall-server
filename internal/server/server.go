@@ -73,9 +73,6 @@ type Server struct {
 	identityTypes []string
 	site          *Site
 	metrics       *Metrics
-	// longestPath is the longest path this server serves (served): the
-	// access log writes a method any longer as its length alone.
-	longestPath int
 
 	polls     *buckets // per box
 	pages     *buckets // per box: list pages after the first
@@ -157,25 +154,8 @@ func New(c Config) *Server {
 	if len(s.identityTypes) == 0 {
 		s.identityTypes = protocol.IdentityTypes()
 	}
-	s.longestPath = s.served()
 	s.metrics.watch(s)
 	return s
-}
-
-// served is the length of the longest path this server serves: a route's or
-// the link page's, each wildcard an address or a message id of 64 hex
-// characters, or a site's page.
-func (s *Server) served() int {
-	n := s.site.longestPath()
-	patterns := []string{linkRoute}
-	for _, r := range s.routes() {
-		patterns = append(patterns, r.pattern)
-	}
-	for _, p := range patterns {
-		_, path, _ := strings.Cut(p, " ")
-		n = max(n, len(wildcard.ReplaceAllString(path, strings.Repeat("0", 64))))
-	}
-	return n
 }
 
 // wildcard is a wildcard in a route's pattern.
@@ -1053,23 +1033,29 @@ func redacting(l *log.Logger) *log.Logger {
 }
 
 // loggedMethod is what the access log writes of a request's method: one of
-// the form methodName reads, or its length alone, as it is when it is longer
-// than the longest path this server serves, so a caller makes no line longer
-// (IronGall-dev/irongall-server#11). A token may hold digits and "-._!~|#",
-// and redact finds only an unbroken run of hex, so a method written as it
-// came could carry an address split by one character, or a name that reads
-// as one redact gives (#79).
-func loggedMethod(m string, longest int) string {
-	if len(m) > longest || !methodName.MatchString(m) {
+// the form methodName reads and no longer than longestMethod, or its length
+// alone, so a caller makes no line longer (IronGall-dev/irongall-server#11).
+// A token may hold digits and "-._!~|#", and redact finds only an unbroken
+// run of hex, so a method written as it came could carry an address split by
+// one character, or a name that reads as one redact gives (#79); and the
+// capitals A to F are hex, so a method of 64 of them would be written as such
+// a name (IronGall-dev/irongall-client#413 item 1).
+func loggedMethod(m string) string {
+	if len(m) > longestMethod || !methodName.MatchString(m) {
 		return fmt.Sprintf("(a method of %d bytes)", len(m))
 	}
 	return m
 }
 
 // methodName is the form of every method the IANA HTTP Method Registry
-// lists (read 2026-10-22), "*", which it reserves, aside: capitals and
-// hyphens, which spell no address in lower case and no name redact gives.
+// lists (read 2026-10-24), "*", which it reserves, aside: capitals and
+// hyphens.
 var methodName = regexp.MustCompile(`\A[A-Z][A-Z-]*\z`)
+
+// longestMethod is the length of the longest method that registry lists,
+// UPDATEREDIRECTREF: no method written as it came is long enough to hold a
+// run redact reads, so none is written as a name redact gives.
+const longestMethod = len("UPDATEREDIRECTREF")
 
 // loggedPath is what the access log writes of a request's path, built from
 // what the routers matched and never from the path as sent or decoded: the
@@ -1141,7 +1127,7 @@ func (s *Server) observed(h http.Handler) http.Handler {
 		h.ServeHTTP(sw, r)
 		took := time.Since(start)
 		if s.log != nil {
-			s.log.Printf("%s %s %d %s", loggedMethod(r.Method, s.longestPath), loggedPath(r), sw.status, took.Round(time.Microsecond))
+			s.log.Printf("%s %s %d %s", loggedMethod(r.Method), loggedPath(r), sw.status, took.Round(time.Microsecond))
 		}
 		s.metrics.answered(r.Pattern, sw.status, sw.code, took)
 	})

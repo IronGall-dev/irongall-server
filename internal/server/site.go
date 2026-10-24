@@ -130,22 +130,6 @@ func LoadSite(dir string) (*Site, error) {
 	return s, nil
 }
 
-// longestPath is the length of the longest path the site answers, 0 for no
-// site.
-func (s *Site) longestPath() int {
-	if s == nil {
-		return 0
-	}
-	n := 0
-	for p := range s.pages {
-		n = max(n, len(p))
-	}
-	for p := range s.dirs {
-		n = max(n, len(p))
-	}
-	return n
-}
-
 // entityTag is a strong ETag of b: its hash.
 func entityTag(b []byte) string {
 	sum := sha256.Sum256(b)
