@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -43,6 +44,31 @@ func served(t *testing.T, s *Server, l Limits) (string, *atomic.Int64) {
 	closed := new(atomic.Int64)
 	srv := HTTPServer("", s.Handler(), l, time.Minute)
 	srv.ConnState = func(_ net.Conn, st http.ConnState) {
+		if st == http.StateClosed || st == http.StateHijacked {
+			closed.Add(1)
+		}
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return ln.Addr().String(), closed
+}
+
+// servedSmall is served, with each connection's send buffer at its
+// smallest, so an answer of more than a few KiB waits on its peer: what
+// the write deadline holds is then what a test sees, not what the kernel's
+// buffers took.
+func servedSmall(t *testing.T, s *Server, l Limits) (string, *atomic.Int64) {
+	t.Helper()
+	closed := new(atomic.Int64)
+	srv := HTTPServer("", s.Handler(), l, time.Minute)
+	srv.ConnState = func(c net.Conn, st http.ConnState) {
+		if st == http.StateNew {
+			_ = c.(*net.TCPConn).SetWriteBuffer(4096)
+		}
 		if st == http.StateClosed || st == http.StateHijacked {
 			closed.Add(1)
 		}
@@ -324,7 +350,10 @@ func TestAnAnswerNeverReadIsCut(t *testing.T) {
 
 // An honest slow reader of a large page is not cut: each write moves the
 // deadline on, so a peer that keeps reading gets the whole page however
-// long it takes, as a body that keeps coming does.
+// long it takes, as a body that keeps coming does. Each write has a clock of
+// its own, from when it began (pacedWriter): this reader takes the page at a
+// third of -body-min-rate, and the page waits on it, so a clock for the
+// whole answer would cut it.
 func TestASlowReaderIsNotCut(t *testing.T) {
 	page := make([]byte, 1<<20)
 	if _, err := rand.Read(page); err != nil {
@@ -336,8 +365,11 @@ func TestASlowReaderIsNotCut(t *testing.T) {
 	}
 	l := pacedLimits()
 	s := New(Config{Store: NewMemStore(time.Now), Limits: l, Site: site})
-	addr, _ := served(t, s, l)
-	conn, err := net.Dial("tcp", addr)
+	addr, _ := servedSmall(t, s, l)
+	d := net.Dialer{Control: func(_, _ string, rc syscall.RawConn) error {
+		return rc.Control(func(fd uintptr) { _ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4096) })
+	}}
+	conn, err := d.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,5 +496,103 @@ func TestOptionsStarIsCounted(t *testing.T) {
 		if !ok || !strings.HasPrefix(got, "HTTP/1.1 "+want+" ") {
 			t.Errorf("OPTIONS *: %.40q, want %s", got, want)
 		}
+	}
+}
+
+// A write is credited only for the bytes it has already written, in pieces
+// of at most -body-min-rate, as a read is (IronGall-dev/irongall-client#413
+// item 2): each piece goes out under the deadline the pieces before it
+// earned, from -body-timeout after the write began, so a peer that takes
+// none of an answer is cut at -body-timeout and what the buffers between
+// took, whatever the answer's size would earn.
+func TestAWriteIsCreditedOnlyForTheBytesItHasWritten(t *testing.T) {
+	l := relaxed()
+	l.BodyTimeout, l.BodyMinRate = time.Second, 1000
+	s := New(Config{Store: NewMemStore(time.Now), Limits: l})
+	answer := make([]byte, 40*l.BodyMinRate+1)
+	h := s.paced(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(answer) }))
+	w := &deadlines{header: http.Header{}}
+	before := time.Now()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+	after := time.Now()
+	if len(w.writes) == 0 {
+		t.Fatal("nothing written")
+	}
+	first, written := w.writes[0].deadline, 0
+	if first.Before(before.Add(l.BodyTimeout)) || first.After(after.Add(l.BodyTimeout)) {
+		t.Errorf("the first piece's deadline is %v past the write, want -body-timeout, %v", first.Sub(before).Round(time.Millisecond), l.BodyTimeout)
+	}
+	for i, p := range w.writes {
+		if p.n > l.BodyMinRate {
+			t.Errorf("piece %d is %d bytes, more than -body-min-rate, %d", i, p.n, l.BodyMinRate)
+		}
+		if want := first.Add(time.Duration(written/l.BodyMinRate) * time.Second); !p.deadline.Equal(want) {
+			t.Errorf("piece %d, after %d bytes: its deadline is %v past the first's, want %v", i, written, p.deadline.Sub(first), want.Sub(first))
+		}
+		written += p.n
+	}
+	if written != len(answer) {
+		t.Errorf("%d of %d bytes written", written, len(answer))
+	}
+}
+
+// deadlines is a ResponseWriter that keeps each write's length and the write
+// deadline set before it, which a connection would hold that write to.
+type deadlines struct {
+	header   http.Header
+	deadline time.Time
+	writes   []struct {
+		n        int
+		deadline time.Time
+	}
+}
+
+func (d *deadlines) Header() http.Header { return d.header }
+func (d *deadlines) WriteHeader(int)     {}
+func (d *deadlines) Write(b []byte) (int, error) {
+	d.writes = append(d.writes, struct {
+		n        int
+		deadline time.Time
+	}{len(b), d.deadline})
+	return len(b), nil
+}
+func (d *deadlines) SetWriteDeadline(t time.Time) error { d.deadline = t; return nil }
+func (d *deadlines) SetReadDeadline(time.Time) error    { return nil }
+
+// A peer that takes none of a fetch holds the connection -body-timeout and
+// what the buffers between took, never what the ciphertext's size would
+// earn (IronGall-dev/irongall-client#413 item 2): the fetch writes the whole
+// ciphertext in one write, which was credited for all of it before any of
+// it moved. At this -body-min-rate the ciphertext would earn a minute.
+func TestAFetchNeverReadIsCutWhateverItsSize(t *testing.T) {
+	l := relaxed()
+	l.BodyTimeout, l.BodyMinRate, l.MaxSize = time.Second, 8<<10, 1<<20
+	e := newEnv(t, l)
+	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
+	body := strings.Repeat("a message that is never read. ", 17000) // its ciphertext is larger
+	if len(body) < 60*l.BodyMinRate {
+		t.Fatalf("a message of %d bytes earns less than a minute", len(body))
+	}
+	m := send(t, a, b, body)
+	pass := e.pass(b)
+	addr, closed := servedSmall(t, e.server, l)
+	d := net.Dialer{Control: func(_, _ string, rc syscall.RawConn) error {
+		return rc.Control(func(fd uintptr) { _ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 1024) })
+	}}
+	conn, err := d.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := io.WriteString(conn, "GET /v1/"+b.Address().String()+"/messages/"+m.ID+" HTTP/1.1\r\nHost: "+e.name()+"\r\nAuthorization: "+pass+"\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for closed.Load() == 0 && time.Since(start) < 8*time.Second {
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Logf("a message of %d bytes: closed by the server %v, after %v", len(body), closed.Load() != 0, time.Since(start).Round(10*time.Millisecond))
+	if closed.Load() == 0 {
+		t.Errorf("a fetch never read, of more than %d bytes at -body-min-rate %d: the connection is held past 8 s", len(body), l.BodyMinRate)
 	}
 }
