@@ -836,12 +836,45 @@ func (s *Server) spendRequest(r *http.Request) *problem {
 	return nil
 }
 
-// spendRegistration spends a registration of the caller's address: of its
-// IPv4 address or IPv6 /64, and of its IPv6 /48, as Let's Encrypt counts new
-// accounts (IronGall-dev/irongall-server#57). Each is reserved before the
-// other is kept, so a refusal by one spends neither; a refusal gives the
-// longer wait of the two (longest). why is said after the refusal's words.
+// spendRegistration spends a registration of the caller's address
+// (reserveRegistration), kept at once.
 func (s *Server) spendRegistration(r *http.Request, why string) error {
+	g, err := s.reserveRegistration(r, why)
+	if err != nil {
+		return err
+	}
+	g.keep()
+	return nil
+}
+
+// registration is a registration's two counts, reserved: of its caller's
+// IPv4 address or IPv6 /64, and of its IPv6 /48 (reserveRegistration). A
+// count that never limits, or an IPv4 address's /48, is nil, which settles
+// as nothing.
+type registration struct{ byIP, byRange *reservation }
+
+// keep settles both counts as counted.
+func (g registration) keep() {
+	g.byRange.keep()
+	g.byIP.keep()
+}
+
+// release gives both counts back. Either does nothing to counts already
+// settled, so a defer made where they are reserved releases them on every
+// path, a panic included.
+func (g registration) release(now time.Time) {
+	g.byRange.release(now)
+	g.byIP.release(now)
+}
+
+// reserveRegistration reserves a registration of the caller's address: of
+// its IPv4 address or IPv6 /64, and of its IPv6 /48, as Let's Encrypt counts
+// new accounts (IronGall-dev/irongall-server#57), before the work they
+// guard, to be kept or given back once its outcome is known (LIMITS.md rule
+// 4). Each is reserved before the other is settled, so a refusal by one
+// spends neither; a refusal gives the longer wait of the two (longest). why
+// is said after the refusal's words.
+func (s *Server) reserveRegistration(r *http.Request, why string) (registration, error) {
 	host := s.clientIP(r)
 	ip, block := ipKey(host), rangeKey(host)
 	byIP, ok, wait := s.regs.reserve(r.Context(), ip, s.now)
@@ -852,19 +885,24 @@ func (s *Server) spendRegistration(r *http.Request, why string) error {
 				p = rateLimited(protocol.QuotaRegistrationsRange, w, "too many registrations from this address's IPv6 /48"+why)
 			}
 		}
-		return p
+		return registration{}, p
 	}
-	defer func() { byIP.release(s.now()) }() // settled below, but for a panic
+	g := registration{byIP: byIP}
+	reserved := false
+	defer func() { // settled by the caller, but for a panic here
+		if !reserved {
+			byIP.release(s.now())
+		}
+	}()
 	if block != "" {
 		byRange, ok, wait := s.rangeRegs.reserve(r.Context(), block, s.now)
 		if !ok {
-			byIP.release(s.now())
-			return rateLimited(protocol.QuotaRegistrationsRange, wait, "too many registrations from this address's IPv6 /48"+why)
+			return registration{}, rateLimited(protocol.QuotaRegistrationsRange, wait, "too many registrations from this address's IPv6 /48"+why)
 		}
-		byRange.keep()
+		g.byRange = byRange
 	}
-	byIP.keep()
-	return nil
+	reserved = true
+	return g, nil
 }
 
 // perDay is one of a box's numbers a day: its buckets, the number, and the

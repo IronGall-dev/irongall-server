@@ -263,18 +263,110 @@ func TestAStatementOutOfOrderIsRefusedBeforeItsSignature(t *testing.T) {
 	e.want(e.do(http.MethodGet, "/v1/"+nobody.String(), nil, ""), http.StatusNotFound, protocol.CodeNoSuchMailbox) // the address's one miss is still there
 }
 
-// Registration never changes a box, so a box the process holds is answered
-// from its record: anything but the identical registration is 409 with no
-// check, and spends nothing of its address's registrations.
-func TestAnExistingBoxIsAnsweredFromItsRecord(t *testing.T) {
+// Registration never changes a box, so a registered box is answered from its
+// record whether this process holds it or reads it, and spends nothing of its
+// address's registrations (PROTOCOL.md §13, the order of refusals;
+// IronGall-dev/irongall-client#410): with the address's one registration
+// spent, the box's identical retry is 200, and another statement is 409 with
+// no check, signed or not, with a pass or none.
+func TestARegisteredBoxIsAnsweredWhateverItsAddressSpentOfRegistrations(t *testing.T) {
+	for name, with := range map[string][]func(*Config){
+		"a box this process holds":         nil,
+		"a box this process does not hold": {func(c *Config) { c.Store = unknownStore{c.Store} }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := relaxed()
+			l.RegistrationsPerHour = 1
+			e := newEnv(t, l, with...)
+			r := e.raw().register(protocol.MaxPrekeyLifetime) // the address's one registration
+			r.prekey(2, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+			unsigned := r.registration(1)
+			unsigned.PrekeySignature = []byte("not a signature")
+			retry := e.do("PUT", r.path(""), r.registration(1), r.pass(1))
+			another := e.do("PUT", r.path(""), r.registration(2), r.pass(2))
+			if retry.status != http.StatusOK || another.status != http.StatusConflict || another.code() != protocol.CodeConflict {
+				t.Fatalf("retry %d %s, another statement %d %s: want 200, and 409 conflict", retry.status, retry.code(), another.status, another.code())
+			}
+			e.want(e.do("PUT", r.path(""), unsigned, ""), http.StatusConflict, protocol.CodeConflict)
+		})
+	}
+}
+
+// failedReads is a store whose reads of an address fail while fail is set,
+// as a store that cannot be reached.
+type failedReads struct {
+	Store
+	fail atomic.Bool
+}
+
+func (s *failedReads) Box(ctx context.Context, a protocol.Address) (*Box, error) {
+	if s.fail.Load() {
+		return nil, errors.New("the store cannot be reached")
+	}
+	return s.Store.Box(ctx, a)
+}
+
+// A registration's read of an address its process's memory cannot answer is
+// counted once, as what it turns out to be (LIMITS.md rule 4; register;
+// IronGall-dev/irongall-client#410). The registrations it would spend, of
+// the address and of its /48, are reserved before the read and given back
+// when it finds a box or a revocation, or fails, and kept when it finds
+// nothing; it reserves no miss. Where they are spent, the read is a
+// lookup's, under a miss: given back when it finds a box or a revocation,
+// and kept when it finds nothing, which is refused for the registrations.
+// With the misses spent too, the read is refused for them.
+func TestARegistrationsReadIsCountedAsWhatItFinds(t *testing.T) {
+	const ip = "2001:db8:7:7::1"
 	l := relaxed()
-	l.RegistrationsPerHour = 1
-	e := newEnv(t, l)
-	r := e.raw().register(protocol.MaxPrekeyLifetime) // the address's one registration
-	other := r.registration(1)
-	other.PrekeySignature = []byte("not a signature")
-	e.want(e.do("PUT", r.path(""), other, ""), http.StatusConflict, protocol.CodeConflict)
-	e.want(e.do("PUT", r.path(""), r.registration(1), r.pass(1)), http.StatusOK, "")
+	l.RegistrationsPerHour, l.RangeRegistrationsPerHour, l.MissesPerMinute = 2, 2, 1
+	reads := &failedReads{}
+	e := newEnv(t, l, func(c *Config) { reads.Store, c.Store = c.Store, unknownStore{reads} })
+	call := e.caller()
+	fresh := func() *raw {
+		r := e.raw()
+		r.prekey(1, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+		return r
+	}
+	register := func(r *raw) reply { return call(ip, "PUT", r.path(""), r.registration(1), r.pass(1)) }
+	box, gone := fresh(), fresh()
+	e.want(register(box), http.StatusCreated, "") // the first of the two
+	e.want(call("192.0.2.70", "PUT", gone.path(""), gone.registration(1), gone.pass(1)), http.StatusCreated, "")
+	rev, err := protocol.SignRevocation(gone.signer, gone.id.Address())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.want(call("192.0.2.70", "PUT", gone.path("/revocations"), protocol.Revocations{Identity: gone.id.Document(), Revocation: rev}, ""), http.StatusCreated, "")
+	box.prekey(2, e.clock.Now().Add(protocol.MaxPrekeyLifetime), nil)
+	// answered is the box's identical retry, another statement, and a
+	// registration of the revoked address, each answered from what is kept.
+	answered := func() {
+		t.Helper()
+		e.want(register(box), http.StatusOK, "")
+		e.want(call(ip, "PUT", box.path(""), box.registration(2), box.pass(2)), http.StatusConflict, protocol.CodeConflict)
+		e.want(register(gone), http.StatusGone, protocol.CodeRevoked)
+	}
+
+	// One registration left: what finds a box or a revocation gives it back,
+	// and so does a read that fails.
+	for range 3 {
+		answered()
+	}
+	failing := fresh()
+	reads.fail.Store(true)
+	e.want(register(failing), http.StatusServiceUnavailable, protocol.CodeUnavailable)
+	reads.fail.Store(false)
+	e.want(register(failing), http.StatusCreated, "") // the second of the two
+
+	// None left: the read is a lookup's, under the one miss, which a box or
+	// a revocation found gives back.
+	for range 3 {
+		answered()
+	}
+	e.limited(register(fresh()), protocol.QuotaRegistrations) // nothing found: the miss kept
+	e.limited(register(fresh()), protocol.QuotaMisses)
+	e.limited(register(box), protocol.QuotaMisses) // the retry is deferred by the misses, never refused for the registrations
+	e.clock.Add(time.Minute)                       // the miss back, no registration
+	e.want(register(box), http.StatusOK, "")
 }
 
 // A revocation of certificates through a serial no higher than the one held
@@ -393,22 +485,30 @@ func forgedFromPublic(t *testing.T, e *env, a protocol.Address) (protocol.Regist
 	return protocol.RegisterRequest{Identity: br.Identity, Prekey: br.Prekey, PrekeySignature: br.PrekeySignature}, pass
 }
 
-// A registration of a box this process holds is answered from its record,
-// before the registrations count, so its pass is checked as any call's is:
-// one the process has not seen reserves a miss of its caller's address,
-// kept when it fails (IronGall-dev/irongall-server#40). Past the misses it
-// is refused before it is checked, as on any other route.
+// A registration of a registered box is answered from its record, before the
+// registrations count, whether this process holds the box or reads it, so its
+// pass is checked as any call's is: one the process has not seen reserves a
+// miss of its caller's address, kept when it fails
+// (IronGall-dev/irongall-server#40). Past the misses it is refused before it
+// is checked, as on any other route.
 func TestAnIdenticalRetrysPassIsCounted(t *testing.T) {
-	l := relaxed()
-	l.MissesPerMinute = 2
-	e := newEnv(t, l)
-	r := e.raw().register(protocol.MaxPrekeyLifetime)
-	reg, forged := forgedFromPublic(t, e, r.id.Address())
-	for range 2 {
-		e.want(e.do("PUT", r.path(""), reg, forged), http.StatusUnauthorized, protocol.CodeUnauthorized)
+	for name, with := range map[string][]func(*Config){
+		"a box this process holds":         nil,
+		"a box this process does not hold": {func(c *Config) { c.Store = unknownStore{c.Store} }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := relaxed()
+			l.MissesPerMinute = 2
+			e := newEnv(t, l, with...)
+			r := e.raw().register(protocol.MaxPrekeyLifetime)
+			reg, forged := forgedFromPublic(t, e, r.id.Address())
+			for range 2 {
+				e.want(e.do("PUT", r.path(""), reg, forged), http.StatusUnauthorized, protocol.CodeUnauthorized)
+			}
+			e.limited(e.do("PUT", r.path(""), reg, forged), protocol.QuotaMisses)
+			e.limited(e.do("GET", r.path("/acl"), nil, forged), protocol.QuotaMisses)
+		})
 	}
-	e.limited(e.do("PUT", r.path(""), reg, forged), protocol.QuotaMisses)
-	e.limited(e.do("GET", r.path("/acl"), nil, forged), protocol.QuotaMisses)
 }
 
 // An identical retry of a registration, once its pass is checked, spends one

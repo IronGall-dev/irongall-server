@@ -24,11 +24,21 @@ const hintDocument = "the identity document is \"irongall-v1\", LF, one SSH publ
 // register is PUT /v1/<address> (PROTOCOL.md §3). It is a call of a box that
 // does not exist yet, so its address pays for it: its body is read only once
 // the call has spent one of its address's flood budget at the gate, as a
-// revocation's is. A box this process does not already hold is read only
-// after the address's count of registrations, and the statement and the pass
-// it carries are checked only once that read shows no box registered and the
-// address not revoked: either is answered from its record, in memory or read
-// (PROTOCOL.md §3 step 5).
+// revocation's is.
+//
+// Registration never changes a box, so what is kept of the address is read
+// before any signature, and a box registered there, or an address revoked,
+// is answered from it, held in memory or read, by one path (registered),
+// spending none of the address's registrations (PROTOCOL.md §13, the order
+// of refusals; IronGall-dev/irongall-client#410). Memory answers with
+// nothing counted. A read is counted once, as what it turns out to be: the
+// registrations it would spend, the address's and its /48's, are reserved
+// before it, given back if it finds a box or a revocation, and kept if it
+// finds nothing, when they bound the statement's signatures and the pass
+// that follow. Where they are spent, the read is a lookup's, a miss of the
+// caller's address reserved for it (lookup): nothing found is refused for
+// the registrations, its miss kept, and a read the misses refuse is refused
+// for them.
 //
 // A registration is held to what is kept of the address, box or none: 410
 // while the address is revoked, and nothing under a certificate its identity
@@ -61,26 +71,43 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	case err != nil:
 		return failErr(protocol.CodeBadKey, "make a new identity: irongall init in a new box", err)
 	}
-	// Registration never changes a box, so a box this process holds is
-	// answered from its record, before the registrations count and the
-	// statement's signatures; so is an address its identity revoked.
-	if cur, ok := s.store.Known(h); ok && settled(cur) {
+	// A box registered, or an address its identity revoked, is answered from
+	// what is kept of the address, whatever the statement and however many
+	// registrations the address has spent (PROTOCOL.md §13, the order of
+	// refusals): from memory, with nothing counted, or from one read.
+	cur, known := s.store.Known(h)
+	if known && settled(cur) {
 		return s.registered(w, r, id, cur, &req, false)
 	}
-	if err := s.spendRegistration(r, ""); err != nil {
-		return err
+	// The read is counted as what it turns out to be: under the
+	// registrations it would spend, reserved before it, given back if it
+	// finds a box or a revocation and kept if it finds nothing (LIMITS.md
+	// rule 4). Where they are spent it is a lookup's, under a miss, and only
+	// a box or a revocation it finds answers: nothing found is refused for
+	// the registrations, and its miss is kept.
+	g, refused := s.reserveRegistration(r, "")
+	if refused != nil {
+		read, err := s.lookup(r, h)
+		switch {
+		case err != nil:
+			return err
+		case settled(read):
+			return s.registered(w, r, id, read, &req, false)
+		}
+		return refused
 	}
-	// The counts just taken bound what follows: no count of misses is needed.
-	// What is kept of the address is read first, so a box registered, or an
-	// address revoked, is answered from it as one in memory is, whatever the
-	// statement (PROTOCOL.md §3 step 5).
-	cur, err := s.box(r.Context(), h)
+	defer func() { g.release(s.now()) }() // settled below, but for a panic
+	cur, err = s.box(r.Context(), h)
 	if err != nil {
 		return err
 	}
 	if settled(cur) {
-		return s.registered(w, r, id, cur, &req, true)
+		g.release(s.now())
+		return s.registered(w, r, id, cur, &req, false)
 	}
+	// A registration that would make a box: the counts kept here bound the
+	// signatures and the pass that follow, which reserve no miss of their own.
+	g.keep()
 	p, cert, err := s.checkPrekey(id, req.Prekey, req.PrekeySignature)
 	if err != nil {
 		return err
@@ -167,11 +194,15 @@ func settled(b *Box) bool { return b.open() || b != nil && b.State == Revoked }
 // again included, so it is refused before the pass, as a prekey upload's
 // identical retry is (PROTOCOL.md §6.3a).
 //
-// bounded is true where the registrations count was taken first, and bounds
-// the pass's check (checkPassBounded). Where it was not, a box this process
-// holds, the retry is a renewal's identical retry in all but its route: a
-// miss is reserved before its pass (checkPass), and the box's calls are spent
-// once it passes.
+// A registration answered from what is kept of its address, held in memory
+// or read, spends no registrations count, so the retry is a renewal's
+// identical retry in all but its route: a miss is reserved before its pass
+// (checkPass), and the box's calls are spent once it passes. bounded is true
+// for the one registration that meets a box at its write, registered by
+// another request meanwhile or by its own write whose outcome is unknown:
+// its registrations counts were taken, and they bound the pass's check
+// (checkPassBounded), which its own statement's pass has passed already
+// where the box is the one it sent.
 func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol.Identity, cur *Box, req *protocol.RegisterRequest, bounded bool) error {
 	switch {
 	case cur.State == Revoked:
@@ -193,7 +224,13 @@ func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol
 		if err := s.checkPass(r, cur.Addr, key, cur.Cert, cur.CertSerial, nil); err != nil {
 			return err
 		}
-		if err := s.spendOwner(r.Context(), cur.Addr); err != nil {
+		// The box's calls, with whatever its account lifts, read from the
+		// record this answers from: the address is read no second time.
+		lim, err := s.limitsFor(r.Context(), cur)
+		if err != nil {
+			return err
+		}
+		if err := s.spendCall(cur.Addr, lim); err != nil {
 			return err
 		}
 	}

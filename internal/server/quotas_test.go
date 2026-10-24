@@ -75,7 +75,11 @@ func TestEveryRefusalNamesItsLimit(t *testing.T) {
 	e.want(e.do("GET", "/v1/"+strings.Repeat("1", 64), nil, ""), http.StatusNotFound, protocol.CodeNoSuchMailbox)
 	e.limited(e.do("GET", "/v1/"+strings.Repeat("2", 64), nil, ""), protocol.QuotaMisses)
 
-	// The registration came from this address, so its count is spent.
+	// The registration came from this address, so its count is spent. With
+	// it spent, a registration's read of its address is a lookup's, under a
+	// miss: the misses come back first, so that read is made and finds
+	// nothing.
+	e.clock.Add(time.Minute)
 	r := e.raw()
 	r.prekey(1, e.clock.Now().Add(protocol.PrekeyLifetime), nil)
 	e.limited(e.do("PUT", r.path(""), r.registration(1), r.pass(1)), protocol.QuotaRegistrations)

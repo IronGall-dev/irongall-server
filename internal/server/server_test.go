@@ -562,10 +562,11 @@ func (s *boxReads) Box(ctx context.Context, a protocol.Address) (*Box, error) {
 }
 
 // A registration that memory cannot answer reads what is kept of its address
-// once, under the count of registrations, and no more: one that makes a box,
-// one of an address whose identity revoked certificates before it had a box,
-// and one answered from a registered box's record (PROTOCOL-SERVER.md § 3;
-// IronGall-dev/irongall-server#94).
+// once, under the registrations it would spend, reserved before the read, and
+// no more: one that makes a box, one of an address whose identity revoked
+// certificates before it had a box, and one answered from a registered box's
+// record (register; IronGall-dev/irongall-server#94,
+// IronGall-dev/irongall-client#410).
 func TestARegistrationReadsItsAddressOnce(t *testing.T) {
 	reads := &boxReads{}
 	e := newEnv(t, relaxed(), func(c *Config) { reads.Store, c.Store = c.Store, unknownStore{reads} })

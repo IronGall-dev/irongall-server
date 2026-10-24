@@ -4,11 +4,10 @@ package server
 //
 // Every certificate_not_current to a pass names, in certificate_serial, the
 // certificate the call takes a pass under, at each caller of checkPass and
-// checkPassBounded: register for a new box, registered with the count of
-// registrations taken and without it, prekey's identical retry and its
-// upload, owner and sender. Each test below reaches one caller, and both of
-// passCheck's refusals where a caller can reach the second (a record that
-// does not verify).
+// checkPassBounded: register for a new box, registered for a box held in
+// memory or read, prekey's identical retry and its upload, owner and sender.
+// Each test below reaches one caller, and both of passCheck's refusals where
+// a caller can reach the second (a record that does not verify).
 //
 // A box whose current certificate its identity revoked is answered
 // certificate_revoked from its record before any pass is checked, at every
@@ -32,8 +31,9 @@ import (
 
 // unknownStore is a store whose memory holds no record (Known), as a
 // process's that has not loaded the box: a registration of a box that exists
-// then takes the registrations count first and reads the record, and is
-// answered by registered with bounded true.
+// then reads the record, under the registrations it would spend, which it
+// gives back, and is answered from it by registered, as one held in memory
+// is.
 type unknownStore struct{ Store }
 
 func (unknownStore) Known(protocol.Address) (*Box, bool) { return nil, false }
@@ -135,7 +135,7 @@ func TestARegistrationOfANewBoxNamesItsStatementsCertificate(t *testing.T) {
 	e.want(e.do("PUT", m.path(""), m.registration(5), m.pass(5)), 201, "")
 }
 
-// registered, bounded: a registration of a box that exists, which this
+// registered, read: a registration of a box that exists, which this
 // process's memory does not hold, names the box's current certificate, for a
 // pass under another certificate and for a record that does not verify.
 func TestARegistrationOfABoxNotInMemoryNamesItsCurrentCertificate(t *testing.T) {
