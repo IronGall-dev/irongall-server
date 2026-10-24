@@ -686,25 +686,11 @@ func required(fields ...any) error {
 func detached(ctx context.Context) context.Context { return context.WithoutCancel(ctx) }
 
 // mayHaveApplied reports whether a store write that returned err may have
-// been applied all the same: anything but a refusal stated (LIMITS.md rule
-// 4), by the store (ErrStale, ErrExists, ErrNotFound, ErrKeyRefused, and a
-// send whose body was not stored, errNotStored) or by AWS to the call itself
-// (a throttle, and any answer of 4xx whatever fault the SDK gives it: those
-// of DynamoDB's refusals the SDK does not model carry none). A write the SDK
-// retried after an attempt that left open whether it was applied
-// (retriedAfter) is no stated refusal, whatever its last attempt answered. A
-// count reserved for the write is kept then, never given back
-// (IronGall-dev/irongall-server#14, #89, #90).
-func mayHaveApplied(err error) bool {
-	if errors.As(err, new(retriedAfter)) {
-		return true
-	}
-	if errors.Is(err, ErrStale) || errors.Is(err, ErrExists) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrKeyRefused) || errors.Is(err, errNotStored) || IsThrottle(err) {
-		return false
-	}
-	var status interface{ HTTPStatusCode() int }
-	return !errors.As(err, &status) || status.HTTPStatusCode() < 400 || status.HTTPStatusCode() >= 500
-}
+// been applied all the same, so that a count reserved for it is kept, never
+// given back (LIMITS.md rule 4; IronGall-dev/irongall-server#14, #89, #90):
+// what the store's one choke point for writes said, ErrUnknown, of anything
+// but a refusal stated (Memory.write).
+func mayHaveApplied(err error) bool { return errors.Is(err, ErrUnknown) }
 
 // box reads a box's record; a box that does not exist is nil, not an error.
 func (s *Server) box(ctx context.Context, a protocol.Address) (*Box, error) {

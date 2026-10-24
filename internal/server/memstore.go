@@ -11,12 +11,33 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
-// MemStore is the dev server's store: everything in memory, nothing
-// persisted. Expired messages and dedupe records vanish at their ExpiresAt.
-// A box's record stays past its Expires, as one in DynamoDB does until the
-// TTL deletes it, which may be days after: a test stands in for the TTL with
-// DeleteBox, which is the delete the TTL makes.
-type MemStore struct {
+// NewMemStore returns the dev server's store: Memory over a backend of maps
+// in this process (memBackend), on the given clock, nothing persisted.
+// Memory follows its feed from the start.
+func NewMemStore(now func() time.Time) *Memory {
+	s := newMemory(now, DefaultBoxCache, nil, nil)
+	b := newMemBackend(s.clock)
+	s.backend = b
+	_ = b.Start(context.Background(), s.apply) // it never fails
+	return s
+}
+
+// memBackend keeps what a store keeps in maps, as the DynamoDB backend
+// keeps it in tables: each write has the outcome its DynamoDB write would
+// have, and each change it makes goes to its feed. Expired messages and
+// dedupe records vanish at their ExpiresAt, as reads of the tables judge
+// expiry. A box's record stays past its Expires, as one in DynamoDB does
+// until the TTL deletes it, which may be days after: a test stands in for
+// the TTL with DeleteBox, which is the delete the TTL makes.
+//
+// Its feed hands each change a write made to apply at the start of the
+// backend's next write, in the order the writes were made, on that write's
+// goroutine (deliver). So the change comes after its writer has applied the
+// write's outcome to memory, as DynamoDB's stream brings a write back a
+// second or two after it, and no test waits on a goroutine for it. Reads
+// hand nothing over, so a read's token sees no write the read did not make
+// room for.
+type memBackend struct {
 	now func() time.Time
 
 	mu          sync.Mutex
@@ -26,6 +47,10 @@ type MemStore struct {
 	dedupe      map[protocol.Address]map[[32]byte]Header
 	accounts    map[string]*Account
 	keys        map[adoptKeyRef]*AdoptKey
+	pending     []Change // made since the last delivery, in order: under mu
+
+	feed  sync.Mutex // one delivery at a time, so changes go in order
+	apply func(Change)
 }
 
 type adoptKeyRef struct {
@@ -33,15 +58,14 @@ type adoptKeyRef struct {
 	hash    [32]byte
 }
 
+// memMessage is a live message: its header and its body.
 type memMessage struct {
-	h       Header
-	body    []byte
-	fetched bool // served to a fetch before
+	h    Header
+	body []byte
 }
 
-// NewMemStore returns an empty store on the given clock.
-func NewMemStore(now func() time.Time) *MemStore {
-	return &MemStore{
+func newMemBackend(now func() time.Time) *memBackend {
+	return &memBackend{
 		now:         now,
 		boxes:       map[protocol.Address]*Box{},
 		revocations: map[protocol.Address]*Revocations{},
@@ -52,144 +76,60 @@ func NewMemStore(now func() time.Time) *MemStore {
 	}
 }
 
-func cloneBox(b *Box) *Box {
-	c := *b
-	c.Retired = slices.Clone(b.Retired)
-	c.SenderKeyTypes = slices.Clone(b.SenderKeyTypes)
-	c.RevokedCerts, c.RevokedCertsSig = slices.Clone(b.RevokedCerts), slices.Clone(b.RevokedCertsSig)
-	c.ACL = cloneACL(b.ACL)
-	if b.Prekey != nil {
-		p := *b.Prekey
-		c.Prekey = &p
-	}
-	return &c
+// Start implements Backend: every change made from now on goes to apply.
+func (s *memBackend) Start(_ context.Context, apply func(Change)) error {
+	s.feed.Lock()
+	defer s.feed.Unlock()
+	s.apply = apply
+	return nil
 }
 
-// cloneACL copies an ACL, which a box record holds and nothing changes in
-// place: it is replaced whole.
-func cloneACL(a *protocol.ACL) *protocol.ACL {
-	if a == nil {
-		return nil
+// Ready implements Backend: the feed is in this process.
+func (s *memBackend) Ready() bool { return true }
+
+// changed records changes a write made, under mu, for the next delivery.
+func (s *memBackend) changed(c ...Change) { s.pending = append(s.pending, c...) }
+
+// deliver hands the changes made so far to the feed, in the order they were
+// made: each write calls it before it takes mu.
+func (s *memBackend) deliver() {
+	s.feed.Lock()
+	defer s.feed.Unlock()
+	s.mu.Lock()
+	cs := s.pending
+	s.pending = nil
+	s.mu.Unlock()
+	if s.apply == nil {
+		return
 	}
-	c := *a
-	c.Allow.Addrs, c.Deny.Addrs = slices.Clone(a.Allow.Addrs), slices.Clone(a.Deny.Addrs)
-	return &c
+	for _, c := range cs {
+		s.apply(c)
+	}
 }
 
-// record returns a's record, or nil.
-func (s *MemStore) record(a protocol.Address) *Box { return s.boxes[a] }
+// recordChange is the feed's change of a's record as it now is.
+func recordChange(rec *Box) Change {
+	return Change{Kind: RecordChange, Addr: rec.Addr, Box: cloneBox(rec)}
+}
 
-func (s *MemStore) viewLocked(a protocol.Address) *Box {
+// ReadAddress implements Backend.
+func (s *memBackend) ReadAddress(_ context.Context, a protocol.Address) (*Box, *Revocations, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var rec *Box
+	if b := s.boxes[a]; b != nil {
+		rec = cloneBox(b)
+	}
 	var rv *Revocations
 	if r, ok := s.revocations[a]; ok {
 		c := *r
 		rv = &c
 	}
-	return view(a, s.record(a), rv)
+	return rec, rv, nil
 }
 
-// Held implements Store: the dev store holds every box in memory.
-func (s *MemStore) Held(a protocol.Address) (Standing, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	b := s.viewLocked(a)
-	if b == nil {
-		return Standing{}, false
-	}
-	st, ok, err := b.standing()
-	return st, ok && err == nil
-}
-
-// Box implements Store.
-func (s *MemStore) Box(_ context.Context, a protocol.Address) (*Box, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if b := s.viewLocked(a); b != nil {
-		return b, nil
-	}
-	return nil, ErrNotFound
-}
-
-// Known implements Store: every box is in memory, and nothing remembers a
-// missing one, so each call naming one counts as a read would.
-func (s *MemStore) Known(a protocol.Address) (*Box, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	b := s.viewLocked(a)
-	return b, b != nil
-}
-
-// Begin implements Store: Known reads the store, so no read of it is older.
-func (s *MemStore) Begin(protocol.Address) uint64 { return 0 }
-
-// CreateBox implements Store.
-func (s *MemStore) CreateBox(_ context.Context, b *Box) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.record(b.Addr) != nil {
-		return ErrExists
-	}
-	if err := b.writable(); err != nil {
-		return err
-	}
-	if _, err := identityWire(b.Identity); err != nil {
-		return fmt.Errorf("the identity: %w", err)
-	}
-	b.Rev = 1
-	s.boxes[b.Addr] = storedRecord(b)
-	return nil
-}
-
-// UpdateBox implements Store.
-func (s *MemStore) UpdateBox(_ context.Context, b *Box) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := b.writable(); err != nil {
-		return err
-	}
-	cur := s.record(b.Addr)
-	if cur == nil || cur.Rev != b.Rev {
-		return ErrStale
-	}
-	b.Rev++
-	s.boxes[b.Addr] = storedRecord(b)
-	return nil
-}
-
-// storedRecord is what a store keeps of b as its record: none of what its
-// identity revoked, which is kept apart, and the state the record says.
-func storedRecord(b *Box) *Box {
-	c := cloneBox(b)
-	c.Revocation, c.RevokedCerts, c.RevokedCertsSig = nil, nil, nil
-	return c
-}
-
-// DeleteBox implements Store.
-func (s *MemStore) DeleteBox(_ context.Context, a protocol.Address) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.boxes, a)
-	return nil
-}
-
-// Revoke implements Store.
-func (s *MemStore) Revoke(_ context.Context, a protocol.Address, rv *Revocations) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cur, ok := s.revocations[a]
-	if !ok {
-		cur = &Revocations{}
-	}
-	if rv.Through > 0 && cur.Through >= rv.Through {
-		return ErrStale
-	}
-	c := *cur
-	c.merge(rv)
-	s.revocations[a] = &c
-	return nil
-}
-
-func (s *MemStore) live(box protocol.Address) map[[32]byte]*memMessage {
+// live is box's live messages at now, the expired dropped.
+func (s *memBackend) live(box protocol.Address) map[[32]byte]*memMessage {
 	now := s.now()
 	m := s.messages[box]
 	for id, msg := range m {
@@ -200,14 +140,90 @@ func (s *MemStore) live(box protocol.Address) map[[32]byte]*memMessage {
 	return m
 }
 
-// Dedupe implements Store.
-func (s *MemStore) Dedupe(_ context.Context, box protocol.Address, id [32]byte) (*Header, error) {
+// ReadLive implements Backend.
+func (s *memBackend) ReadLive(_ context.Context, box protocol.Address) ([]Header, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var hs []Header
+	for _, m := range s.live(box) {
+		hs = append(hs, m.h)
+	}
+	return hs, nil
+}
+
+// CreateBox implements Backend.
+func (s *memBackend) CreateBox(_ context.Context, b *Box) error {
+	s.deliver()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.boxes[b.Addr] != nil {
+		return ErrExists
+	}
+	if _, err := identityWire(b.Identity); err != nil {
+		return refused(fmt.Errorf("the identity: %w", err))
+	}
+	rec := storedRecord(b)
+	s.boxes[b.Addr] = rec
+	s.changed(recordChange(rec))
+	return nil
+}
+
+// UpdateBox implements Backend.
+func (s *memBackend) UpdateBox(_ context.Context, b *Box) error {
+	s.deliver()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur := s.boxes[b.Addr]
+	if cur == nil || cur.Rev != b.Rev {
+		return ErrStale
+	}
+	rec := storedRecord(b)
+	rec.Rev++
+	s.boxes[b.Addr] = rec
+	s.changed(recordChange(rec))
+	return nil
+}
+
+// DeleteBox implements Backend.
+func (s *memBackend) DeleteBox(_ context.Context, a protocol.Address) error {
+	s.deliver()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.boxes[a]; ok {
+		delete(s.boxes, a)
+		s.changed(Change{Kind: RecordChange, Addr: a, Gone: true})
+	}
+	return nil
+}
+
+// Revoke implements Backend.
+func (s *memBackend) Revoke(_ context.Context, a protocol.Address, rv *Revocations) (*Revocations, error) {
+	s.deliver()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.revocations[a]
+	if !ok {
+		cur = &Revocations{}
+	}
+	if rv.Through > 0 && cur.Through >= rv.Through {
+		return nil, ErrStale
+	}
+	c := *cur
+	c.merge(rv)
+	s.revocations[a] = &c
+	held, echo := c, c
+	s.changed(Change{Kind: RevocationsChange, Addr: a, Revocations: &echo})
+	return &held, nil
+}
+
+// Dedupe implements Backend.
+func (s *memBackend) Dedupe(_ context.Context, box protocol.Address, id [32]byte) (*Header, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.dedupeLocked(box, id)
 }
 
-func (s *MemStore) dedupeLocked(box protocol.Address, id [32]byte) (*Header, error) {
+func (s *memBackend) dedupeLocked(box protocol.Address, id [32]byte) (*Header, error) {
 	h, ok := s.dedupe[box][id]
 	if !ok || !s.now().Before(h.ExpiresAt) {
 		return nil, ErrNotFound
@@ -215,12 +231,14 @@ func (s *MemStore) dedupeLocked(box protocol.Address, id [32]byte) (*Header, err
 	return &h, nil
 }
 
-// PutMessage implements Store.
-func (s *MemStore) PutMessage(_ context.Context, box protocol.Address, h *Header, body []byte) (*Header, error) {
+// PutMessage implements Backend: an unexpired item of the id, live or
+// acked, refuses it, as the condition of DynamoDB's write does.
+func (s *memBackend) PutMessage(_ context.Context, box protocol.Address, h *Header, body []byte) error {
+	s.deliver()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if orig, err := s.dedupeLocked(box, h.ID); err == nil {
-		return orig, nil
+		return duplicate{orig}
 	}
 	if s.dedupe[box] == nil {
 		s.dedupe[box] = map[[32]byte]Header{}
@@ -230,7 +248,9 @@ func (s *MemStore) PutMessage(_ context.Context, box protocol.Address, h *Header
 	}
 	s.dedupe[box][h.ID] = *h
 	s.messages[box][h.ID] = &memMessage{h: *h, body: bytes.Clone(body)}
-	return nil, nil
+	echo := *h
+	s.changed(Change{Kind: MessageChange, Addr: box, Header: &echo, Live: true})
+	return nil
 }
 
 func less(a, b Header) int {
@@ -240,8 +260,8 @@ func less(a, b Header) int {
 	return bytes.Compare(a.ID[:], b.ID[:])
 }
 
-// List implements Store.
-func (s *MemStore) List(_ context.Context, box protocol.Address, after *Cursor, limit int) ([]Header, error) {
+// List implements Backend.
+func (s *memBackend) List(_ context.Context, box protocol.Address, after *Cursor, limit int) ([]Header, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var all []Header
@@ -258,9 +278,9 @@ func (s *MemStore) List(_ context.Context, box protocol.Address, after *Cursor, 
 	return all, nil
 }
 
-// Message implements Store: the body, or its bytes from byte from on, a
-// slice of what memory keeps.
-func (s *MemStore) Message(_ context.Context, box protocol.Address, id [32]byte, from int64) (*Header, []byte, error) {
+// Message implements Backend: the body, or its bytes from byte from on, a
+// slice of what the map keeps.
+func (s *memBackend) Message(_ context.Context, box protocol.Address, id [32]byte, from int64) (*Header, []byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m, ok := s.live(box)[id]
@@ -274,104 +294,60 @@ func (s *MemStore) Message(_ context.Context, box protocol.Address, id [32]byte,
 	return &h, bytes.Clone(body), nil
 }
 
-// DeleteMessage implements Store.
-func (s *MemStore) DeleteMessage(_ context.Context, box protocol.Address, id [32]byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	m := s.live(box)
-	if _, ok := m[id]; !ok {
-		return ErrNotFound
-	}
-	delete(m, id)
-	return nil
-}
-
-// DeleteMessages implements Store.
-func (s *MemStore) DeleteMessages(ctx context.Context, box protocol.Address) error {
-	return s.DeleteFrom(ctx, box, func(protocol.Address) bool { return true })
-}
-
-// DeleteFrom implements Store.
-func (s *MemStore) DeleteFrom(_ context.Context, box protocol.Address, from func(protocol.Address) bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	m := s.messages[box]
-	for id, msg := range m {
-		if from(msg.h.From) {
-			delete(m, id)
-		}
-	}
-	if len(m) == 0 {
-		delete(s.messages, box)
-	}
-	return nil
-}
-
-// Count implements Store.
-func (s *MemStore) Count(_ context.Context, box protocol.Address) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.live(box)), nil
-}
-
-// PairCount implements Store.
-func (s *MemStore) PairCount(_ context.Context, box, from protocol.Address) (int, time.Time, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var n int
-	var oldest time.Time
-	for _, m := range s.live(box) {
-		if m.h.From != from {
-			continue
-		}
-		n++
-		if oldest.IsZero() || m.h.ExpiresAt.Before(oldest) {
-			oldest = m.h.ExpiresAt
-		}
-	}
-	return n, oldest, nil
-}
-
-// After implements Store.
-func (s *MemStore) After(_ context.Context, box protocol.Address, c *Cursor) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	n := 0
-	for _, m := range s.live(box) {
-		if less(m.h, Header{ReceivedAt: c.ReceivedAt, ID: c.ID}) > 0 {
-			n++
-		}
-	}
-	return n, nil
-}
-
-// Holds implements Store.
-func (s *MemStore) Holds(_ context.Context, box protocol.Address, id [32]byte) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, ok := s.live(box)[id]
-	return ok, nil
-}
-
-// Fetched implements Store.
-func (s *MemStore) Fetched(_ context.Context, box protocol.Address, id [32]byte) (held, again bool, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// retireLocked takes a live message out of the list, its body with it, and
+// records the change. The caller holds mu.
+func (s *memBackend) retireLocked(box protocol.Address, id [32]byte) (time.Time, error) {
 	m, ok := s.live(box)[id]
 	if !ok {
-		return false, false, nil
+		return time.Time{}, ErrNotFound
 	}
-	again, m.fetched = m.fetched, true
-	return true, again, nil
+	delete(s.messages[box], id)
+	if len(s.messages[box]) == 0 {
+		delete(s.messages, box)
+	}
+	echo := m.h
+	s.changed(Change{Kind: MessageChange, Addr: box, Header: &echo})
+	return m.h.ReceivedAt, nil
 }
 
-func cloneAccount(a *Account) *Account {
-	c := *a
-	return &c
+// Retire implements Backend.
+func (s *memBackend) Retire(_ context.Context, box protocol.Address, id [32]byte) (time.Time, error) {
+	s.deliver()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.retireLocked(box, id)
 }
 
-// Account implements Store.
-func (s *MemStore) Account(_ context.Context, id string) (*Account, error) {
+// DeleteMessage implements Backend: the body and the item go together.
+func (s *memBackend) DeleteMessage(ctx context.Context, box protocol.Address, id [32]byte) (time.Time, error) {
+	return s.Retire(ctx, box, id)
+}
+
+// DeleteFrom implements Backend.
+func (s *memBackend) DeleteFrom(_ context.Context, box protocol.Address, from func(protocol.Address) bool, retired func([32]byte, time.Time)) error {
+	s.deliver()
+	type taken struct {
+		id       [32]byte
+		received time.Time
+	}
+	var out []taken
+	s.mu.Lock()
+	for id, msg := range s.live(box) {
+		if from(msg.h.From) {
+			if received, err := s.retireLocked(box, id); err == nil {
+				out = append(out, taken{id, received})
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, t := range out {
+		retired(t.id, t.received)
+	}
+	return nil
+}
+
+// Account implements Backend.
+func (s *memBackend) Account(_ context.Context, id string) (*Account, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.accounts[id]
@@ -381,20 +357,22 @@ func (s *MemStore) Account(_ context.Context, id string) (*Account, error) {
 	return cloneAccount(a), nil
 }
 
-// CreateAccount implements Store.
-func (s *MemStore) CreateAccount(_ context.Context, a *Account) error {
+// CreateAccount implements Backend.
+func (s *memBackend) CreateAccount(_ context.Context, a *Account) error {
+	s.deliver()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.accounts[a.ID]; ok {
 		return ErrExists
 	}
-	a.Rev = 1
 	s.accounts[a.ID] = cloneAccount(a)
+	s.changed(Change{Kind: AccountChange, AccountID: a.ID, Account: cloneAccount(a)})
 	return nil
 }
 
-// PutAdoptKey implements Store.
-func (s *MemStore) PutAdoptKey(_ context.Context, k *AdoptKey) error {
+// PutAdoptKey implements Backend. An adopt key is no change memory follows.
+func (s *memBackend) PutAdoptKey(_ context.Context, k *AdoptKey) error {
+	s.deliver()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ref := adoptKeyRef{k.Account, k.Hash}
@@ -406,8 +384,8 @@ func (s *MemStore) PutAdoptKey(_ context.Context, k *AdoptKey) error {
 	return nil
 }
 
-// AdoptKey implements Store.
-func (s *MemStore) AdoptKey(_ context.Context, account string, hash [32]byte) (*AdoptKey, error) {
+// AdoptKey implements Backend.
+func (s *memBackend) AdoptKey(_ context.Context, account string, hash [32]byte) (*AdoptKey, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k, ok := s.keys[adoptKeyRef{account, hash}]
@@ -418,11 +396,13 @@ func (s *MemStore) AdoptKey(_ context.Context, account string, hash [32]byte) (*
 	return &c, nil
 }
 
-// Adopt implements Store.
-func (s *MemStore) Adopt(_ context.Context, b *Box, account string, key [32]byte) error {
+// Adopt implements Backend: the record and the key's use in one step, as
+// DynamoDB's transaction.
+func (s *memBackend) Adopt(_ context.Context, b *Box, account string, key [32]byte) error {
+	s.deliver()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cur := s.record(b.Addr)
+	cur := s.boxes[b.Addr]
 	if cur == nil || cur.Rev != b.Rev {
 		return ErrStale
 	}
@@ -431,20 +411,25 @@ func (s *MemStore) Adopt(_ context.Context, b *Box, account string, key [32]byte
 		return ErrKeyRefused
 	}
 	k.Uses--
-	cur.Account, cur.Rev = account, cur.Rev+1
-	b.Account, b.Rev = account, cur.Rev
+	rec := cloneBox(cur)
+	rec.Account, rec.Rev = account, cur.Rev+1
+	s.boxes[b.Addr] = rec
+	s.changed(recordChange(rec))
 	return nil
 }
 
-// Leave implements Store.
-func (s *MemStore) Leave(_ context.Context, b *Box) error {
+// Leave implements Backend.
+func (s *memBackend) Leave(_ context.Context, b *Box) error {
+	s.deliver()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cur := s.record(b.Addr)
+	cur := s.boxes[b.Addr]
 	if cur == nil || cur.Rev != b.Rev {
 		return ErrStale
 	}
-	cur.Account, cur.Rev = "", cur.Rev+1
-	b.Account, b.Rev = "", cur.Rev
+	rec := cloneBox(cur)
+	rec.Account, rec.Rev = "", cur.Rev+1
+	s.boxes[b.Addr] = rec
+	s.changed(recordChange(rec))
 	return nil
 }

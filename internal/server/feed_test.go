@@ -138,10 +138,10 @@ func msgEvent(op stypes.OperationType, box protocol.Address, id byte, recvMs uin
 	}}
 }
 
-func feedFixture(t *testing.T) (*fakeStream, *feed, *DynamoStore, protocol.Address, uint64) {
+func feedFixture(t *testing.T) (*fakeStream, *feed, *Memory, protocol.Address, uint64) {
 	t.Helper()
 	now := time.Now()
-	s := &DynamoStore{idx: newIndex(), cache: newBoxCache(0), now: func() time.Time { return now }}
+	s := &Memory{idx: newIndex(), cache: newBoxCache(0), now: func() time.Time { return now }}
 	fs := &fakeStream{expire: map[string]bool{}}
 	f := &feed{streams: fs, interval: time.Hour, apply: s.applyMsgRecord, logf: func(string, ...any) {}, shards: map[string]*shard{}}
 	var box protocol.Address
@@ -153,7 +153,7 @@ func feedFixture(t *testing.T) (*fakeStream, *feed, *DynamoStore, protocol.Addre
 	return fs, f, s, box, ms(now)
 }
 
-func (s *DynamoStore) countOf(box protocol.Address) int {
+func (s *Memory) countOf(box protocol.Address) int {
 	n, _ := s.Count(context.Background(), box)
 	return n
 }
@@ -277,7 +277,7 @@ func TestFeed(t *testing.T) {
 // a deleted one; an account's other items, and accounts not cached, are not
 // memory's.
 func TestAccountRecords(t *testing.T) {
-	s := &DynamoStore{accCache: newAccountCache(10)}
+	s := &Memory{accCache: newAccountCache(10)}
 	b := func(v []byte) stypes.AttributeValue { return &stypes.AttributeValueMemberB{Value: v} }
 	rec := func(op stypes.OperationType, id string, sk []byte, rev uint64, unmetered bool) stypes.Record {
 		keys := map[string]stypes.AttributeValue{"account": b([]byte(id)), "sk": b(sk)}

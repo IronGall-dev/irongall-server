@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -212,10 +211,11 @@ func (s *failPut) PutMessage(ctx context.Context, box protocol.Address, h *Heade
 // A count reserved for a write is kept when the write may have been applied,
 // whatever error it returned, and given back only for a refusal the store or
 // AWS stated (IronGall-dev/irongall-server#14, #90): a send whose write timed
-// out, or met a fault of AWS's own, spends its send a day; one AWS
-// throttled, or refused for the call itself, or whose body's PUT failed
-// before its item, does not. Each error from AWS is the one DynamoStore
-// returns when the fake answers so, as the SDK makes it.
+// out, or met a fault of AWS's own, or whose backend answered an error it
+// states nothing of, spends its send a day; one AWS throttled, or refused
+// for the call itself, or whose body's PUT failed before its item, does
+// not. Each error is the one the store returns when the fake of AWS answers
+// so, as the SDK makes it, or when its backend answers so (faults).
 func TestACountIsKeptWhenItsWriteMayHaveBeenApplied(t *testing.T) {
 	every := func(a answer) func(string, int, []byte) answer { return func(string, int, []byte) answer { return a } }
 	everyS3 := func(a answer) func(string, int) answer { return func(string, int) answer { return a } }
@@ -240,7 +240,13 @@ func TestACountIsKeptWhenItsWriteMayHaveBeenApplied(t *testing.T) {
 	}{
 		{"a timeout", put(short, every(answer{hang: true}), nil), true},
 		{"a fault of AWS's own", put(ctx, every(answer500), nil), true},
-		{"an error of no kind the store states", func() error { return errors.New("injected") }, true},
+		{"an error of no kind its backend states", func() error {
+			s := NewMemStore(time.Now)
+			injectFaults(s).set("PutMessage", unknownBefore)
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			_, err := s.PutMessage(ctx, protocol.Address{4}, &Header{ID: [32]byte{7}, From: protocol.Address{6}, Size: 3, ReceivedAt: now, ExpiresAt: now.Add(protocol.Retention)}, []byte("abc"))
+			return err
+		}, true},
 		{"a throttle", put(ctx, every(answerPTEE), nil), false},
 		{"a refusal of the call", put(ctx, every(answer{status: http.StatusBadRequest, body: dynErr("ValidationException", "")}), nil), false},
 		{"a refusal of the body", put(ctx, nil, everyS3(answer{status: http.StatusForbidden, body: s3Err("AccessDenied")})), false},

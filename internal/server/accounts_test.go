@@ -80,11 +80,11 @@ func TestAnAdoptKeyIsKeptAsItsHash(t *testing.T) {
 	if _, err := e.store.AdoptKey(ctx, acc.ID, sha256.Sum256([]byte(key+"A"))); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("another key: %v", err)
 	}
-	s, ok := e.store.(*DynamoStore)
+	s, ok := onDynamo(e.store)
 	if !ok {
 		return
 	}
-	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.accts, Key: adoptKeyKey(acc.ID, hash), ConsistentRead: aws.Bool(true)})
+	out, err := s.dynamo().db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.dynamo().accts, Key: adoptKeyKey(acc.ID, hash), ConsistentRead: aws.Bool(true)})
 	if err != nil || out.Item == nil {
 		t.Fatalf("the key's item: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestAccounts(t *testing.T) {
 		if got := adopt(t, a, key2); got != second.ID || e.accountOf(a) != second.ID {
 			t.Fatalf("moved to %q", e.accountOf(a))
 		}
-		if s, ok := e.store.(*DynamoStore); ok { // the index of each account's boxes follows the box record
+		if s, ok := onDynamo(e.store); ok { // the index of each account's boxes follows the box record
 			s.lists(t, first.ID, a.Address(), false)
 			s.lists(t, second.ID, a.Address(), true)
 			if err := a.Leave(ctx); err != nil {
@@ -411,7 +411,7 @@ func (d *cannedDynamo) Do(r *http.Request) (*http.Response, error) {
 		Body:   io.NopCloser(strings.NewReader(body)), Request: r}, nil
 }
 
-func (d *cannedDynamo) store(logged *bytes.Buffer) *DynamoStore {
+func (d *cannedDynamo) store(logged *bytes.Buffer) *Memory {
 	return NewDynamoStore(DynamoConfig{AWS: aws.Config{Region: "us-east-1", Credentials: credentials.NewStaticCredentialsProvider("AKIDEXAMPLE", "x", ""),
 		HTTPClient: d, BaseEndpoint: aws.String("http://127.0.0.1:1")}, BoxesTable: "b", MsgsTable: "m", AccountsTable: "a", Bucket: "s", Log: log.New(logged, "", 0)})
 }
@@ -425,10 +425,10 @@ func cancelled(reasons ...string) string {
 	return `{"__type":"com.amazonaws.dynamodb.v20120810#TransactionCanceledException","Message":"Transaction cancelled, please refer cancellation reasons for specific reasons [` + strings.Join(reasons, ", ") + `]","CancellationReasons":[` + strings.Join(codes, ",") + `]}`
 }
 
-// dynamoAdopt is the test store, but with a DynamoStore's Adopt.
+// dynamoAdopt is the test store, but with the Adopt of a store on DynamoDB.
 type dynamoAdopt struct {
 	Store
-	d *DynamoStore
+	d *Memory
 }
 
 func (s dynamoAdopt) Adopt(ctx context.Context, b *Box, account string, key [32]byte) error {
@@ -503,9 +503,9 @@ func TestARecordWriteThatMeetsATransactionIsStale(t *testing.T) {
 		t.Fatal(err)
 	}
 	conflict := `{"__type":"com.amazonaws.dynamodb.v20120810#TransactionConflictException","message":"Transaction is ongoing for the item"}`
-	for name, write := range map[string]func(*DynamoStore) error{
-		"UpdateBox": func(s *DynamoStore) error { return s.UpdateBox(ctx, cloneBox(b)) },
-		"Leave":     func(s *DynamoStore) error { return s.Leave(ctx, cloneBox(b)) },
+	for name, write := range map[string]func(*Memory) error{
+		"UpdateBox": func(s *Memory) error { return s.UpdateBox(ctx, cloneBox(b)) },
+		"Leave":     func(s *Memory) error { return s.Leave(ctx, cloneBox(b)) },
 	} {
 		var logged bytes.Buffer
 		d := &cannedDynamo{answers: []string{conflict}}
@@ -529,7 +529,7 @@ func TestAccountChangesReachMemory(t *testing.T) {
 	l := relaxed()
 	l.SendsPerDay = 1
 	e := newEnv(t, l)
-	s := e.store.(*DynamoStore)
+	s := e.store.(*Memory)
 	acc, key := accountEnv(t, e, false, 1)
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	adopt(t, a, key)
@@ -537,8 +537,8 @@ func TestAccountChangesReachMemory(t *testing.T) {
 	if _, err := a.Send(ctx, b.Address(), "2"); !limitedBy(err, protocol.QuotaSends) {
 		t.Fatalf("second send: %v", err)
 	}
-	if _, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: &s.accts, Key: accountKey(acc.ID, skAccount),
+	if _, err := s.dynamo().db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &s.dynamo().accts, Key: accountKey(acc.ID, skAccount),
 		UpdateExpression:          aws.String("SET #u = :t, #r = :r"),
 		ExpressionAttributeNames:  map[string]string{"#u": "unmetered", "#r": "rev"},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":t": &types.AttributeValueMemberBOOL{Value: true}, ":r": num(2)},
@@ -549,7 +549,7 @@ func TestAccountChangesReachMemory(t *testing.T) {
 		_, err := a.Send(ctx, b.Address(), fmt.Sprintf("unmetered %d", i))
 		return err == nil
 	})
-	if _, err := s.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &s.accts, Key: accountKey(acc.ID, skAccount)}); err != nil {
+	if _, err := s.dynamo().db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &s.dynamo().accts, Key: accountKey(acc.ID, skAccount)}); err != nil {
 		t.Fatal(err)
 	}
 	until(t, func(i int) bool {

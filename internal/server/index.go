@@ -22,7 +22,7 @@ import (
 // it; a change that arrives while the box loads waits, and is applied after
 // the load, in order. Applying a change twice, or late, is harmless:
 // messages are a set keyed by (id, expiry), a count is the size of the set,
-// and a standing only moves to a newer rev.
+// and a standing only moves to a newer record (version).
 type index struct {
 	shards [256]indexShard // by the address's first byte
 	// key tags each mark (markTag): random, made with the index.
@@ -55,7 +55,9 @@ type boxMem struct {
 	loading *boxLoad // set while the box's first load is in flight
 	exists  bool     // the box has a record
 	st      Standing // its record's, with Listed unset: standing judges it
-	rev     uint64
+	// The record's version: when its box registered, in unix ms, and its
+	// rev.
+	created, rev uint64
 	// What its identity revoked, from its revocations item: the address,
 	// and certificates through a serial (0: none). Neither is taken away.
 	revoked bool
@@ -79,10 +81,12 @@ type boxLoad struct {
 }
 
 // boxRead is what a load reads of a box: whether it has a record, its
-// standing at rev, what its identity revoked, and its live messages.
+// standing at its version (created, rev), what its identity revoked, and
+// its live messages.
 type boxRead struct {
 	exists  bool
 	st      Standing
+	created uint64
 	rev     uint64
 	revoked bool
 	through uint64
@@ -148,7 +152,7 @@ func (x *index) ensure(ctx context.Context, a protocol.Address, read func() (box
 	if err != nil {
 		delete(sh.boxes, a) // and its queued changes: the next read sees them
 	} else {
-		m.exists, m.st, m.rev, m.marks = r.exists, r.st, r.rev, r.marks
+		m.exists, m.st, m.created, m.rev, m.marks = r.exists, r.st, r.created, r.rev, r.marks
 		m.revoked, m.through = r.revoked, r.through
 		for _, op := range l.queued {
 			op(m)
@@ -318,14 +322,14 @@ func (x *index) fetched(box protocol.Address, tag, now uint64) (held, again bool
 	return false, false
 }
 
-// setStanding records a box's standing at rev, unless memory holds a newer
-// one.
-func (x *index) setStanding(a protocol.Address, st Standing, rev uint64) {
+// setStanding records a box's standing, of a record at version v, unless
+// memory holds a newer record's.
+func (x *index) setStanding(a protocol.Address, st Standing, v version) {
 	x.apply(a, func(m *boxMem) {
-		if m.rev > rev {
+		if (version{m.created, m.rev}).after(v) {
 			return
 		}
-		m.exists, m.st, m.rev = true, st, rev
+		m.exists, m.st, m.created, m.rev = true, st, v.created, v.rev
 	})
 }
 

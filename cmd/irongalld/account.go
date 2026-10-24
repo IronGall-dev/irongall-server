@@ -18,12 +18,12 @@ func account(cmd string, args []string) error {
 	fs := flag.NewFlagSet("account "+cmd, flag.ContinueOnError)
 	region := fs.String("region", "us-east-1", "the AWS region")
 	accts := fs.String("accounts-table", "", "the DynamoDB table of accounts")
-	var run func(context.Context, *server.DynamoStore) error
+	var run func(context.Context, *server.Memory) error
 	switch cmd {
 	case "create":
 		id := fs.String("id", "", "the account's id: a name of ours (echo), or none to mint one")
 		unmetered := fs.Bool("unmetered", false, "its boxes have no daily limit, the largest cap and new mail at the fastest any box takes it, never charged (the echo account)")
-		run = func(ctx context.Context, s *server.DynamoStore) error {
+		run = func(ctx context.Context, s *server.Memory) error {
 			if *id == "" {
 				var err error
 				if *id, err = server.NewAccountID(); err != nil {
@@ -44,7 +44,7 @@ func account(cmd string, args []string) error {
 		id := fs.String("account", "", "the account the key adopts boxes into")
 		uses := fs.Int("uses", 0, "how many boxes the key may adopt")
 		ttl := fs.Duration("ttl", 0, "how long the key is good for")
-		run = func(ctx context.Context, s *server.DynamoStore) error {
+		run = func(ctx context.Context, s *server.Memory) error {
 			if *id == "" || *uses < 1 || *ttl <= 0 {
 				return errors.New("name -account, -uses and -ttl")
 			}
@@ -66,7 +66,7 @@ func account(cmd string, args []string) error {
 		fs.String("boxes-table", "", "the DynamoDB table of boxes")
 		id := fs.String("account", "", "the account to drop the box from")
 		addr := fs.String("box", "", "the box's address")
-		run = func(ctx context.Context, s *server.DynamoStore) error {
+		run = func(ctx context.Context, s *server.Memory) error {
 			a, err := protocol.ParseAddress(*addr)
 			if fs.Lookup("boxes-table").Value.String() == "" || *id == "" || err != nil {
 				return errors.New("name -boxes-table, -account and -box (an address)")

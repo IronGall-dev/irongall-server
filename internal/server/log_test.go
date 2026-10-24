@@ -46,12 +46,12 @@ func (s errorWithURL) Box(ctx context.Context, a protocol.Address) (*Box, error)
 	return s.Store.Box(ctx, a)
 }
 
-// deadS3 is the test store, but a send is stored by a DynamoStore whose S3
+// deadS3 is the test store, but a send is stored by a store on DynamoDB whose S3
 // is a closed port: its PutMessage fails as a real S3 client does when it
 // cannot connect.
 type deadS3 struct {
 	Store
-	d *DynamoStore
+	d *Memory
 }
 
 func (s deadS3) PutMessage(ctx context.Context, box protocol.Address, h *Header, body []byte) (*Header, error) {

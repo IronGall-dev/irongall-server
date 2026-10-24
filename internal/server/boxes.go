@@ -126,18 +126,26 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 		writeJSON(w, http.StatusCreated, struct{}{})
 		return nil
 	}
-	if !errors.Is(err, ErrExists) {
+	// The address has a record, or may have one this write made, whose
+	// outcome is unknown: the record answers, as for a box registered
+	// before (IronGall-dev/irongall-client#411 item 2), and no count of the
+	// client's retry depends on the write.
+	exists := errors.Is(err, ErrExists)
+	if !exists && !mayHaveApplied(err) {
 		return err
 	}
-	if cur, err = s.box(r.Context(), h); err != nil {
-		return err
+	read, rerr := s.box(r.Context(), h)
+	switch {
+	case rerr != nil:
+		return rerr
+	case settled(read):
+		return s.registered(w, r, id, read, &req, true)
+	case !exists:
+		return err // the record does not hold it: its client sends it again
 	}
-	if !settled(cur) { // a read that does not see the record yet
-		p := fail(protocol.CodeUnavailable, "retry", "this box is being registered")
-		p.retryAfter = time.Second
-		return p
-	}
-	return s.registered(w, r, id, cur, &req, true)
+	busy := fail(protocol.CodeUnavailable, "retry", "this box is being registered") // a read that does not see the record yet
+	busy.retryAfter = time.Second
+	return busy
 }
 
 // statementRevoked is the answer to a prekey statement signed under a

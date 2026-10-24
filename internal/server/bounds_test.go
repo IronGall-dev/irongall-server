@@ -28,12 +28,13 @@ import (
 // of AWS sees it.
 const streamOp = "DynamoDBStreams_20120810."
 
-// Every call DynamoStore makes to AWS ends at storeTimeout, on a context its
-// caller handed it with no deadline and no end, against a DynamoDB, its
-// streams and an S3 that never answer: the reads as the writes, whoever calls
-// them, and a stream follower's (IronGall-dev/irongall-server#91). Where a
-// call comes after another, the fake answers the first and holds the one
-// named.
+// Every call the DynamoDB backend makes to AWS ends at storeTimeout, on a
+// context its caller handed it with no deadline and no end, against a
+// DynamoDB, its streams and an S3 that never answer: the reads as the
+// writes, whoever calls them, and a stream follower's
+// (IronGall-dev/irongall-server#91). The bound is in one place for each
+// client (bound, boundedStreams), not at each call. Where a call comes after
+// another, the fake answers the first and holds the one named.
 func TestEveryCallToAWSEndsAtItsBound(t *testing.T) {
 	_, _, box := heldRecord(t)
 	hang := answer{hang: true}
@@ -71,75 +72,75 @@ func TestEveryCallToAWSEndsAtItsBound(t *testing.T) {
 		name   string
 		dynamo func(string, int, []byte) answer // nil: every call is held
 		s3     func(string, int) answer         // nil: every call is held
-		call   func(context.Context, *DynamoStore) error
+		call   func(context.Context, *Memory) error
 	}{
-		{name: "Box", call: func(ctx context.Context, s *DynamoStore) error { _, err := s.Box(ctx, protocol.Address{5}); return err }},
-		{name: "a load's read of the record", call: func(ctx context.Context, s *DynamoStore) error { _, err := s.Count(ctx, box.Addr); return err }},
+		{name: "Box", call: func(ctx context.Context, s *Memory) error { _, err := s.Box(ctx, protocol.Address{5}); return err }},
+		{name: "a load's read of the record", call: func(ctx context.Context, s *Memory) error { _, err := s.Count(ctx, box.Addr); return err }},
 		{name: "a load's read of the live index", dynamo: first("Query", answered(map[string]any{"Items": []any{itemJSON(boxItem(box))}, "Count": 1, "ScannedCount": 1})),
-			call: func(ctx context.Context, s *DynamoStore) error { _, err := s.Count(ctx, box.Addr); return err }},
-		{name: "Dedupe", call: func(ctx context.Context, s *DynamoStore) error { _, err := s.Dedupe(ctx, box.Addr, msg.ID); return err }},
-		{name: "List", call: func(ctx context.Context, s *DynamoStore) error { _, err := s.List(ctx, box.Addr, nil, 10); return err }},
-		{name: "Message's read of the item", call: func(ctx context.Context, s *DynamoStore) error {
+			call: func(ctx context.Context, s *Memory) error { _, err := s.Count(ctx, box.Addr); return err }},
+		{name: "Dedupe", call: func(ctx context.Context, s *Memory) error { _, err := s.Dedupe(ctx, box.Addr, msg.ID); return err }},
+		{name: "List", call: func(ctx context.Context, s *Memory) error { _, err := s.List(ctx, box.Addr, nil, 10); return err }},
+		{name: "Message's read of the item", call: func(ctx context.Context, s *Memory) error {
 			_, _, err := s.Message(ctx, box.Addr, msg.ID, 0)
 			return err
 		}},
 		{name: "Message's read of the body", dynamo: first("GetItem", answered(map[string]any{"Item": itemJSON(msgItem(box.Addr, msg))})),
-			call: func(ctx context.Context, s *DynamoStore) error {
+			call: func(ctx context.Context, s *Memory) error {
 				_, _, err := s.Message(ctx, box.Addr, msg.ID, 0)
 				return err
 			}},
 		{name: "Message's read of the body's bytes", dynamo: first("GetItem", answered(map[string]any{"Item": itemJSON(msgItem(box.Addr, msg))})),
 			s3: func(string, int) answer { return answer{status: http.StatusOK, body: "ab", stall: true} },
-			call: func(ctx context.Context, s *DynamoStore) error {
+			call: func(ctx context.Context, s *Memory) error {
 				_, _, err := s.Message(ctx, box.Addr, msg.ID, 0)
 				return err
 			}},
-		{name: "Account", call: func(ctx context.Context, s *DynamoStore) error { _, err := s.Account(ctx, "acct"); return err }},
-		{name: "AdoptKey", call: func(ctx context.Context, s *DynamoStore) error {
+		{name: "Account", call: func(ctx context.Context, s *Memory) error { _, err := s.Account(ctx, "acct"); return err }},
+		{name: "AdoptKey", call: func(ctx context.Context, s *Memory) error {
 			_, err := s.AdoptKey(ctx, "acct", [32]byte{1})
 			return err
 		}},
-		{name: "CreateAccount", call: func(ctx context.Context, s *DynamoStore) error { return s.CreateAccount(ctx, &Account{ID: "acct"}) }},
-		{name: "PutAdoptKey", call: func(ctx context.Context, s *DynamoStore) error {
+		{name: "CreateAccount", call: func(ctx context.Context, s *Memory) error { return s.CreateAccount(ctx, &Account{ID: "acct"}) }},
+		{name: "PutAdoptKey", call: func(ctx context.Context, s *Memory) error {
 			return s.PutAdoptKey(ctx, &AdoptKey{Account: "acct", Hash: [32]byte{1}, Uses: 1, Expires: now.Add(time.Hour)})
 		}},
-		{name: "CreateBox", call: func(ctx context.Context, s *DynamoStore) error { return s.CreateBox(ctx, cloneBox(box)) }},
-		{name: "UpdateBox", call: func(ctx context.Context, s *DynamoStore) error { return s.UpdateBox(ctx, cloneBox(box)) }},
-		{name: "DeleteBox", call: func(ctx context.Context, s *DynamoStore) error { return s.DeleteBox(ctx, box.Addr) }},
-		{name: "Revoke", call: func(ctx context.Context, s *DynamoStore) error {
+		{name: "CreateBox", call: func(ctx context.Context, s *Memory) error { return s.CreateBox(ctx, cloneBox(box)) }},
+		{name: "UpdateBox", call: func(ctx context.Context, s *Memory) error { return s.UpdateBox(ctx, cloneBox(box)) }},
+		{name: "DeleteBox", call: func(ctx context.Context, s *Memory) error { return s.DeleteBox(ctx, box.Addr) }},
+		{name: "Revoke", call: func(ctx context.Context, s *Memory) error {
 			return s.Revoke(ctx, box.Addr, &Revocations{Identity: box.Identity, Address: []byte("r")})
 		}},
-		{name: "PutMessage's body", call: func(ctx context.Context, s *DynamoStore) error {
+		{name: "PutMessage's body", call: func(ctx context.Context, s *Memory) error {
 			_, err := s.PutMessage(ctx, box.Addr, msg, []byte("abc"))
 			return err
 		}},
-		{name: "PutMessage's item", s3: s3ok, call: func(ctx context.Context, s *DynamoStore) error {
+		{name: "PutMessage's item", s3: s3ok, call: func(ctx context.Context, s *Memory) error {
 			_, err := s.PutMessage(ctx, box.Addr, msg, []byte("abc"))
 			return err
 		}},
-		{name: "DeleteMessage's body", call: func(ctx context.Context, s *DynamoStore) error { return s.DeleteMessage(ctx, box.Addr, msg.ID) }},
-		{name: "DeleteMessage's item", s3: s3ok, call: func(ctx context.Context, s *DynamoStore) error { return s.DeleteMessage(ctx, box.Addr, msg.ID) }},
-		{name: "DeleteFrom", call: func(ctx context.Context, s *DynamoStore) error { return s.DeleteMessages(ctx, box.Addr) }},
-		{name: "Adopt", call: func(ctx context.Context, s *DynamoStore) error {
+		{name: "DeleteMessage's body", call: func(ctx context.Context, s *Memory) error { return s.DeleteMessage(ctx, box.Addr, msg.ID) }},
+		{name: "DeleteMessage's item", s3: s3ok, call: func(ctx context.Context, s *Memory) error { return s.DeleteMessage(ctx, box.Addr, msg.ID) }},
+		{name: "DeleteFrom", call: func(ctx context.Context, s *Memory) error { return s.DeleteMessages(ctx, box.Addr) }},
+		{name: "Adopt", call: func(ctx context.Context, s *Memory) error {
 			return s.Adopt(ctx, cloneBox(box), "acct", [32]byte{1})
 		}},
-		{name: "Leave", call: func(ctx context.Context, s *DynamoStore) error { return s.Leave(ctx, cloneBox(box)) }},
-		{name: "Start's DescribeTable", call: func(ctx context.Context, s *DynamoStore) error { return s.Start(ctx) }},
+		{name: "Leave", call: func(ctx context.Context, s *Memory) error { return s.Leave(ctx, cloneBox(box)) }},
+		{name: "Start's DescribeTable", call: func(ctx context.Context, s *Memory) error { return s.Start(ctx) }},
 		{name: "a stream's DescribeStream", dynamo: first("DescribeTable", described),
-			call: func(ctx context.Context, s *DynamoStore) error { return s.Start(ctx) }},
+			call: func(ctx context.Context, s *Memory) error { return s.Start(ctx) }},
 		{name: "a stream's GetShardIterator at the start", dynamo: func(op string, n int, b []byte) answer {
 			if op == streamOp+"DescribeStream" && n == 1 {
 				return oneShard
 			}
 			return first("DescribeTable", described)(op, n, b)
-		}, call: func(ctx context.Context, s *DynamoStore) error { return s.Start(ctx) }},
-		{name: "a stream's GetShardIterator in a read", call: func(ctx context.Context, s *DynamoStore) error {
-			s.boxFeed.arn = "fake-stream"
-			return s.boxFeed.read(ctx, &shard{id: "s", seq: "1"})
+		}, call: func(ctx context.Context, s *Memory) error { return s.Start(ctx) }},
+		{name: "a stream's GetShardIterator in a read", call: func(ctx context.Context, s *Memory) error {
+			s.dynamo().boxFeed.arn = "fake-stream"
+			return s.dynamo().boxFeed.read(ctx, &shard{id: "s", seq: "1"})
 		}},
-		{name: "a stream's GetRecords", call: func(ctx context.Context, s *DynamoStore) error {
-			s.boxFeed.arn = "fake-stream"
-			return s.boxFeed.read(ctx, &shard{id: "s", iter: aws.String("i")})
+		{name: "a stream's GetRecords", call: func(ctx context.Context, s *Memory) error {
+			s.dynamo().boxFeed.arn = "fake-stream"
+			return s.dynamo().boxFeed.read(ctx, &shard{id: "s", iter: aws.String("i")})
 		}},
 	}
 	// Every call at once, each on a fake of its own, then each judged.

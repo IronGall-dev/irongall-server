@@ -305,43 +305,46 @@ func TestARefusalAWSStatedGivesTheCountBack(t *testing.T) {
 // table (recCache.write; IronGall-dev/irongall-server#89). The controls: a
 // refusal AWS stated, one the SDK models or one it gives no fault (#90),
 // changes nothing in memory; a failed condition with nothing applied evicts
-// the cached copy, counts no write and leaves the index, as before.
+// the cached copy, counted as a write, since the store holds what this
+// process never applied, so a read begun before it puts nothing, and leaves
+// the index (Memory.write).
 func TestAWriteThatMayHaveBeenAppliedForgetsItsAddress(t *testing.T) {
 	_, r, box := heldRecord(t)
 	notFound := answer{status: http.StatusBadRequest, body: dynErr("ResourceNotFoundException", "")}
 	validation := answer{status: http.StatusBadRequest, body: dynErr("ValidationException", "")}
-	raise := func(ctx context.Context, s *DynamoStore) error {
+	raise := func(ctx context.Context, s *Memory) error {
 		return s.Revoke(ctx, box.Addr, &Revocations{Identity: r.id.Document(), Certs: []byte("c"), CertsSig: []byte("s"), Through: 7})
 	}
-	update := func(ctx context.Context, s *DynamoStore) error { return s.UpdateBox(ctx, cloneBox(box)) }
+	update := func(ctx context.Context, s *Memory) error { return s.UpdateBox(ctx, cloneBox(box)) }
 	cases := []struct {
 		name            string
 		op              string
 		answers         []answer
-		write           func(context.Context, *DynamoStore) error
+		write           func(context.Context, *Memory) error
 		evicted, counts bool
 		timeout         time.Duration // the write's caller's, if not 0
+		kept            bool          // the index keeps the box: a refusal stated
 	}{
-		{"UpdateBox timed out, its one attempt unanswered", "UpdateItem", []answer{{hang: true}}, update, true, true, 300 * time.Millisecond},
-		{"a raise timed out, its one attempt unanswered", "UpdateItem", []answer{{hang: true}}, raise, true, true, 300 * time.Millisecond},
-		{"UpdateBox answered 500 every attempt", "UpdateItem", []answer{applied(answer500), answer500, answer500}, update, true, true, 0},
-		{"UpdateBox applied, answered 500, then the retry's failed condition", "UpdateItem", []answer{applied(answer500), answerCCF}, update, true, true, 0},
-		{"UpdateBox's answer lost every attempt", "UpdateItem", []answer{applied(answer{drop: true}), {drop: true}, {drop: true}}, update, true, true, 0},
-		{"a raise answered 500 every attempt", "UpdateItem", []answer{applied(answer500), answer500, answer500}, raise, true, true, 0},
-		{"a raise applied, answered 500, then the retry's failed condition", "UpdateItem", []answer{applied(answer500), answerCCF}, raise, true, true, 0},
+		{"UpdateBox timed out, its one attempt unanswered", "UpdateItem", []answer{{hang: true}}, update, true, true, 300 * time.Millisecond, false},
+		{"a raise timed out, its one attempt unanswered", "UpdateItem", []answer{{hang: true}}, raise, true, true, 300 * time.Millisecond, false},
+		{"UpdateBox answered 500 every attempt", "UpdateItem", []answer{applied(answer500), answer500, answer500}, update, true, true, 0, false},
+		{"UpdateBox applied, answered 500, then the retry's failed condition", "UpdateItem", []answer{applied(answer500), answerCCF}, update, true, true, 0, false},
+		{"UpdateBox's answer lost every attempt", "UpdateItem", []answer{applied(answer{drop: true}), {drop: true}, {drop: true}}, update, true, true, 0, false},
+		{"a raise answered 500 every attempt", "UpdateItem", []answer{applied(answer500), answer500, answer500}, raise, true, true, 0, false},
+		{"a raise applied, answered 500, then the retry's failed condition", "UpdateItem", []answer{applied(answer500), answerCCF}, raise, true, true, 0, false},
 		{"CreateBox answered 500 every attempt", "PutItem", []answer{applied(answer500), answer500, answer500},
-			func(ctx context.Context, s *DynamoStore) error { return s.CreateBox(ctx, cloneBox(box)) }, true, true, 0},
+			func(ctx context.Context, s *Memory) error { return s.CreateBox(ctx, cloneBox(box)) }, true, true, 0, false},
 		{"DeleteBox answered 500 every attempt", "DeleteItem", []answer{applied(answer500), answer500, answer500},
-			func(ctx context.Context, s *DynamoStore) error { return s.DeleteBox(ctx, box.Addr) }, true, true, 0},
+			func(ctx context.Context, s *Memory) error { return s.DeleteBox(ctx, box.Addr) }, true, true, 0, false},
 		{"Adopt answered 500 every attempt", "TransactWriteItems", []answer{applied(answer500), answer500, answer500},
-			func(ctx context.Context, s *DynamoStore) error {
+			func(ctx context.Context, s *Memory) error {
 				return s.Adopt(ctx, cloneBox(box), "acct", [32]byte{1})
-			}, true, true, 0},
+			}, true, true, 0, false},
 		{"Leave answered 500 every attempt", "UpdateItem", []answer{applied(answer500), answer500, answer500},
-			func(ctx context.Context, s *DynamoStore) error { return s.Leave(ctx, cloneBox(box)) }, true, true, 0},
-		{"control: UpdateBox refused, a ResourceNotFoundException", "UpdateItem", []answer{notFound}, update, false, false, 0},
-		{"control: UpdateBox refused, a ValidationException, which the SDK gives no fault", "UpdateItem", []answer{validation}, update, false, false, 0},
-		{"control: UpdateBox's failed condition, nothing applied", "UpdateItem", []answer{answerCCF}, update, true, false, 0},
+			func(ctx context.Context, s *Memory) error { return s.Leave(ctx, cloneBox(box)) }, true, true, 0, false},
+		{"control: UpdateBox refused, a ResourceNotFoundException", "UpdateItem", []answer{notFound}, update, false, false, 0, true},
+		{"control: UpdateBox refused, a ValidationException, which the SDK gives no fault", "UpdateItem", []answer{validation}, update, false, false, 0, true},
+		{"control: UpdateBox's failed condition, nothing applied", "UpdateItem", []answer{answerCCF}, update, true, true, 0, true},
 	}
 	// Every write at once, each on a fake of its own, then each judged.
 	type outcome struct {
@@ -396,15 +399,15 @@ func TestAWriteThatMayHaveBeenAppliedForgetsItsAddress(t *testing.T) {
 			if filled == c.counts && c.evicted {
 				t.Errorf("a read begun before the write puts its copy after it %v; want %v: the write is counted %v", filled, !c.counts, !filled)
 			}
-			if outs[i].indexed == c.counts {
-				t.Errorf("after the write the index holds the box's standing from before it %v; want %v", outs[i].indexed, !c.counts)
+			if outs[i].indexed != c.kept {
+				t.Errorf("after the write the index holds the box's standing from before it %v; want %v", outs[i].indexed, c.kept)
 			}
 		})
 	}
 }
 
 // overFake makes the next write of the suite's store, then answers it as a
-// DynamoStore answers the same write when AWS answers as the fake scripts
+// store on DynamoDB answers the same write when AWS answers as the fake scripts
 // it: its error, made by the SDK, so a handler meets the store's own
 // statement of a write AWS applied and then answered with a fault. hook runs
 // first.
@@ -416,7 +419,7 @@ type overFake struct {
 	dynamo func(string, int, []byte) answer
 }
 
-func (s *overFake) fake() *DynamoStore {
+func (s *overFake) fake() *Memory {
 	f := newFakeAWS()
 	f.dynamo = s.dynamo
 	return fakeStore(s.t, f)
@@ -611,7 +614,7 @@ func (b *boxesTable) answer(op string, n int, body []byte) answer {
 
 // A raise of a revocation of certificates whose write AWS applied, and whose
 // answer was lost, leaves memory holding nothing of the address, the index
-// as the cache (unsettled): the next call with a pass under the revoked
+// as the cache (Memory.write): the next call with a pass under the revoked
 // certificate is refused at once, from the record read again. Before, the
 // index's standing from before the write took that pass until the stream's
 // echo. The control: a raise AWS refused leaves the index standing, and the
@@ -680,15 +683,15 @@ func TestARevocationWhoseAnswerWasLostIsInTheNextPassCheck(t *testing.T) {
 // (TestAnAdoptsRetriesCarryItsFirstAttemptsToken).
 func TestEveryConditionalWriteRetriedAfterAnAmbiguousAttemptMayHaveBeenApplied(t *testing.T) {
 	_, _, box := heldRecord(t)
-	createBox := func(ctx context.Context, s *DynamoStore) error { return s.CreateBox(ctx, cloneBox(box)) }
-	leave := func(ctx context.Context, s *DynamoStore) error { return s.Leave(ctx, cloneBox(box)) }
-	deleteBox := func(ctx context.Context, s *DynamoStore) error { return s.DeleteBox(ctx, box.Addr) }
-	ack := func(ctx context.Context, s *DynamoStore) error { return s.DeleteMessage(ctx, box.Addr, [32]byte{7}) }
-	account := func(ctx context.Context, s *DynamoStore) error { return s.CreateAccount(ctx, &Account{ID: "acct"}) }
-	adoptKey := func(ctx context.Context, s *DynamoStore) error {
+	createBox := func(ctx context.Context, s *Memory) error { return s.CreateBox(ctx, cloneBox(box)) }
+	leave := func(ctx context.Context, s *Memory) error { return s.Leave(ctx, cloneBox(box)) }
+	deleteBox := func(ctx context.Context, s *Memory) error { return s.DeleteBox(ctx, box.Addr) }
+	ack := func(ctx context.Context, s *Memory) error { return s.DeleteMessage(ctx, box.Addr, [32]byte{7}) }
+	account := func(ctx context.Context, s *Memory) error { return s.CreateAccount(ctx, &Account{ID: "acct"}) }
+	adoptKey := func(ctx context.Context, s *Memory) error {
 		return s.PutAdoptKey(ctx, &AdoptKey{Account: "acct", Hash: [32]byte{1}, Uses: 1, Expires: time.Now().Add(time.Hour)})
 	}
-	adopt := func(ctx context.Context, s *DynamoStore) error {
+	adopt := func(ctx context.Context, s *Memory) error {
 		return s.Adopt(ctx, cloneBox(box), "acct", [32]byte{1})
 	}
 	cancelled := answer{status: http.StatusBadRequest, body: dynErr("TransactionCanceledException", `,"CancellationReasons":[{"Code":"ConditionalCheckFailed"},{"Code":"None"}]`)}
@@ -696,7 +699,7 @@ func TestEveryConditionalWriteRetriedAfterAnAmbiguousAttemptMayHaveBeenApplied(t
 		name    string
 		op      string
 		answers []answer
-		write   func(context.Context, *DynamoStore) error
+		write   func(context.Context, *Memory) error
 		stated  error // the refusal the write states, or nil for one that may have been applied
 	}{
 		{"CreateBox applied and answered 500, then the retry's failed condition", "PutItem", []answer{applied(answer500), answerCCF}, createBox, nil},

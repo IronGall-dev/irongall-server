@@ -367,7 +367,7 @@ func TestASlowReaderIsNotCut(t *testing.T) {
 }
 
 // slowStore is a store whose DeleteMessages takes hold, and whose reads of
-// a box read their context first, as DynamoStore's calls do.
+// a box read their context first, as the DynamoDB backend's calls do.
 type slowStore struct {
 	Store
 	hold time.Duration

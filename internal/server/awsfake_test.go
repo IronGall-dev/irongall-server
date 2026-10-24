@@ -1,9 +1,9 @@
 package server
 
 // A local fake of DynamoDB's JSON protocol and S3's path-style object calls,
-// on 127.0.0.1, for DynamoStore to run against through the AWS SDK at the
-// module's version: its retries, its retry quota, its error types, its HTTP
-// client. Nothing calls AWS: the SDK's HTTP client refuses any other host.
+// on 127.0.0.1, for the DynamoDB backend to run against through the AWS SDK
+// at the module's version: its retries, its retry quota, its error types,
+// its HTTP client. Nothing calls AWS: the SDK's HTTP client refuses any other host.
 // It came with the audit of IronGall-dev/irongall-client#349
 // (IronGall-dev/irongall-server#89, #90, #91).
 
@@ -159,9 +159,9 @@ func (o onlyHost) RoundTrip(r *http.Request) (*http.Response, error) {
 	return o.rt.RoundTrip(r)
 }
 
-// fakeStore is a DynamoStore on f, with a record cache and the SDK's default
-// retryer, as irongalld's config.LoadDefaultConfig leaves it.
-func fakeStore(t testing.TB, f *fakeAWS) *DynamoStore {
+// fakeStore is the store on DynamoDB over f, with a record cache and the
+// SDK's default retryer, as irongalld's config.LoadDefaultConfig leaves it.
+func fakeStore(t testing.TB, f *fakeAWS) *Memory {
 	t.Helper()
 	srv := httptest.NewServer(f)
 	t.Cleanup(func() {
@@ -178,7 +178,7 @@ func fakeStore(t testing.TB, f *fakeAWS) *DynamoStore {
 		HTTPClient:   &http.Client{Transport: onlyHost{host: host, rt: tr}},
 	}
 	s := NewDynamoStore(DynamoConfig{AWS: cfg, BoxesTable: "boxes", MsgsTable: "msgs", AccountsTable: "accounts", Bucket: "bodies", BoxCache: 16})
-	s.s3 = s3.NewFromConfig(cfg, func(o *s3.Options) { o.UsePathStyle = true })
+	s.dynamo().s3 = newS3(cfg, func(o *s3.Options) { o.UsePathStyle = true })
 	return s
 }
 

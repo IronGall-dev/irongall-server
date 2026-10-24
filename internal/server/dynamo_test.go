@@ -45,7 +45,7 @@ func newTestStore(t *testing.T, now func() time.Time) (Store, func() bool) {
 	return s, s.Ready
 }
 
-func startDynamo(t *testing.T, now func() time.Time) *DynamoStore {
+func startDynamo(t *testing.T, now func() time.Time) *Memory {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -73,20 +73,21 @@ func startDynamo(t *testing.T, now func() time.Time) *DynamoStore {
 }
 
 // dynamoEnv is an env on DynamoDB + S3 Express; the test is skipped without.
-func dynamoEnv(t *testing.T) (*env, *DynamoStore) {
+func dynamoEnv(t *testing.T) (*env, *Memory) {
 	t.Helper()
 	if !onAWS() {
 		t.Skip("needs IRONGALL_TEST_BOXES_TABLE, IRONGALL_TEST_MSGS_TABLE, IRONGALL_TEST_ACCOUNTS_TABLE and IRONGALL_TEST_BUCKET")
 	}
 	e := newEnv(t, relaxed())
-	return e, e.store.(*DynamoStore)
+	return e, e.store.(*Memory)
 }
 
-// failOnce makes the store fail once at a point, as a crash there would.
-func failOnce(s *DynamoStore, point string) {
+// failOnce makes the DynamoDB backend fail once between the two steps of a
+// write, as a crash there would.
+func failOnce(s *Memory, point string) {
 	var mu sync.Mutex
 	done := false
-	s.fault = func(p string) error {
+	s.dynamo().crash = func(p string) error {
 		mu.Lock()
 		defer mu.Unlock()
 		if p == point && !done {
@@ -107,11 +108,11 @@ func idOf(t *testing.T, r *protocol.Receipt) [32]byte {
 // lists holds the boxes table's index of each account's boxes to whether it
 // lists box a under account: the index is read eventually consistent, as
 // every global secondary index is, so it is asked for up to ten seconds.
-func (s *DynamoStore) lists(t *testing.T, account string, a protocol.Address, want bool) {
+func (s *Memory) lists(t *testing.T, account string, a protocol.Address, want bool) {
 	t.Helper()
 	for range 100 {
-		out, err := s.db.Query(context.Background(), &dynamodb.QueryInput{
-			TableName:                 &s.boxes,
+		out, err := s.dynamo().db.Query(context.Background(), &dynamodb.QueryInput{
+			TableName:                 &s.dynamo().boxes,
 			IndexName:                 aws.String(accountIndex),
 			KeyConditionExpression:    aws.String("#c = :c AND #a = :a"),
 			ExpressionAttributeNames:  map[string]string{"#c": "account", "#a": "addr"},
@@ -129,18 +130,18 @@ func (s *DynamoStore) lists(t *testing.T, account string, a protocol.Address, wa
 }
 
 // stored reads a message's item from the table as it is, or nil.
-func (s *DynamoStore) stored(t *testing.T, box protocol.Address, id [32]byte) item {
+func (s *Memory) stored(t *testing.T, box protocol.Address, id [32]byte) item {
 	t.Helper()
-	out, err := s.db.GetItem(context.Background(), &dynamodb.GetItemInput{TableName: &s.msgs, Key: msgKey(box, id), ConsistentRead: aws.Bool(true)})
+	out, err := s.dynamo().db.GetItem(context.Background(), &dynamodb.GetItemInput{TableName: &s.dynamo().msgs, Key: msgKey(box, id), ConsistentRead: aws.Bool(true)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return out.Item
 }
 
-func (s *DynamoStore) bodyExists(t *testing.T, box protocol.Address, id [32]byte) bool {
+func (s *Memory) bodyExists(t *testing.T, box protocol.Address, id [32]byte) bool {
 	t.Helper()
-	_, err := s.s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.bucket, Key: aws.String(bodyKey(box, id))})
+	_, err := s.dynamo().s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.dynamo().bucket, Key: aws.String(bodyKey(box, id))})
 	if err != nil && !isNoSuchKey(err) {
 		t.Fatal(err)
 	}
@@ -149,7 +150,7 @@ func (s *DynamoStore) bodyExists(t *testing.T, box protocol.Address, id [32]byte
 
 // listed reports whether the table lists the message: its item is in the
 // live index.
-func (s *DynamoStore) listed(t *testing.T, box protocol.Address, id [32]byte) bool {
+func (s *Memory) listed(t *testing.T, box protocol.Address, id [32]byte) bool {
 	t.Helper()
 	_, ok := s.stored(t, box, id)["live"]
 	return ok
@@ -240,7 +241,7 @@ func TestHeaderWithoutBodyIsGone(t *testing.T) {
 	if _, _, err := s.Message(ctx, b.Address(), id, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.deleteBody(ctx, b.Address(), id); err != nil {
+	if err := s.dynamo().deleteBody(ctx, b.Address(), id); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := s.Message(ctx, b.Address(), id, 0); !errors.Is(err, ErrNotFound) {
@@ -265,7 +266,7 @@ func TestAckedMessageWithABodyAgainIsGone(t *testing.T) {
 	if res := receive(t, b); len(res.Delivered) != 1 {
 		t.Fatalf("delivered %d", len(res.Delivered))
 	}
-	if _, err := s.s3.PutObject(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: aws.String(bodyKey(b.Address(), id)), Body: strings.NewReader("ciphertext")}); err != nil {
+	if _, err := s.dynamo().s3.PutObject(ctx, &s3.PutObjectInput{Bucket: &s.dynamo().bucket, Key: aws.String(bodyKey(b.Address(), id)), Body: strings.NewReader("ciphertext")}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := s.Message(ctx, b.Address(), id, 0); !errors.Is(err, ErrNotFound) {
@@ -483,7 +484,7 @@ func TestNotReadyIs503(t *testing.T) {
 
 // countingStore counts every call of a Store that reaches storage. It does
 // not embed the Store, so each method is written here, and a new one is
-// counted or not by a choice made where it is added: those a DynamoStore
+// counted or not by a choice made where it is added: those Memory
 // answers from memory (the index and the record cache, after a box's one
 // load on its first use) are not counted.
 type countingStore struct {
@@ -956,7 +957,7 @@ func TestRetryAfterAPauseIsNotRedelivered(t *testing.T) {
 	if list := listOf(t, e.do("GET", to+"/messages", nil, e.pass(b))); len(list.Messages) != 0 {
 		t.Fatalf("mail the pause deleted came back: %+v", list)
 	}
-	if s, ok := e.store.(*DynamoStore); ok {
+	if s, ok := onDynamo(e.store); ok {
 		if id := sha256.Sum256(sent.ciphertext); s.listed(t, b.Address(), id) || s.bodyExists(t, b.Address(), id) {
 			t.Fatal("mail the pause deleted is still listed, or its body kept")
 		}
@@ -972,15 +973,15 @@ func TestBoxCache(t *testing.T) {
 	if b, _ := c.get(a1); b.Rev != 3 {
 		t.Fatalf("rev %d: an older record replaced a newer one", b.Rev)
 	}
-	c.write(a1, c.image(3, func() (*Box, error) { return &Box{Addr: a1, Rev: 3, CertSerial: 9}, nil }))
+	c.write(a1, c.image(&Box{Addr: a1, Rev: 3, CertSerial: 9}))
 	if b, _ := c.get(a1); b.CertSerial == 9 {
 		t.Fatal("refreshed at the same rev")
 	}
-	c.write(a1, c.image(4, func() (*Box, error) { return &Box{Addr: a1, Rev: 4}, nil }))
+	c.write(a1, c.image(&Box{Addr: a1, Rev: 4}))
 	if b, _ := c.get(a1); b.Rev != 4 {
 		t.Fatal("not refreshed to a newer rev")
 	}
-	c.write(a2, c.image(1, func() (*Box, error) { return &Box{Addr: a2, Rev: 1}, nil }))
+	c.write(a2, c.image(&Box{Addr: a2, Rev: 1}))
 	if _, ok := c.get(a2); ok {
 		t.Fatal("an image cached a record the cache did not hold")
 	}
@@ -1046,7 +1047,7 @@ func TestTheBoxsStateAnswersBeforeItsPass(t *testing.T) {
 func TestDynamoObservesTheItemCollection(t *testing.T) {
 	e, s := dynamoEnv(t)
 	m := NewMetrics(prometheus.NewRegistry())
-	s.metrics = m
+	s.dynamo().metrics = m
 	a, b := e.box(protocol.Classic), e.box(protocol.Classic)
 	send(t, a, b, "sized")
 	if err := testutil.CollectAndCompare(m.collections, strings.NewReader(collectionsWant(1)), "irongalld_item_collection_estimate_bytes"); err != nil {

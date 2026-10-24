@@ -115,7 +115,7 @@ func serve(args []string) error {
 	names := fs.String("names", "", "comma-separated names clients call this server by: the host of its URL, lowercase, with its port only when that is not the scheme's default; a pass is taken only for one of them")
 	idTypes := fs.String("identity-types", strings.Join(protocol.IdentityTypes(), ","), "comma-separated identity key types a box may register with, of those this build verifies; "+protocol.IdentityEd25519+" is always one of them")
 	region := fs.String("region", "us-east-1", "the AWS region")
-	boxCache := fs.Int("box-cache", 10000, "box records held in memory, for sends and reads of a box")
+	boxCache := fs.Int("box-cache", server.DefaultBoxCache, "box records held in memory, for sends and reads of a box")
 	streamEvery := fs.Duration("stream-interval", time.Second, "how often each stream shard is read")
 	proxies := fs.String("trusted-proxy", "", "comma-separated CIDRs whose CF-Connecting-IP names the client: the proxy in front, if any")
 	l := server.DefaultLimits()

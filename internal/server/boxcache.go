@@ -8,11 +8,11 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
-// recCache is a bounded LRU of records, each at a rev, and a record never
-// moves back to an older one. Two are kept: what is held of each address, a
-// box's record with its identity's revocations (ARCHITECTURE.md § Memory,
-// for sends and reads of a box), with the addresses a read found missing;
-// and account records (for a sender's limits).
+// recCache is a bounded LRU of records, each at a version, and a record
+// never moves back to an older one. Two are kept: what is held of each
+// address, a box's record with its identity's revocations (ARCHITECTURE.md
+// § Memory, for sends and reads of a box), with the addresses a read found
+// missing; and account records (for a sender's limits).
 //
 // What it holds never goes back to before a write this process has applied
 // (IronGall-dev/irongall-server#12, #41, #95, #96). It counts the writes to
@@ -24,7 +24,7 @@ import (
 // no write to the shard was counted since the token. A copy refused is
 // never put, so no reader is given it.
 type recCache[K comparable, V any] struct {
-	mu  sync.Mutex
+	mu  takings
 	max int // 0: no cache
 	ll  *list.List
 	m   map[K]*list.Element // value: V
@@ -39,13 +39,40 @@ type recCache[K comparable, V any] struct {
 	missing *missCache[K]
 
 	key   func(V) K
-	rev   func(V) uint64
+	ver   func(V) version
 	clone func(V) V
 	// merge, if set, is what two copies of an entry hold together, old the
 	// cached one: fill and image keep it in place of the newer copy alone.
 	merge func(old, cur V) V
 	// note, if set, is told of each hit, miss and eviction (Metrics).
 	note func(event string)
+	// between, in tests, runs in fill and in missed between the check and
+	// the put, under the lock: it is handed the taking of the lock the check
+	// was made under (takings), so that it can tell the lock was held from
+	// the check to the put (IronGall-dev/irongall-client#407 item 3).
+	between func(checked uint64)
+}
+
+// takings is the cache's lock, which counts each taking of it, so that a
+// step can be shown to have held it throughout: a check and its put are one
+// step only where no other taking came between them.
+type takings struct {
+	sync.Mutex
+	n uint64
+}
+
+// Lock takes the lock, and counts it.
+func (t *takings) Lock() {
+	t.Mutex.Lock()
+	t.n++
+}
+
+// stepped runs between, if set: a step's check is done, under the taking
+// checked, and its put comes next.
+func (c *recCache[K, V]) stepped(checked uint64) {
+	if c.between != nil {
+		c.between(checked)
+	}
 }
 
 // token is a shard's write count as a read of one of its keys begins
@@ -59,7 +86,7 @@ type boxCache = recCache[protocol.Address, *Box]
 // writes are counted by the address's first byte.
 func newBoxCache(size int) *boxCache {
 	c := newRecCache(size, 256, func(a protocol.Address) int { return int(a[0]) },
-		func(b *Box) protocol.Address { return b.Addr }, func(b *Box) uint64 { return b.Rev }, cloneBox)
+		func(b *Box) protocol.Address { return b.Addr }, versionOf, cloneBox)
 	c.merge = mergeViews // revocations are never taken away, so neither copy's are lost
 	c.missing = newMissCache[protocol.Address](size)
 	return c
@@ -71,12 +98,12 @@ type accountCache = recCache[string, *Account]
 // serves them all.
 func newAccountCache(size int) *accountCache {
 	return newRecCache(size, 1, func(string) int { return 0 },
-		func(a *Account) string { return a.ID }, func(a *Account) uint64 { return a.Rev }, cloneAccount)
+		func(a *Account) string { return a.ID }, func(a *Account) version { return version{rev: a.Rev} }, cloneAccount)
 }
 
-func newRecCache[K comparable, V any](size, shards int, shard func(K) int, key func(V) K, rev func(V) uint64, clone func(V) V) *recCache[K, V] {
+func newRecCache[K comparable, V any](size, shards int, shard func(K) int, key func(V) K, ver func(V) version, clone func(V) V) *recCache[K, V] {
 	return &recCache[K, V]{max: size, ll: list.New(), m: map[K]*list.Element{}, writes: make([]uint64, shards), shard: shard,
-		key: key, rev: rev, clone: clone}
+		key: key, ver: ver, clone: clone}
 }
 
 func (c *recCache[K, V]) get(k K) (V, bool) {
@@ -106,10 +133,10 @@ func (c *recCache[K, V]) begin(k K) token {
 	return token(c.writes[c.shard(k)])
 }
 
-// fill caches v, a copy read at tok, unless the cache holds a newer rev of
-// it, or merges it with the copy held. For a key the cache does not hold, it
-// puts v only while no write to the key's shard was counted since tok: the
-// write's image found the key not held and changed nothing, so v may be
+// fill caches v, a copy read at tok, unless the cache holds a newer record
+// of it, or merges it with the copy held. For a key the cache does not hold,
+// it puts v only while no write to the key's shard was counted since tok:
+// the write's image found the key not held and changed nothing, so v may be
 // older than it. The check and the put are one step under the lock.
 func (c *recCache[K, V]) fill(v V, tok token) {
 	if c.max == 0 {
@@ -117,10 +144,12 @@ func (c *recCache[K, V]) fill(v V, tok token) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	checked := c.mu.n
 	k := c.key(v)
 	if _, held := c.m[k]; !held && token(c.writes[c.shard(k)]) != tok {
 		return
 	}
+	c.stepped(checked)
 	c.putLocked(v)
 }
 
@@ -131,7 +160,7 @@ func (c *recCache[K, V]) putLocked(v V) {
 		switch {
 		case c.merge != nil:
 			e.Value = c.merge(e.Value.(V), v)
-		case c.rev(e.Value.(V)) <= c.rev(v):
+		case !c.ver(e.Value.(V)).after(c.ver(v)):
 			e.Value = c.clone(v)
 		}
 		c.ll.MoveToFront(e)
@@ -182,23 +211,18 @@ func (c *recCache[K, V]) write(k K, f func(cur V, held, missing bool) (V, bool))
 	}
 }
 
-// image is the write of the stream's image of a record at rev: an entry held
-// at an older rev becomes the record decode reads, merged where the cache
-// merges, or is evicted where decode fails; a key not held stays so, since
-// the next read of it reads the image.
-func (c *recCache[K, V]) image(rev uint64, decode func() (V, error)) func(V, bool, bool) (V, bool) {
+// image is the write of the feed's image of a record, v: an entry held of
+// an older record becomes v, merged where the cache merges; a key not held
+// stays so, since the next read of it reads the image.
+func (c *recCache[K, V]) image(v V) func(V, bool, bool) (V, bool) {
 	return func(cur V, held, _ bool) (V, bool) {
-		if !held || c.rev(cur) >= rev {
+		if !held || !c.ver(v).after(c.ver(cur)) {
 			return cur, held
 		}
-		v, err := decode()
-		if err != nil {
-			return v, false
-		}
 		if c.merge != nil {
-			v = c.merge(cur, v)
+			return c.merge(cur, v), true
 		}
-		return v, true
+		return c.clone(v), true
 	}
 }
 
@@ -239,9 +263,11 @@ func (c *recCache[K, V]) missed(k K, tok token, now time.Time) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	checked := c.mu.n
 	if token(c.writes[c.shard(k)]) != tok {
 		return
 	}
+	c.stepped(checked)
 	c.missing.add(k, now)
 }
 

@@ -641,7 +641,7 @@ func (c *cannedAWS) Do(r *http.Request) (*http.Response, error) {
 		Body:   io.NopCloser(strings.NewReader(body)), Request: r}, nil
 }
 
-// DynamoStore.PutMessage, in process against canned answers: a duplicate
+// The DynamoDB backend's PutMessage, in process against canned answers: a duplicate
 // whose PutItem finds the id's item acked deletes the body it just put, under
 // the key it put it at, and one that finds the item live deletes nothing
 // (IronGall-dev/irongall-server#16, #92). TestADuplicateAfterAnAckLeavesNoBody

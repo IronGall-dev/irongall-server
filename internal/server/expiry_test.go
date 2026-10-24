@@ -99,7 +99,7 @@ func TestTheRecordAndTheRevocationsAreTwoItems(t *testing.T) {
 	e.want(e.do("PUT", r.path("/revocations"), r.certs(1), ""), 200, "")
 	get := func(key map[string]types.AttributeValue) item {
 		t.Helper()
-		out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.boxes, Key: key, ConsistentRead: aws.Bool(true)})
+		out, err := s.dynamo().db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.dynamo().boxes, Key: key, ConsistentRead: aws.Bool(true)})
 		if err != nil {
 			t.Fatal(err)
 		}

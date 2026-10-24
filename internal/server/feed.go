@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,11 +18,12 @@ import (
 
 // feed follows one table's DynamoDB stream: every shard, each parent before
 // its children (AWS docs, DynamoDB Streams, reading and processing a stream),
-// applying each change to the process's memory. It keeps no position across
-// restarts: a restart rebuilds memory from the tables and follows the streams
-// from then on. Each of its calls to AWS is bounded as the store's are
-// (bounded): one that never answers ends there, and fails its pass as any
-// failed read does, so the follower reads again at its next pass.
+// handing each change to memory (dynamoBackend.Start). It keeps no position
+// across restarts: a restart rebuilds memory from the tables and follows the
+// streams from then on. Each of its calls to AWS is bounded as the store's
+// are (boundedStreams): one that never answers ends there, and fails its
+// pass as any failed read does, so the follower reads again at its next
+// pass.
 type feed struct {
 	streams  streamsAPI
 	interval time.Duration
@@ -41,6 +43,32 @@ type streamsAPI interface {
 	GetShardIterator(context.Context, *dynamodbstreams.GetShardIteratorInput, ...func(*dynamodbstreams.Options)) (*dynamodbstreams.GetShardIteratorOutput, error)
 	GetRecords(context.Context, *dynamodbstreams.GetRecordsInput, ...func(*dynamodbstreams.Options)) (*dynamodbstreams.GetRecordsOutput, error)
 }
+
+// boundedStreams is the follower's view of its streams, each call bounded by
+// storeTimeout whatever context the follower hands it: the one bound of the
+// streams' calls, as bound is of the store's other calls to AWS.
+type boundedStreams struct{ streamsAPI }
+
+func (b boundedStreams) DescribeStream(ctx context.Context, in *dynamodbstreams.DescribeStreamInput, o ...func(*dynamodbstreams.Options)) (*dynamodbstreams.DescribeStreamOutput, error) {
+	ctx, cancel := bounded(ctx)
+	defer cancel()
+	return b.streamsAPI.DescribeStream(ctx, in, o...)
+}
+
+func (b boundedStreams) GetShardIterator(ctx context.Context, in *dynamodbstreams.GetShardIteratorInput, o ...func(*dynamodbstreams.Options)) (*dynamodbstreams.GetShardIteratorOutput, error) {
+	ctx, cancel := bounded(ctx)
+	defer cancel()
+	return b.streamsAPI.GetShardIterator(ctx, in, o...)
+}
+
+func (b boundedStreams) GetRecords(ctx context.Context, in *dynamodbstreams.GetRecordsInput, o ...func(*dynamodbstreams.Options)) (*dynamodbstreams.GetRecordsOutput, error) {
+	ctx, cancel := bounded(ctx)
+	defer cancel()
+	return b.streamsAPI.GetRecords(ctx, in, o...)
+}
+
+// api is the follower's streams, each call bounded.
+func (f *feed) api() streamsAPI { return boundedStreams{f.streams} }
 
 type shard struct {
 	id, parent string
@@ -70,8 +98,6 @@ func lost(err error) bool {
 
 // streamARN returns a table's stream, which must carry new images.
 func streamARN(ctx context.Context, db *dynamodb.Client, table string) (string, error) {
-	ctx, cancel := bounded(ctx)
-	defer cancel()
 	t, err := db.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: &table})
 	if err != nil {
 		return "", err
@@ -99,11 +125,9 @@ func (f *feed) position(ctx context.Context, arn string) error {
 		if s.SequenceNumberRange != nil && s.SequenceNumberRange.EndingSequenceNumber != nil {
 			sh.done = true
 		} else {
-			call, cancel := bounded(ctx)
-			out, err := f.streams.GetShardIterator(call, &dynamodbstreams.GetShardIteratorInput{
+			out, err := f.api().GetShardIterator(ctx, &dynamodbstreams.GetShardIteratorInput{
 				StreamArn: &f.arn, ShardId: s.ShardId, ShardIteratorType: stypes.ShardIteratorTypeLatest,
 			})
-			cancel()
 			if err != nil {
 				return err
 			}
@@ -119,9 +143,7 @@ func (f *feed) list(ctx context.Context) ([]stypes.Shard, error) {
 	var all []stypes.Shard
 	in := &dynamodbstreams.DescribeStreamInput{StreamArn: &f.arn}
 	for {
-		call, cancel := bounded(ctx)
-		out, err := f.streams.DescribeStream(call, in)
-		cancel()
+		out, err := f.api().DescribeStream(ctx, in)
 		if err != nil {
 			return nil, err
 		}
@@ -233,9 +255,7 @@ func (f *feed) read(ctx context.Context, sh *shard) error {
 		default:
 			in.ShardIteratorType = stypes.ShardIteratorTypeTrimHorizon
 		}
-		call, cancel := bounded(ctx)
-		out, err := f.streams.GetShardIterator(call, in)
-		cancel()
+		out, err := f.api().GetShardIterator(ctx, in)
 		if lost(err) {
 			return &errLost{err}
 		}
@@ -248,9 +268,7 @@ func (f *feed) read(ctx context.Context, sh *shard) error {
 		}
 	}
 	for {
-		call, cancel := bounded(ctx)
-		out, err := f.streams.GetRecords(call, &dynamodbstreams.GetRecordsInput{ShardIterator: sh.iter, Limit: aws.Int32(1000)})
-		cancel()
+		out, err := f.api().GetRecords(ctx, &dynamodbstreams.GetRecordsInput{ShardIterator: sh.iter, Limit: aws.Int32(1000)})
 		var expired *stypes.ExpiredIteratorException
 		if errors.As(err, &expired) {
 			sh.iter = nil // re-positioned after the last record, next pass
@@ -278,26 +296,84 @@ func (f *feed) read(ctx context.Context, sh *shard) error {
 	}
 }
 
-// applyBoxRecord applies one record of the -boxes-table stream to memory.
-func (s *DynamoStore) applyBoxRecord(r stypes.Record) {
+// boxStreamChange is the change a record of the -boxes-table stream makes:
+// to a box's record (sk 0x00), or to an address's revocations (sk 0x01).
+// Other items under an address are not memory's, and make none (Kind 0). An
+// image that does not read is a change with Err; a key that does not read
+// is an error, and the record is skipped.
+func boxStreamChange(r stypes.Record) (Change, error) {
 	if r.Dynamodb == nil {
-		return
+		return Change{}, nil
 	}
-	if r.EventName == stypes.OperationTypeRemove {
-		s.applyBoxRemoval(fromStream(r.Dynamodb.Keys))
-		return
+	gone := r.EventName == stypes.OperationTypeRemove
+	it := fromStream(r.Dynamodb.NewImage)
+	if gone {
+		it = fromStream(r.Dynamodb.Keys)
 	}
-	s.applyBoxImage(fromStream(r.Dynamodb.NewImage))
+	a, sk, err := boxItemKey(it)
+	if err != nil {
+		return Change{}, err
+	}
+	c := Change{Addr: a, Gone: gone}
+	switch {
+	case bytes.Equal(sk, []byte{skBox}):
+		c.Kind = RecordChange
+		if !gone {
+			c.Box, c.Err = decodeBox(it)
+		}
+	case bytes.Equal(sk, []byte{skRevocations}):
+		c.Kind = RevocationsChange
+		if !gone {
+			c.Revocations, c.Err = decodeRevocations(it)
+		}
+	}
+	return c, nil
 }
 
-// applyMsgRecord applies one record of the -msgs-table stream to memory. A
-// removal is ignored: nothing deletes a message item but the TTL,
-// after the message expired, and memory drops a mark at its expiry.
-func (s *DynamoStore) applyMsgRecord(r stypes.Record) {
-	if r.Dynamodb == nil || r.EventName == stypes.OperationTypeRemove {
-		return
+// msgStreamChange is the change a record of the -msgs-table stream makes to
+// a message: in the list, out of it (acked, or its body found gone), or
+// gone, which only the TTL makes, after the message expired.
+func msgStreamChange(r stypes.Record) (Change, error) {
+	if r.Dynamodb == nil {
+		return Change{}, nil
 	}
-	s.applyMsgImage(fromStream(r.Dynamodb.NewImage))
+	gone := r.EventName == stypes.OperationTypeRemove
+	it := fromStream(r.Dynamodb.NewImage)
+	if gone {
+		it = fromStream(r.Dynamodb.Keys)
+	}
+	box, err := it.hash("box")
+	if err != nil {
+		return Change{}, err
+	}
+	c := Change{Kind: MessageChange, Addr: box, Gone: gone}
+	if !gone {
+		c.Header, c.Live, c.Err = decodeMsg(it)
+	}
+	return c, nil
+}
+
+// accountStreamChange is the change a record of the -accounts-table stream
+// makes to an account's record (sk 0x00). Its other items, adopt keys, are
+// not memory's.
+func accountStreamChange(r stypes.Record) (Change, error) {
+	if r.Dynamodb == nil {
+		return Change{}, nil
+	}
+	gone := r.EventName == stypes.OperationTypeRemove
+	it := fromStream(r.Dynamodb.NewImage)
+	if gone {
+		it = fromStream(r.Dynamodb.Keys)
+	}
+	id, rec, err := accountRecord(it)
+	if err != nil || !rec {
+		return Change{}, err
+	}
+	c := Change{Kind: AccountChange, AccountID: id, Gone: gone}
+	if !gone {
+		c.Account, c.Err = decodeAccount(it)
+	}
+	return c, nil
 }
 
 // fromStream converts a stream image to the DynamoDB client's types: the two

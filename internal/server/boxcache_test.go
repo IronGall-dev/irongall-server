@@ -45,7 +45,7 @@ func TestAFillAfterAWriteItDidNotSeeIsNotKept(t *testing.T) {
 	a[0], other[0] = 1, 2
 	c := newBoxCache(10)
 	tok := c.begin(a)
-	c.write(a, c.image(3, func() (*Box, error) { return &Box{Addr: a, Rev: 3}, nil })) // rev 3's image, dropped: a is not held
+	c.write(a, c.image(&Box{Addr: a, Rev: 3})) // rev 3's image, dropped: a is not held
 	c.fill(&Box{Addr: a, Rev: 2}, tok)
 	if b, ok := c.get(a); ok {
 		t.Fatalf("a copy at rev %d, read before a write it did not see, was kept", b.Rev)
@@ -89,7 +89,7 @@ func TestAWriteAndAFillAreEachOneStepUnderTheLock(t *testing.T) {
 		return true
 	}
 	c = newRecCache(10, 256, func(a protocol.Address) int { return int(a[0]) },
-		func(b *Box) protocol.Address { return b.Addr }, func(b *Box) uint64 { return b.Rev },
+		func(b *Box) protocol.Address { return b.Addr }, versionOf,
 		func(b *Box) *Box {
 			if !held() {
 				unlocked++
@@ -204,7 +204,7 @@ func TestMergedCopiesKeepEveryRevocation(t *testing.T) {
 	}
 }
 
-// cannedTables answers a DynamoStore from items held in the test, in
+// cannedTables answers a store on DynamoDB from items held in the test, in
 // process: a Query of the boxes table with the address's items, one of the
 // live index with none, a GetItem of the accounts table with the account's
 // record, and a PutItem with a failed condition, as a registration that
@@ -283,7 +283,7 @@ func (c *cannedTables) Do(r *http.Request) (*http.Response, error) {
 		Body:   io.NopCloser(bytes.NewReader(b)), Request: r}, nil
 }
 
-func (c *cannedTables) store() *DynamoStore {
+func (c *cannedTables) store() *Memory {
 	return NewDynamoStore(DynamoConfig{AWS: aws.Config{Region: "us-east-1", Credentials: credentials.NewStaticCredentialsProvider("AKIDEXAMPLE", "x", ""),
 		HTTPClient: c, BaseEndpoint: aws.String("http://127.0.0.1:1")}, BoxesTable: "b", MsgsTable: "m", AccountsTable: "a", Bucket: "s", BoxCache: 10})
 }
@@ -307,30 +307,30 @@ func TestAWriteDuringAReadKeepsItsFillOut(t *testing.T) {
 	newer["rev"] = num(rec.Rev + 1)
 	acc := &Account{ID: "an account", Rev: 1}
 	s := (&cannedTables{address: []map[string]types.AttributeValue{boxItem(rec)}, account: accountItem(acc)}).store()
+	f := injectFaults(s)
 	for _, c := range []struct {
-		name, point string
-		read        func() error
-		write       func()
-		kept        func() bool
+		name, read string // the read of the backend, at whose answer the write lands
+		call       func() error
+		write      func()
+		kept       func() bool
 	}{
-		{"a read of the address", "address: after the read", func() error { _, err := s.Box(ctx, a); return err },
+		{"a read of the address", "ReadAddress", func() error { _, err := s.Box(ctx, a); return err },
 			func() { s.applyBoxImage(newer) }, func() bool { _, ok := s.cache.get(a); return ok }},
-		{"the box's load", "address: after the read", func() error { s.idx.forget(a); _, err := s.Count(ctx, a); return err },
+		{"the box's load", "ReadAddress", func() error { s.idx.forget(a); _, err := s.Count(ctx, a); return err },
 			func() { s.applyBoxImage(newer) }, func() bool { _, ok := s.cache.get(a); return ok }},
-		{"an account's read", "account: after the read", func() error { _, err := s.Account(ctx, acc.ID); return err },
+		{"an account's read", "Account", func() error { _, err := s.Account(ctx, acc.ID); return err },
 			func() { s.applyAccountRecord(accountChange(stypes.OperationTypeModify, acc.ID, 2)) }, func() bool { _, ok := s.accCache.get(acc.ID); return ok }},
 	} {
 		for _, during := range []bool{true, false} {
 			s.cache.evict(a)
 			s.accCache.evict(acc.ID)
-			s.fault = func(p string) error {
-				if during && p == c.point {
+			f.read = func(method string) {
+				if during && method == c.read {
 					c.write()
 				}
-				return nil
 			}
-			err := c.read()
-			s.fault = nil
+			err := c.call()
+			f.read = nil
 			if err != nil {
 				t.Fatalf("%s: %v", c.name, err)
 			}
@@ -422,6 +422,7 @@ func TestTheStreamsChangesAreCounted(t *testing.T) {
 // each through applyBoxImage, which counts it (#97).
 func TestAnImageDuringAReadKeepsItsFillOut(t *testing.T) {
 	e, s := dynamoEnv(t)
+	f := injectFaults(s)
 	ctx := context.Background()
 	r := e.raw().register(protocol.MaxPrekeyLifetime)
 	a := r.id.Address()
@@ -451,14 +452,13 @@ func TestAnImageDuringAReadKeepsItsFillOut(t *testing.T) {
 			{"the box's load", func() error { s.idx.forget(a); _, err := s.Count(ctx, a); return err }},
 		} {
 			s.cache.evict(a)
-			s.fault = func(p string) error {
-				if p == "address: after the read" {
+			f.read = func(method string) {
+				if method == "ReadAddress" {
 					s.applyBoxImage(im.it)
 				}
-				return nil
 			}
 			err := c.read()
-			s.fault = nil
+			f.read = nil
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -494,14 +494,14 @@ func TestAnAccountChangeDuringItsReadKeepsTheFillOut(t *testing.T) {
 	ctx := context.Background()
 	acc, _ := accountEnv(t, e, false, 1)
 	s.accCache.evict(acc.ID)
-	s.fault = func(p string) error {
-		if p == "account: after the read" {
+	f := injectFaults(s)
+	f.read = func(method string) {
+		if method == "Account" {
 			s.applyAccountRecord(accountChange(stypes.OperationTypeModify, acc.ID, acc.Rev+1)) // the stream brought a change meanwhile
 		}
-		return nil
 	}
 	_, err := s.Account(ctx, acc.ID)
-	s.fault = nil
+	f.read = nil
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,24 +584,24 @@ func TestEveryOrderOfAFillAndAWrite(t *testing.T) {
 	const id = "an account"
 
 	// A read of the address begun before the write, whose copy is v, fills
-	// the cache once it has read (DynamoStore.Box, readBox).
-	read := func(s *DynamoStore, v *Box) []func() {
+	// the cache once it has read (Memory.Box, readBox).
+	read := func(s *Memory, v *Box) []func() {
 		tok := s.cache.begin(a)
 		return []func(){func() { s.cache.fill(v, tok) }}
 	}
 	// applyBox, this process's write of a record whose view, b, it read
 	// before the write.
-	applyBox := func(s *DynamoStore, b *Box) []func() { return []func(){func() { s.applyBox(b) }} }
-	revoke := func(s *DynamoStore) func() { return func() { s.applyRevocations(a, revocation) } }
-	accountRead := func(s *DynamoStore) []func() {
+	applyBox := func(s *Memory, b *Box) []func() { return []func(){func() { s.applyBox(b) }} }
+	revoke := func(s *Memory) func() { return func() { s.applyRevocations(a, revocation) } }
+	accountRead := func(s *Memory) []func() {
 		tok := s.accCache.begin(id)
 		return []func(){func() { s.accCache.fill(&Account{ID: id, Rev: 1}, tok) }}
 	}
 	// What memory answers of the address with no read, as a lookup and a
 	// send's check of its recipient ask it.
-	known := func(s *DynamoStore) (*Box, bool) { return s.Known(a) }
-	withoutTheRevocation := func(s *DynamoStore) bool { b, ok := known(s); return ok && (b == nil || b.State != Revoked) }
-	withoutTheRecord := func(s *DynamoStore) bool { b, ok := known(s); return ok && (b == nil || b.Rev < 2) }
+	known := func(s *Memory) (*Box, bool) { return s.Known(a) }
+	withoutTheRevocation := func(s *Memory) bool { b, ok := known(s); return ok && (b == nil || b.State != Revoked) }
+	withoutTheRecord := func(s *Memory) bool { b, ok := known(s); return ok && (b == nil || b.Rev < 2) }
 
 	type actors struct {
 		fill, write []func()
@@ -609,42 +609,42 @@ func TestEveryOrderOfAFillAndAWrite(t *testing.T) {
 	}
 	for _, c := range []struct {
 		name  string
-		mk    func(s *DynamoStore) actors
-		stale func(s *DynamoStore) bool // memory answers without the write
+		mk    func(s *Memory) actors
+		stale func(s *Memory) bool // memory answers without the write
 	}{
-		{"a read's fill and applyBox of this process's write", func(s *DynamoStore) actors {
+		{"a read's fill and applyBox of this process's write", func(s *Memory) actors {
 			w := applyBox(s, newer)
 			return actors{read(s, older), w, len(w)}
 		}, withoutTheRecord},
-		{"a read's fill and a revocation of the address", func(s *DynamoStore) actors {
+		{"a read's fill and a revocation of the address", func(s *Memory) actors {
 			return actors{read(s, older), []func(){revoke(s)}, 1}
 		}, withoutTheRevocation},
-		{"a read's fill and a revocation with its purge", func(s *DynamoStore) actors {
+		{"a read's fill and a revocation with its purge", func(s *Memory) actors {
 			return actors{read(s, older), []func(){revoke(s), func() { s.forget(a) }}, 1}
 		}, withoutTheRevocation},
-		{"a read's fill and the record's removal", func(s *DynamoStore) actors {
+		{"a read's fill and the record's removal", func(s *Memory) actors {
 			return actors{read(s, older), []func(){func() { s.forget(a) }}, 1}
-		}, func(s *DynamoStore) bool { b, ok := known(s); return ok && b != nil && b.hasRecord() }},
-		{"a read's fill and the stream's image of a newer record", func(s *DynamoStore) actors {
+		}, func(s *Memory) bool { b, ok := known(s); return ok && b != nil && b.hasRecord() }},
+		{"a read's fill and the stream's image of a newer record", func(s *Memory) actors {
 			return actors{read(s, older), []func(){func() { s.applyBoxImage(item(boxItem(newer))) }}, 1}
 		}, withoutTheRecord},
-		{"a read that found nothing and a revocation of the address", func(s *DynamoStore) actors {
+		{"a read that found nothing and a revocation of the address", func(s *Memory) actors {
 			tok := s.cache.begin(a)
 			return actors{[]func(){func() { s.cache.missed(a, tok, s.now()) }}, []func(){revoke(s)}, 1}
-		}, func(s *DynamoStore) bool { b, ok := known(s); return ok && b == nil }},
-		{"a registration's applyBox and a revocation of the address", func(s *DynamoStore) actors {
+		}, func(s *Memory) bool { b, ok := known(s); return ok && b == nil }},
+		{"a registration's applyBox and a revocation of the address", func(s *Memory) actors {
 			s.cache.missed(a, s.cache.begin(a), s.now()) // the registration's read finds nothing
 			return actors{applyBox(s, older), []func(){revoke(s)}, 1}
 		}, withoutTheRevocation},
-		{"applyBox of a write whose view predates a revocation the cache did not hold", func(s *DynamoStore) actors {
+		{"applyBox of a write whose view predates a revocation the cache did not hold", func(s *Memory) actors {
 			return actors{applyBox(s, newer), []func(){revoke(s)}, 1}
 		}, withoutTheRevocation},
-		{"an account's read and the stream's change to it", func(s *DynamoStore) actors {
+		{"an account's read and the stream's change to it", func(s *Memory) actors {
 			return actors{accountRead(s), []func(){func() { s.applyAccountRecord(accountChange(stypes.OperationTypeModify, id, 2)) }}, 1}
-		}, func(s *DynamoStore) bool { got, ok := s.accCache.get(id); return ok && got.Rev < 2 }},
-		{"an account's read and its removal", func(s *DynamoStore) actors {
+		}, func(s *Memory) bool { got, ok := s.accCache.get(id); return ok && got.Rev < 2 }},
+		{"an account's read and its removal", func(s *Memory) actors {
 			return actors{accountRead(s), []func(){func() { s.applyAccountRecord(accountChange(stypes.OperationTypeRemove, id, 1)) }}, 1}
-		}, func(s *DynamoStore) bool { _, ok := s.accCache.get(id); return ok }},
+		}, func(s *Memory) bool { _, ok := s.accCache.get(id); return ok }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			first := c.mk(NewDynamoStore(DynamoConfig{BoxCache: 10}))
@@ -683,12 +683,12 @@ func TestEveryOrderOfAFillAndAWrite(t *testing.T) {
 	}
 }
 
-// heldRead is memory's DynamoStore over a table of one address, held in the
+// heldRead is a store's memory over a table of one address, held in the
 // test: each read of the address answers what the table holds as the read
 // begins, as a strongly consistent read does, and the first read is held
 // until released.
 type heldRead struct {
-	*DynamoStore
+	*Memory
 	mu      sync.Mutex
 	table   *Box
 	reads   int
@@ -743,7 +743,7 @@ func TestALookupJoinedToAReadBegunBeforeARevocationReadsAgain(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				s := &heldRead{DynamoStore: NewDynamoStore(DynamoConfig{BoxCache: 10}), table: rec, release: make(chan struct{})}
+				s := &heldRead{Memory: NewDynamoStore(DynamoConfig{BoxCache: 10}), table: rec, release: make(chan struct{})}
 				srv := New(Config{Store: s, Limits: relaxed()})
 				lookup := func() chan *Box {
 					got := make(chan *Box, 1)

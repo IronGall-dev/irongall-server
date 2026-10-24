@@ -5,13 +5,11 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
-	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	stypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
 )
 
 // The accounts table (PROTOCOL.md §6.5): account is the account id's
@@ -71,84 +69,49 @@ func decodeAccount(it item) (*Account, error) {
 	return &Account{ID: id, Unmetered: u.Value, Rev: rev}, nil
 }
 
-// Account implements Store: the cache, or a strongly consistent read, so a
-// change made before it is in it (one made after reaches the cache by the
-// stream, or, where it was counted after the read's token, keeps the fill
-// out: recCache.fill).
-func (s *DynamoStore) Account(ctx context.Context, id string) (*Account, error) {
-	if a, ok := s.accCache.get(id); ok {
-		return a, nil
-	}
-	tok := s.accCache.begin(id)
-	ctx, cancel := bounded(ctx)
-	defer cancel()
+// Account implements Backend: a strongly consistent read, so a change made
+// before it is in it.
+func (s *dynamoBackend) Account(ctx context.Context, id string) (*Account, error) {
 	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.accts, Key: accountKey(id, skAccount), ConsistentRead: aws.Bool(true)})
 	if err != nil {
-		return nil, err
-	}
-	if err := s.failAt("account: after the read"); err != nil {
 		return nil, err
 	}
 	if out.Item == nil {
 		return nil, ErrNotFound
 	}
-	a, err := decodeAccount(out.Item)
-	if err != nil {
-		return nil, err
-	}
-	s.accCache.fill(a, tok)
-	return a, nil
+	return decodeAccount(out.Item)
 }
 
-// CreateAccount implements Store.
-func (s *DynamoStore) CreateAccount(ctx context.Context, a *Account) error {
-	a.Rev = 1
-	ctx, cancel := bounded(ctx)
-	defer cancel()
-	seen := new(atomic.Bool)
+// CreateAccount implements Backend.
+func (s *dynamoBackend) CreateAccount(ctx context.Context, a *Account) error {
+	n := new(note)
 	_, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                &s.accts,
 		Item:                     accountItem(a),
 		ConditionExpression:      aws.String("attribute_not_exists(#a)"),
 		ExpressionAttributeNames: map[string]string{"#a": "account"},
-	}, notingRetries(seen))
-	if err != nil && seen.Load() {
-		return retriedAfter{err}
-	}
-	if _, ok := isConditionFailed(err); ok {
-		return ErrExists
-	}
-	return err
+	}, n.option())
+	return written(err, n, ErrExists)
 }
 
-// PutAdoptKey implements Store. Its expiry is also the item's TTL.
-func (s *DynamoStore) PutAdoptKey(ctx context.Context, k *AdoptKey) error {
+// PutAdoptKey implements Backend. Its expiry is also the item's TTL.
+func (s *dynamoBackend) PutAdoptKey(ctx context.Context, k *AdoptKey) error {
 	it := adoptKeyKey(k.Account, k.Hash)
 	it["uses"] = num(uint64(k.Uses)) //nolint:gosec // uses are not negative
 	it["expires"] = num(ms(k.Expires))
 	it["expires_at"] = num(ttlSeconds(ms(k.Expires)))
-	ctx, cancel := bounded(ctx)
-	defer cancel()
-	seen := new(atomic.Bool)
+	n := new(note)
 	_, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                &s.accts,
 		Item:                     it,
 		ConditionExpression:      aws.String("attribute_not_exists(#a)"),
 		ExpressionAttributeNames: map[string]string{"#a": "account"},
-	}, notingRetries(seen))
-	if err != nil && seen.Load() {
-		return retriedAfter{err}
-	}
-	if _, ok := isConditionFailed(err); ok {
-		return ErrExists
-	}
-	return err
+	}, n.option())
+	return written(err, n, ErrExists)
 }
 
-// AdoptKey implements Store.
-func (s *DynamoStore) AdoptKey(ctx context.Context, account string, hash [32]byte) (*AdoptKey, error) {
-	ctx, cancel := bounded(ctx)
-	defer cancel()
+// AdoptKey implements Backend.
+func (s *dynamoBackend) AdoptKey(ctx context.Context, account string, hash [32]byte) (*AdoptKey, error) {
 	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.accts, Key: adoptKeyKey(account, hash), ConsistentRead: aws.Bool(true)})
 	if err != nil {
 		return nil, err
@@ -181,9 +144,9 @@ func boxRevCheck(b *Box, expr string, names map[string]string, values map[string
 	}
 }
 
-// Adopt implements Store: in one transaction, the box record names the
+// Adopt implements Backend: in one transaction, the box record names the
 // account, and the key loses a use.
-func (s *DynamoStore) Adopt(ctx context.Context, b *Box, account string, key [32]byte) error {
+func (s *dynamoBackend) Adopt(ctx context.Context, b *Box, account string, key [32]byte) error {
 	upd := boxRevCheck(b, "SET #acct = :acct, #rev = :new", map[string]string{"#acct": "account"}, map[string]types.AttributeValue{":acct": bin([]byte(account))})
 	upd.TableName = &s.boxes
 	items := []types.TransactWriteItem{
@@ -197,20 +160,13 @@ func (s *DynamoStore) Adopt(ctx context.Context, b *Box, account string, key [32
 			ExpressionAttributeValues: map[string]types.AttributeValue{":one": num(1), ":now": num(s.nowMs())},
 		}},
 	}
-	if err := s.transact(ctx, b, items, map[int]error{0: ErrStale, 1: ErrKeyRefused}); err != nil {
-		return s.unsettled(b.Addr, err)
-	}
-	b.Account, b.Rev = account, b.Rev+1
-	s.applyBox(b)
-	return nil
+	return s.transact(ctx, items, map[int]error{0: ErrStale, 1: ErrKeyRefused})
 }
 
-// Leave implements Store: the box record names no account.
-func (s *DynamoStore) Leave(ctx context.Context, b *Box) error {
+// Leave implements Backend: the box record names no account.
+func (s *dynamoBackend) Leave(ctx context.Context, b *Box) error {
 	upd := boxRevCheck(b, "REMOVE #acct SET #rev = :new", map[string]string{"#acct": "account"}, map[string]types.AttributeValue{})
-	ctx, cancel := bounded(ctx)
-	defer cancel()
-	seen := new(atomic.Bool)
+	n := new(note)
 	_, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.boxes,
 		Key:                       upd.Key,
@@ -218,20 +174,8 @@ func (s *DynamoStore) Leave(ctx context.Context, b *Box) error {
 		ConditionExpression:       upd.ConditionExpression,
 		ExpressionAttributeNames:  upd.ExpressionAttributeNames,
 		ExpressionAttributeValues: upd.ExpressionAttributeValues,
-	}, notingRetries(seen))
-	if err != nil && seen.Load() {
-		return s.unsettled(b.Addr, retriedAfter{err})
-	}
-	if _, ok := isConditionFailed(err); ok || isTransactionConflict(err) {
-		s.cache.evict(b.Addr) // the cached record may be the stale one
-		return ErrStale
-	}
-	if err != nil {
-		return s.unsettled(b.Addr, err)
-	}
-	b.Account, b.Rev = "", b.Rev+1
-	s.applyBox(b)
-	return nil
+	}, n.option())
+	return written(err, n, ErrStale)
 }
 
 // A transaction that meets another on one of its items is cancelled for a
@@ -246,32 +190,36 @@ const (
 	transactPause = 25 * time.Millisecond
 )
 
-// transact writes items in one transaction. A condition that failed is the
-// error named for its item, whatever else met another; a failed box
-// condition also evicts the box's cached record, which may be the stale one.
-// A conflict that lasts every try is ErrStale, and evicts it too. The SDK
-// gives one call's transaction a client token, the same on each of its
-// attempts, and "if the original TransactWriteItems call was successful,
-// then subsequent TransactWriteItems calls with the same client token return
-// successfully without making any changes" (Amazon DynamoDB Developer Guide,
-// Transaction APIs, Idempotency): so a failed condition here is a refusal
-// stated, and no attempt is noted (noting).
-func (s *DynamoStore) transact(ctx context.Context, b *Box, items []types.TransactWriteItem, failed map[int]error) error {
+// transact writes items in one transaction, its calls sharing one note
+// (note): an attempt of any of them that left open whether it was applied
+// leaves the write open whatever came after, a throttle, an answer that the
+// transaction is in progress, or the retry quota running out among them
+// (IronGall-dev/irongall-server#101). A condition that failed is the
+// refusal named for its item in failed, whatever else met another; a
+// conflict that lasts every try is ErrStale. The SDK gives one call's
+// transaction a client token, the same on each of its attempts, and "if the
+// original TransactWriteItems call was successful, then subsequent
+// TransactWriteItems calls with the same client token return successfully
+// without making any changes" (Amazon DynamoDB Developer Guide, Transaction
+// APIs, Idempotency): so a failed condition is a refusal stated after an
+// attempt of its own call, but not after one of an earlier call, which
+// carried another token.
+func (s *dynamoBackend) transact(ctx context.Context, items []types.TransactWriteItem, failed map[int]error) error {
+	n := new(note)
 	for try := 1; ; try++ {
-		call, cancel := bounded(ctx)
-		_, err := s.db.TransactWriteItems(call, &dynamodb.TransactWriteItemsInput{TransactItems: items})
-		cancel()
+		earlier := n.seen.Load() // an attempt of an earlier call, under another token
+		_, err := s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items}, n.option())
 		var tc *types.TransactionCanceledException
 		if !errors.As(err, &tc) {
-			return err
+			return written(err, n, nil)
 		}
 		conflict := false
 		for i, r := range tc.CancellationReasons {
 			switch aws.ToString(r.Code) {
 			case "ConditionalCheckFailed":
 				if e, ok := failed[i]; ok {
-					if errors.Is(e, ErrStale) {
-						s.cache.evict(b.Addr)
+					if earlier { // a call before this one, under another token, may have been applied
+						return written(err, n, nil)
 					}
 					return e
 				}
@@ -280,10 +228,12 @@ func (s *DynamoStore) transact(ctx context.Context, b *Box, items []types.Transa
 			}
 		}
 		if !conflict {
-			return err
+			return written(err, n, nil)
 		}
 		if try == transactTries {
-			s.cache.evict(b.Addr)
+			if n.seen.Load() { // a try before may have been applied
+				return written(err, n, nil)
+			}
 			return ErrStale
 		}
 		pause := time.NewTimer(rand.N(transactPause << (try - 1))) //nolint:gosec // a pause's jitter, no secret
@@ -291,7 +241,7 @@ func (s *DynamoStore) transact(ctx context.Context, b *Box, items []types.Transa
 		case <-pause.C:
 		case <-ctx.Done():
 			pause.Stop()
-			return ctx.Err()
+			return written(ctx.Err(), n, nil)
 		}
 	}
 }
@@ -302,42 +252,4 @@ func (s *DynamoStore) transact(ctx context.Context, b *Box, items []types.Transa
 func isTransactionConflict(err error) bool {
 	var tc *types.TransactionConflictException
 	return errors.As(err, &tc)
-}
-
-// applyAccountRecord applies one record of the -accounts-table stream to the
-// account cache, as a write (recCache.write). Only an account's record
-// counts.
-func (s *DynamoStore) applyAccountRecord(r stypes.Record) {
-	if r.Dynamodb == nil {
-		return
-	}
-	if r.EventName == stypes.OperationTypeRemove {
-		id, rec, err := accountRecord(fromStream(r.Dynamodb.Keys))
-		if err != nil {
-			s.logf("accounts: skipping a removal: %v", err)
-			return
-		}
-		if rec {
-			s.accCache.write(id, evicted[*Account])
-		}
-		return
-	}
-	it := fromStream(r.Dynamodb.NewImage)
-	id, rec, err := accountRecord(it)
-	if err != nil {
-		s.logf("accounts: skipping an item: %v", err)
-		return
-	}
-	if !rec {
-		return
-	}
-	rev, err := it.uint("rev")
-	if err != nil {
-		s.logf("accounts: skipping an account record: %v", err)
-		// Counted all the same, so a read begun before it puts nothing; what
-		// is held stays.
-		s.accCache.write(id, func(cur *Account, held, _ bool) (*Account, bool) { return cur, held })
-		return
-	}
-	s.accCache.write(id, s.accCache.image(rev, func() (*Account, error) { return decodeAccount(it) }))
 }

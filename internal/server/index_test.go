@@ -127,12 +127,12 @@ func TestIndex(t *testing.T) {
 	t.Run("standing only moves forward", func(t *testing.T) {
 		first, second := Standing{State: Active, Cert: [32]byte{1}}, Standing{State: Active, Cert: [32]byte{2}}
 		x := loaded(t, box, boxRead{exists: true, st: first, rev: 1})
-		x.setStanding(box, second, 3)
-		x.setStanding(box, first, 1) // a late image
+		x.setStanding(box, second, version{rev: 3})
+		x.setStanding(box, first, version{rev: 1}) // a late image
 		if st, ok := x.standing(box); !ok || st != second {
 			t.Fatalf("standing %v %v", st, ok)
 		}
-		x.setStanding(box, Standing{State: Active, Cert: [32]byte{3}}, 4)
+		x.setStanding(box, Standing{State: Active, Cert: [32]byte{3}}, version{rev: 4})
 		if st, _ := x.standing(box); st.Cert != [32]byte{3} {
 			t.Fatal("a later standing not kept")
 		}
@@ -140,7 +140,7 @@ func TestIndex(t *testing.T) {
 		if _, ok := x.standing(box); ok {
 			t.Fatal("a deleted record kept its standing")
 		}
-		x.setStanding(box, first, 1) // registered again: the next use loads it, so nothing is held until then
+		x.setStanding(box, first, version{rev: 1}) // registered again: the next use loads it, so nothing is held until then
 		if _, ok := x.standing(box); ok {
 			t.Fatal("a box memory forgot was taken back from a change")
 		}
@@ -157,12 +157,12 @@ func TestIndex(t *testing.T) {
 		if st, _ := x.standing(box); !st.Listed {
 			t.Fatal("certificates revoked through 5 did not list the box's 5")
 		}
-		x.setStanding(box, Standing{State: Active, CertSerial: 6}, 2) // a renewal above them
+		x.setStanding(box, Standing{State: Active, CertSerial: 6}, version{rev: 2}) // a renewal above them
 		if st, _ := x.standing(box); st.Listed {
 			t.Fatal("a renewal above the revoked certificates is still listed")
 		}
 		x.setRevocations(box, true, 0)
-		x.setStanding(box, Standing{State: Active, CertSerial: 7}, 3)
+		x.setStanding(box, Standing{State: Active, CertSerial: 7}, version{rev: 3})
 		if st, ok := x.standing(box); !ok || st.State != Revoked {
 			t.Fatalf("a revoked address: %+v %v", st, ok)
 		}
@@ -193,7 +193,7 @@ func TestIndexLoad(t *testing.T) {
 	t.Run("a change to a box memory does not hold is dropped", func(t *testing.T) {
 		x := newIndex()
 		x.insert(box, k1, now)
-		x.setStanding(box, Standing{State: Revoked}, 9)
+		x.setStanding(box, Standing{State: Revoked}, version{rev: 9})
 		if err := x.ensure(ctx, box, func() (boxRead, error) {
 			return boxRead{exists: true, st: Standing{State: Active}, rev: 1}, nil
 		}); err != nil {
@@ -225,7 +225,7 @@ func TestIndexLoad(t *testing.T) {
 		}
 		x.remove(box, k1.tag, k1.exp, now, true) // acked meanwhile
 		x.insert(box, k2, now)                   // and a new message
-		x.setStanding(box, Standing{State: Active, Cert: [32]byte{1}}, 2)
+		x.setStanding(box, Standing{State: Active, Cert: [32]byte{1}}, version{rev: 2})
 		close(release)
 		if err := <-done; err != nil {
 			t.Fatal(err)

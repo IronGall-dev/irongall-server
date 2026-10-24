@@ -227,14 +227,14 @@ func (b *Box) withRevocations(rv *Revocations) (*Box, error) {
 	return c, nil
 }
 
-// mergeViews is what two reads of one address hold together: the record of
-// the higher rev, and every revocation either holds, since none is ever
+// mergeViews is what two reads of one address hold together: the newer
+// record (version), and every revocation either holds, since none is ever
 // taken away: the revocation of the address if either holds it, and the
 // higher revocation of its certificates (higherCerts). Nothing is dropped
 // for a list that does not parse (IronGall-dev/irongall-server#64).
 func mergeViews(old, cur *Box) *Box {
 	base, other := cur, old
-	if old.Rev > cur.Rev {
+	if versionOf(old).after(versionOf(cur)) {
 		base, other = old, cur
 	}
 	m := cloneBox(base)
@@ -415,19 +415,149 @@ func expiry(p *protocol.Prekey, cert *protocol.Certificate) time.Time {
 	return cert.NotAfter()
 }
 
-// Store errors.
+// Store errors. A write's error is one of two outcomes (Memory.write): a
+// refusal the store stated, of a write it did not make, which these name
+// (and errNotStored, errRefused, a duplicate); or ErrUnknown, which leaves
+// open whether the write was applied. A write that returns nil was applied.
 var (
 	ErrNotFound = errors.New("not found")
 	ErrExists   = errors.New("already exists")
 	ErrStale    = errors.New("the record changed since it was read")
 	// ErrKeyRefused is an adopt key that is spent, expired or gone.
 	ErrKeyRefused = errors.New("the adopt key is spent, expired or revoked")
+	// ErrUnknown is a write's error that leaves open whether it was
+	// applied: an answer lost, a timeout, a fault of the backend's own, or
+	// any error a backend did not state as a refusal. It wraps the cause.
+	// A count reserved for the write is kept (LIMITS.md rule 4).
+	ErrUnknown = errors.New("the write may have been applied")
 )
 
+// errRefused marks a backend's error as a refusal it stated, of a write it
+// did not make: AWS's throttle or its answer of 4xx to the call itself, or
+// a step of a multi-step write that failed before its item's write, and
+// changed nothing memory holds (an ack's body not deleted, a delete of a
+// box's mail that deleted no body).
+var errRefused = errors.New("refused")
+
+// refused is err, marked as a refusal stated (errRefused).
+func refused(err error) error { return fmt.Errorf("%w: %w", errRefused, err) }
+
+// unknown is err, marked as leaving open whether its write was applied.
+func unknown(err error) error {
+	if errors.Is(err, ErrUnknown) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrUnknown, err)
+}
+
+// duplicate is a send's refusal, stated by the store: the message item of
+// another send of the same ciphertext was there first, live or acked, and
+// h is its header. A send answers from it (PROTOCOL-SERVER.md §7).
+type duplicate struct{ h *Header }
+
+func (d duplicate) Error() string { return "a message of the same ciphertext is held" }
+
+// isRefusal reports whether a backend's error is a refusal it stated. Any
+// other error leaves open whether its write was applied.
+func isRefusal(err error) bool {
+	return !errors.Is(err, ErrUnknown) && (errors.Is(err, ErrExists) || errors.Is(err, ErrStale) || errors.Is(err, ErrNotFound) ||
+		errors.Is(err, ErrKeyRefused) || errors.Is(err, errNotStored) || errors.Is(err, errRefused) || errors.As(err, new(duplicate)))
+}
+
+// errNotStored is a send's error that the store states left nothing stored:
+// its body's PUT failed, before its item was written, whatever S3 answered
+// (IronGall-dev/irongall-server#90).
+var errNotStored = errors.New("not stored")
+
+// version is a record's place in its address's history: the time its box
+// registered, to the millisecond as the store keeps it, then its rev. A box
+// registered again once the TTL took its record starts at rev 1 again, and
+// later (IronGall-dev/irongall-client#407 item 2). It is the one comparison
+// of two records of an address: the record cache's (putLocked, image,
+// mergeViews) and the index's (setStanding). An account's has its rev
+// alone.
+type version struct{ created, rev uint64 }
+
+// after reports whether v is a later record than o.
+func (v version) after(o version) bool {
+	return v.created > o.created || v.created == o.created && v.rev > o.rev
+}
+
+// versionOf is b's record's version: 0 for a view with no record.
+func versionOf(b *Box) version {
+	if b.Created.IsZero() {
+		return version{rev: b.Rev}
+	}
+	return version{ms(b.Created), b.Rev}
+}
+
+// storeTimeout bounds each call to AWS the store makes, a read as a write,
+// whatever context its caller hands it (bound, boundedStreams), and each
+// read that a call shared by several callers makes apart from the request
+// that started it: a lookup's read of a box's record (Server.lead) and the
+// reads of a send's steps 6 to 9 (Server.deliver).
+const storeTimeout = 10 * time.Second
+
+// bounded is ctx bounded by storeTimeout: for a read that callers share,
+// made apart from their requests, on any store (Server.deliver), and for
+// each call of the stream follower (boundedStreams). A handler hands every
+// store write a context apart from its request (detached), so that what a
+// write changed is counted and reaches memory whenever the write was made
+// (IronGall-dev/irongall-server#14), and a call that callers share reads on
+// one (IronGall-dev/irongall-server#91).
+func bounded(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, storeTimeout)
+}
+
+func ms(t time.Time) uint64     { return uint64(t.UnixMilli()) }          //nolint:gosec // times after 1970
+func fromMs(v uint64) time.Time { return time.UnixMilli(int64(v)).UTC() } //nolint:gosec // decoded from our own keys
+
+// ttlMs is how long a message is kept after it was received, in ms: the
+// TTL less the hour the maker of a time-limited thing leaves, and a post's own
+// time (protocol.Retention).
+var ttlMs = uint64(protocol.Retention / time.Millisecond)
+
+func cloneBox(b *Box) *Box {
+	c := *b
+	c.Retired = slices.Clone(b.Retired)
+	c.SenderKeyTypes = slices.Clone(b.SenderKeyTypes)
+	c.RevokedCerts, c.RevokedCertsSig = slices.Clone(b.RevokedCerts), slices.Clone(b.RevokedCertsSig)
+	c.ACL = cloneACL(b.ACL)
+	if b.Prekey != nil {
+		p := *b.Prekey
+		c.Prekey = &p
+	}
+	return &c
+}
+
+// cloneACL copies an ACL, which a box record holds and nothing changes in
+// place: it is replaced whole.
+func cloneACL(a *protocol.ACL) *protocol.ACL {
+	if a == nil {
+		return nil
+	}
+	c := *a
+	c.Allow.Addrs, c.Deny.Addrs = slices.Clone(a.Allow.Addrs), slices.Clone(a.Deny.Addrs)
+	return &c
+}
+
+// storedRecord is what a store keeps of b as its record: none of what its
+// identity revoked, which is kept apart, and the state the record says.
+func storedRecord(b *Box) *Box {
+	c := cloneBox(b)
+	c.Revocation, c.RevokedCerts, c.RevokedCertsSig = nil, nil, nil
+	return c
+}
+
+func cloneAccount(a *Account) *Account {
+	c := *a
+	return &c
+}
+
 // Store is the server's state: box records, message headers with their
-// dedupe records, and bodies. MemStore keeps it in memory (the dev server);
-// DynamoStore keeps it in DynamoDB + S3 Express, with what a poll needs in
-// memory.
+// dedupe records, and bodies, and what a poll needs of them in memory. Its
+// one implementation is Memory, over a Backend: DynamoDB and S3 Express
+// (NewDynamoStore), or maps in this process (NewMemStore, the dev server).
 type Store interface {
 	// Held returns the standing of a box memory holds, with no read. ok is
 	// false for a box this process has not loaded, which only its record
@@ -442,8 +572,7 @@ type Store interface {
 	Known(a protocol.Address) (b *Box, ok bool)
 	// Begin returns a token of address a, which only grows: what Box
 	// answers once it is taken holds every write this process applied to a
-	// before it. A store with no memory but the store itself, whose Known is
-	// never behind, returns 0.
+	// before it.
 	Begin(a protocol.Address) uint64
 	// CreateBox stores a new box's record at Rev 1, or returns ErrExists if
 	// the address has one.
@@ -487,8 +616,8 @@ type Store interface {
 	// §6.2). A message already gone is no error.
 	DeleteFrom(ctx context.Context, box protocol.Address, from func(protocol.Address) bool) error
 
-	// Account returns an account's record, or ErrNotFound. A store with
-	// memory reads it on its first use, then answers from memory.
+	// Account returns an account's record, or ErrNotFound: read on its
+	// first use, then answered from memory.
 	Account(ctx context.Context, id string) (*Account, error)
 	// CreateAccount stores a new account at Rev 1, or returns ErrExists.
 	CreateAccount(ctx context.Context, a *Account) error
@@ -508,8 +637,8 @@ type Store interface {
 	Leave(ctx context.Context, b *Box) error
 
 	// Count returns the number of live messages in a box. Count and
-	// PairCount answer from memory: a store with memory loads the box on its
-	// first use, then answers from memory.
+	// PairCount answer from memory: the box is loaded on its first use, and
+	// answered from memory after that.
 	Count(ctx context.Context, box protocol.Address) (n int, err error)
 	// PairCount returns how many live messages from one sender a box holds,
 	// and when the oldest of them expires.

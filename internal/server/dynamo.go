@@ -26,20 +26,22 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
 )
 
-// DynamoStore is the production store (PROTOCOL-SERVER.md §7): box records in one
-// DynamoDB table, messages in another (each item its header and its dedupe
-// record), accounts in a third, bodies in an S3 Express One Zone directory
-// bucket. What a poll needs lives in memory (index), loaded per box on its
-// first use, and bounded caches of box and account records serve sends
-// (recCache). This process's own writes and each table's stream (feed) keep
-// all three current.
+// dynamoBackend is the production backend (PROTOCOL-SERVER.md §7): box
+// records in one DynamoDB table, messages in another (each item its header
+// and its dedupe record), accounts in a third, bodies in an S3 Express One
+// Zone directory bucket, and each table's stream for the feed (feed). It is
+// the mapping of the AWS SDK to the Backend's operations and their three
+// outcomes, and nothing more: what a write's answer means is read in one
+// place (written), and every call to AWS is bounded in one place (bound, and
+// boundedStreams for the streams).
 //
 // A send writes the body, then the message item; an ack deletes the body,
 // then takes the item out of the list. Neither pair is atomic, and neither
 // needs to be: each step is safe to repeat.
-type DynamoStore struct {
+type dynamoBackend struct {
 	db     *dynamodb.Client
 	s3     *s3.Client
 	boxes  string // -boxes-table
@@ -52,25 +54,22 @@ type DynamoStore struct {
 	// consistent makes every read strongly consistent; otherwise only the
 	// reads that fill memory are (DynamoConfig.ConsistentReads).
 	consistent bool
-	// loads counts boxes read into memory, for tests.
-	loads atomic.Int64
 
-	idx      *index
-	cache    *boxCache // with the boxes a read found missing
-	accCache *accountCache
-	boxFeed  *feed // the -boxes-table stream: the box cache and standing
-	msgFeed  *feed // the -msgs-table stream: layer 1's marks
-	accFeed  *feed // the -accounts-table stream: the account cache
-	metrics  *Metrics
-	fatal    func(error)
-	ready    atomic.Bool
+	streams                   streamsAPI
+	interval                  time.Duration
+	boxFeed, msgFeed, accFeed *feed
+	apply                     func(Change) // what Start was given
+	metrics                   *Metrics
+	fatal                     func(error)
+	ready                     atomic.Bool
 
-	// fault, in tests, fails a write sequence at a named point, as a crash
-	// there would leave it, or does there what a test needs to happen then.
-	fault func(point string) error
+	// crash, in tests, fails a write of two steps between them, as a
+	// crash there would leave it: "put: after the body", "ack: after the
+	// body".
+	crash func(step string) error
 }
 
-// DynamoConfig configures a DynamoStore.
+// DynamoConfig configures a store over DynamoDB and S3 Express.
 type DynamoConfig struct {
 	AWS                                          aws.Config
 	BoxesTable, MsgsTable, AccountsTable, Bucket string
@@ -100,62 +99,99 @@ type DynamoConfig struct {
 	Metrics *Metrics
 }
 
-// NewDynamoStore returns a store that is not ready until Start returns.
-func NewDynamoStore(c DynamoConfig) *DynamoStore {
-	s := &DynamoStore{
-		db:         dynamodb.NewFromConfig(c.AWS),
-		s3:         s3.NewFromConfig(c.AWS),
+// NewDynamoStore returns the store over DynamoDB and S3 Express: Memory
+// over the DynamoDB backend, not ready until Start returns.
+func NewDynamoStore(c DynamoConfig) *Memory {
+	s := newMemory(c.Now, c.BoxCache, c.Log, c.Metrics)
+	if c.StreamInterval <= 0 {
+		c.StreamInterval = time.Second
+	}
+	d := &dynamoBackend{
+		db:         dynamodb.NewFromConfig(c.AWS, func(o *dynamodb.Options) { o.APIOptions = append(o.APIOptions, bound) }),
+		s3:         newS3(c.AWS),
+		streams:    dynamodbstreams.NewFromConfig(c.AWS),
 		boxes:      c.BoxesTable,
 		msgs:       c.MsgsTable,
 		accts:      c.AccountsTable,
 		bucket:     c.Bucket,
-		now:        c.Now,
-		log:        redacting(c.Log),
+		now:        s.clock,
+		log:        s.log,
 		consistent: c.ConsistentReads,
-		idx:        newIndex(),
-		cache:      newBoxCache(c.BoxCache),
-		accCache:   newAccountCache(c.BoxCache),
+		interval:   c.StreamInterval,
 		metrics:    c.Metrics,
 		fatal:      c.Fatal,
 	}
-	if s.now == nil {
-		s.now = time.Now
-	}
-	if c.StreamInterval <= 0 {
-		c.StreamInterval = time.Second
-	}
-	if m := c.Metrics; m != nil {
-		s.cache.note = func(e string) { m.cacheEvent("boxes", e) }
-		s.cache.missing.note = func(e string) { m.cacheEvent("missing", e) }
-		s.accCache.note = func(e string) { m.cacheEvent("accounts", e) }
-	}
-	streams := dynamodbstreams.NewFromConfig(c.AWS)
-	newFeed := func(table string, apply func(stypes.Record)) *feed {
-		applied := func(r stypes.Record) {
-			apply(r)
-			if r.Dynamodb != nil && r.Dynamodb.ApproximateCreationDateTime != nil {
-				c.Metrics.applied(table, *r.Dynamodb.ApproximateCreationDateTime, s.now())
-			}
-		}
-		return &feed{streams: streams, interval: c.StreamInterval, apply: applied, logf: s.logf, shards: map[string]*shard{}}
-	}
-	s.boxFeed, s.msgFeed, s.accFeed = newFeed("boxes", s.applyBoxRecord), newFeed("messages", s.applyMsgRecord), newFeed("accounts", s.applyAccountRecord)
+	d.boxFeed, d.msgFeed, d.accFeed = d.newFeed("boxes", boxStreamChange), d.newFeed("messages", msgStreamChange), d.newFeed("accounts", accountStreamChange)
+	s.backend = d
 	return s
 }
 
-func (s *DynamoStore) logf(format string, args ...any) {
+// newS3 is an S3 client on cfg, each call bounded (bound).
+func newS3(cfg aws.Config, opts ...func(*s3.Options)) *s3.Client {
+	return s3.NewFromConfig(cfg, append([]func(*s3.Options){func(o *s3.Options) { o.APIOptions = append(o.APIOptions, bound) }}, opts...)...)
+}
+
+// bound is the one bound on each call the DynamoDB backend makes to
+// DynamoDB and S3, its retries included, whatever context its caller handed
+// it: storeTimeout, as the first step of every operation's stack, which the
+// SDK's documented way to change every call of a client is (its APIOptions).
+// A body S3 answers with is read after its call returns, within the same
+// bound, which ends when the body is closed. A call that never answers ends
+// there, and its caller is answered 503; a write's caller meets a write
+// whose outcome is unknown.
+func bound(stack *middleware.Stack) error {
+	return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("irongallBound", func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
+		ctx, cancel := context.WithTimeout(ctx, storeTimeout)
+		out, md, err := next.HandleInitialize(ctx, in)
+		if o, ok := out.Result.(*s3.GetObjectOutput); ok && err == nil && o.Body != nil {
+			o.Body = cancelOnClose{o.Body, cancel}
+			return out, md, err
+		}
+		cancel()
+		return out, md, err
+	}), middleware.Before)
+}
+
+// cancelOnClose is a body read within its call's bound, which ends when the
+// body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c cancelOnClose) Close() error {
+	defer c.cancel()
+	return c.ReadCloser.Close()
+}
+
+func (s *dynamoBackend) logf(format string, args ...any) {
 	if s.log != nil {
 		s.log.Printf(format, args...)
 	}
 }
 
-// Start positions a follower on every open shard of the three streams, then
-// returns; the streams are followed until ctx ends. Memory starts empty, and
-// a box is loaded on its first use, after the positioning: a change made
-// before its load is in the load, one made after reaches memory by a stream,
-// or both, and applying it twice is harmless (ARCHITECTURE.md § Startup).
-// Nothing is kept across restarts.
-func (s *DynamoStore) Start(ctx context.Context) error {
+// newFeed is the follower of a table's stream, which hands each change,
+// as change decodes it, to what Start was given.
+func (s *dynamoBackend) newFeed(table string, change func(stypes.Record) (Change, error)) *feed {
+	applied := func(r stypes.Record) {
+		switch c, err := change(r); {
+		case err != nil:
+			s.logf("%s: skipping a record whose key does not read: %v", table, err)
+		case c.Kind != 0 && s.apply != nil:
+			s.apply(c)
+		}
+		if r.Dynamodb != nil && r.Dynamodb.ApproximateCreationDateTime != nil {
+			s.metrics.applied(table, *r.Dynamodb.ApproximateCreationDateTime, s.now())
+		}
+	}
+	return &feed{streams: s.streams, interval: s.interval, apply: applied, logf: s.logf, shards: map[string]*shard{}}
+}
+
+// Start implements Backend: it positions a follower on every open shard of
+// the three streams, then returns; the streams are followed until ctx ends,
+// each change handed to apply.
+func (s *dynamoBackend) Start(ctx context.Context, apply func(Change)) error {
+	s.apply = apply
 	feeds := []struct {
 		f     *feed
 		table string
@@ -182,8 +218,8 @@ func (s *DynamoStore) Start(ctx context.Context) error {
 	return nil
 }
 
-// Ready reports whether the three streams are followed.
-func (s *DynamoStore) Ready() bool { return s.ready.Load() }
+// Ready implements Backend: the three streams are followed.
+func (s *dynamoBackend) Ready() bool { return s.ready.Load() }
 
 // Keys. Every key is binary. Boxes: addr is the address, sk 0x00 its box's
 // record and 0x01 its revocations, the identity's, kept with or without a
@@ -199,15 +235,7 @@ const (
 	accountIndex       = "account"
 )
 
-// ttlMs is how long a message is kept after it was received, in ms: the
-// TTL less the hour the maker of a time-limited thing leaves, and a post's own
-// time (protocol.Retention).
-var ttlMs = uint64(protocol.Retention / time.Millisecond)
-
-func ms(t time.Time) uint64     { return uint64(t.UnixMilli()) }          //nolint:gosec // times after 1970
-func fromMs(v uint64) time.Time { return time.UnixMilli(int64(v)).UTC() } //nolint:gosec // decoded from our own keys
-
-func (s *DynamoStore) nowMs() uint64 { return ms(s.now()) }
+func (s *dynamoBackend) nowMs() uint64 { return ms(s.now()) }
 
 // ttlSeconds is the TTL attribute: DynamoDB deletes the item some time after
 // it, so reads judge expiry from received_at.
@@ -525,9 +553,9 @@ func decodeRevocations(it item) (*Revocations, error) {
 	return rv, nil
 }
 
-// readAddress reads what the boxes table holds of address a, in one Query
-// of its items: its box's record and its revocations, each nil if absent.
-func (s *DynamoStore) readAddress(ctx context.Context, a protocol.Address, consistent bool) (*Box, *Revocations, error) {
+// ReadAddress implements Backend: one strongly consistent Query of the
+// address's items, its box's record and its revocations.
+func (s *dynamoBackend) ReadAddress(ctx context.Context, a protocol.Address) (*Box, *Revocations, error) {
 	var rec *Box
 	var rv *Revocations
 	p := dynamodb.NewQueryPaginator(s.db, &dynamodb.QueryInput{
@@ -535,12 +563,10 @@ func (s *DynamoStore) readAddress(ctx context.Context, a protocol.Address, consi
 		KeyConditionExpression:    aws.String("#a = :a"),
 		ExpressionAttributeNames:  map[string]string{"#a": "addr"},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":a": bin(a[:])},
-		ConsistentRead:            aws.Bool(consistent),
+		ConsistentRead:            aws.Bool(true),
 	})
 	for p.HasMorePages() {
-		page, cancel := bounded(ctx)
-		out, err := p.NextPage(page)
-		cancel()
+		out, err := p.NextPage(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -560,9 +586,6 @@ func (s *DynamoStore) readAddress(ctx context.Context, a protocol.Address, consi
 				}
 			}
 		}
-	}
-	if err := s.failAt("address: after the read"); err != nil {
-		return nil, nil, err
 	}
 	return rec, rv, nil
 }
@@ -627,13 +650,6 @@ func decodeLive(it item) (*Header, error) {
 	return &Header{ID: id, From: from, Size: int(size), ReceivedAt: fromMs(recv), ExpiresAt: fromMs(recv + ttlMs)}, nil //nolint:gosec // sizes are small
 }
 
-func (s *DynamoStore) failAt(point string) error {
-	if s.fault == nil {
-		return nil
-	}
-	return s.fault(point)
-}
-
 func isConditionFailed(err error) (*types.ConditionalCheckFailedException, bool) {
 	var ccf *types.ConditionalCheckFailedException
 	return ccf, errors.As(err, &ccf)
@@ -660,152 +676,100 @@ func IsThrottle(err error) bool {
 	return false
 }
 
-// retriedAfter is a write's error when the SDK retried it after an attempt
-// that left open whether it was applied (a fault of AWS's own, an answer
-// lost, a timeout): the write may have been applied whatever the last
-// attempt answered, a failed condition or a throttle among them, since a
-// failed condition may be the one that attempt's own write makes
-// (IronGall-dev/irongall-server#89). mayHaveApplied takes none for a
-// refusal.
-type retriedAfter struct{ err error }
+// note records whether a write's calls made an attempt that left open
+// whether it was applied: a fault of AWS's own, an answer lost, a timeout,
+// which the SDK retries. One note serves every call of one write, a
+// transaction's tries among them (IronGall-dev/irongall-server#101), so a
+// write one attempt of which left it open stays open whatever came after
+// (written).
+type note struct{ seen atomic.Bool }
 
-func (r retriedAfter) Error() string {
-	return "after an attempt that may have been applied: " + r.err.Error()
-}
-
-func (r retriedAfter) Unwrap() error { return r.err }
-
-// noting is the SDK's retryer, noting in seen each failed attempt it would
-// retry for an error that is not a throttle: one that leaves open whether
-// the attempt was applied. It is asked of every failed attempt, the last
+// noting is the SDK's retryer, noting each failed attempt it would retry
+// for an error that is not a throttle: one that leaves open whether the
+// attempt was applied. It is asked of every failed attempt, the last
 // included, and of one whose retry the retry quota then refuses.
 type noting struct {
 	aws.RetryerV2
-	seen *atomic.Bool
+	n *note
 }
 
 func (n noting) IsErrorRetryable(err error) bool {
 	ok := n.RetryerV2.IsErrorRetryable(err)
 	if ok && !IsThrottle(err) {
-		n.seen.Store(true)
+		n.n.seen.Store(true)
 	}
 	return ok
 }
 
-// notingRetries is the option of one call that notes in seen an attempt
-// that left open whether it was applied (noting). Every conditional write of
-// one item carries it, whose retry would otherwise read its own applied
-// attempt as a failed condition, and so does DeleteBox, whose retry may be
-// throttled after one; Adopt's transaction needs none (transact). The SDK's
-// retryers, retry.Standard and retry.AdaptiveMode, are each a RetryerV2.
-func notingRetries(seen *atomic.Bool) func(*dynamodb.Options) {
+// option is the option of each write call the note serves: the client's
+// retryer, noting. The SDK's retryers, retry.Standard and
+// retry.AdaptiveMode, are each a RetryerV2.
+func (n *note) option() func(*dynamodb.Options) {
 	return func(o *dynamodb.Options) {
 		if v2, ok := o.Retryer.(aws.RetryerV2); ok {
-			o.Retryer = noting{RetryerV2: v2, seen: seen}
+			o.Retryer = noting{RetryerV2: v2, n: n}
 		}
 	}
 }
 
-// errNotStored is a send's error that the store states left nothing stored:
-// its body's PUT failed, before its item was written, whatever S3 answered
-// (IronGall-dev/irongall-server#90).
-var errNotStored = errors.New("not stored")
-
-// unsettled returns err, the error of a write to what is held of address a,
-// once memory holds nothing the write may have changed: one that may have
-// been applied all the same (mayHaveApplied) makes the process forget the
-// address, as a record's removal does (forget). The record cache counts it
-// as a write and keeps no copy, so a read begun before it puts nothing after
-// it (recCache.write), and the index drops the box, so its standing from
-// before the write checks no pass; the next use reads the record. A refusal
-// stated changes nothing there.
-func (s *DynamoStore) unsettled(a protocol.Address, err error) error {
-	if mayHaveApplied(err) {
-		s.forget(a)
+// written is the one reading of what AWS answered a write of this backend,
+// as one of the three outcomes (Backend); cond is the refusal the write's
+// condition states when it fails, or nil for a write with none. err nil:
+// applied. After an attempt that left it open (n): unknown, whatever came
+// after, a failed condition or a throttle among them, since a failed
+// condition may be the one that attempt's own write makes
+// (IronGall-dev/irongall-server#89). Otherwise a refusal stated: the
+// write's condition failed (cond), or it met a transaction on its item,
+// which changes the item if it commits, so it is answered as its failed
+// condition; a throttle or the SDK's retry quota running out; or any other
+// answer of 4xx, whatever fault the SDK gives it (those of DynamoDB's
+// refusals the SDK does not model carry none; #90). Anything else is
+// unknown: an answer lost, a timeout, a fault of AWS's own.
+func written(err error, n *note, cond error) error {
+	if err == nil {
+		return nil
 	}
-	return err
+	if n != nil && n.seen.Load() {
+		return fmt.Errorf("%w, after an attempt that left it open: %w", ErrUnknown, err)
+	}
+	if _, ok := isConditionFailed(err); ok && cond != nil || isTransactionConflict(err) && cond != nil {
+		return cond
+	}
+	var status interface{ HTTPStatusCode() int }
+	if IsThrottle(err) || errors.As(err, &status) && status.HTTPStatusCode() >= 400 && status.HTTPStatusCode() < 500 {
+		return refused(err)
+	}
+	return unknown(err)
 }
 
-// storeTimeout bounds each call to AWS the store makes, a read as a write,
-// whatever context its caller hands it (bounded), and each read that a call
-// shared by several callers makes apart from the request that started it: a
-// lookup's read of a box's record (Server.lead) and the reads of a send's
-// steps 6 to 9 (Server.deliver).
-const storeTimeout = 10 * time.Second
-
-// bounded is ctx bounded by storeTimeout. The store bounds each of its calls
-// to AWS with it, so that no call outlasts it however its caller made ctx: a
-// handler hands every store write a context apart from its request
-// (detached), so that what a write changed is counted and reaches memory
-// whenever the write was made (IronGall-dev/irongall-server#14), and a call
-// that callers share reads on one (IronGall-dev/irongall-server#91). It bounds
-// each call, not a whole delete of a box's mail or a box's load, which are
-// many.
-func bounded(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(ctx, storeTimeout)
-}
-
-// ensure loads box a into memory on its first use by this process. The
-// callers that come while it loads share the load, so it reads apart from
-// the context of the caller that began it, and each of its calls is bounded
-// (bounded).
-func (s *DynamoStore) ensure(ctx context.Context, a protocol.Address) error {
-	return s.idx.ensure(ctx, a, func() (boxRead, error) {
-		return s.readBox(context.WithoutCancel(ctx), a)
-	})
-}
-
-// readBox reads what memory holds of a box: its record's standing, its
-// identity's revocations and its live messages, strongly consistent, so a
-// change made before the read is in it (one made after reaches memory by a
-// stream). What it read joins the cache, as of its token (recCache.fill).
-func (s *DynamoStore) readBox(ctx context.Context, a protocol.Address) (boxRead, error) {
-	s.loads.Add(1)
-	var r boxRead
-	tok := s.cache.begin(a)
-	rec, rv, err := s.readAddress(ctx, a, true)
-	if err != nil {
-		return r, err
-	}
-	if b := view(a, rec, rv); b != nil {
-		s.cache.fill(b, tok)
-	}
-	if rv != nil {
-		r.revoked, r.through = len(rv.Address) > 0, rv.Through
-	}
-	if rec == nil {
-		return r, nil // no box: no mail either
-	}
-	if r.st, _, err = rec.standing(); err != nil {
-		return r, err
-	}
-	r.exists, r.rev = true, rec.Rev
-	p := dynamodb.NewQueryPaginator(s.db, s.liveQuery(a, s.liveFrom(), true))
+// ReadLive implements Backend: one strongly consistent Query of the box's
+// entries in the live index, which a local secondary index allows.
+func (s *dynamoBackend) ReadLive(ctx context.Context, box protocol.Address) ([]Header, error) {
+	var hs []Header
+	p := dynamodb.NewQueryPaginator(s.db, s.liveQuery(box, s.liveFrom(), true))
 	for p.HasMorePages() {
-		page, cancel := bounded(ctx)
-		out, err := p.NextPage(page)
-		cancel()
+		out, err := p.NextPage(ctx)
 		if err != nil {
-			return r, err
+			return nil, err
 		}
 		for _, it := range out.Items {
 			h, err := decodeLive(it)
 			if err != nil {
-				return r, err
+				return nil, err
 			}
-			r.marks = append(r.marks, s.idx.newMark(h.ID, h.From, ms(h.ReceivedAt)+ttlMs))
+			hs = append(hs, *h)
 		}
 	}
-	return r, nil
+	return hs, nil
 }
 
 // liveFrom is the lowest live key at now: received_at > now − Retention
 // (ttlMs, protocol.Retention), so an expired message the TTL has not yet
 // deleted is never read.
-func (s *DynamoStore) liveFrom() []byte { return liveKey(s.nowMs()-ttlMs+1, [32]byte{}) }
+func (s *dynamoBackend) liveFrom() []byte { return liveKey(s.nowMs()-ttlMs+1, [32]byte{}) }
 
 // liveQuery is a Query of a box's entries in the live index from lo.
-func (s *DynamoStore) liveQuery(box protocol.Address, lo []byte, consistent bool) *dynamodb.QueryInput {
+func (s *dynamoBackend) liveQuery(box protocol.Address, lo []byte, consistent bool) *dynamodb.QueryInput {
 	return &dynamodb.QueryInput{
 		TableName:                 &s.msgs,
 		IndexName:                 aws.String(liveIndex),
@@ -817,133 +781,21 @@ func (s *DynamoStore) liveQuery(box protocol.Address, lo []byte, consistent bool
 	}
 }
 
-// Held implements Store: the standing of a box memory has loaded.
-func (s *DynamoStore) Held(a protocol.Address) (Standing, bool) { return s.idx.standing(a) }
-
-// applyBox records a box record this process wrote: b is what is held of
-// its address, the record and the revocations read with it. Those were read
-// before the write, so in the step that counts the write (recCache.write)
-// b merges with what the cache holds of the address, every image since
-// applied to it, and where the cache holds nothing, joins it only where the
-// read before a registration found the address missing and no write to it
-// was counted since. A read begun before the write puts nothing after it.
-func (s *DynamoStore) applyBox(b *Box) {
-	s.cache.write(b.Addr, func(cur *Box, held, missing bool) (*Box, bool) {
-		switch {
-		case held:
-			return mergeViews(cur, b), true
-		case missing:
-			return cloneBox(b), true
-		}
-		return nil, false
-	})
-	st, _, err := storedRecord(b).standing()
-	if err != nil { // a record this process just checked and wrote
-		s.logf("boxes: a record written with a bad identity: %v", err)
-		return
-	}
-	s.idx.setStanding(b.Addr, st, b.Rev)
-}
-
-// applyRevocations records an address's revocations as they now are, from
-// this process's write or the stream.
-func (s *DynamoStore) applyRevocations(a protocol.Address, rv *Revocations) {
-	s.cache.write(a, func(cur *Box, held, _ bool) (*Box, bool) {
-		if !held {
-			return nil, false
-		}
-		m, err := cur.withRevocations(rv)
-		return m, err == nil // one that fails is evicted: the next use reads it
-	})
-	s.idx.setRevocations(a, len(rv.Address) > 0, rv.Through)
-}
-
-// forget drops what memory holds of an address whose record was deleted,
-// or that a write whose answer was lost may have changed (unsettled), so
-// that its next use reads it again. A deletion seen on the stream may be of
-// a record older than one this process has written since: the read after it
-// is what tells.
-func (s *DynamoStore) forget(a protocol.Address) {
-	s.cache.write(a, evicted[*Box])
-	s.idx.forget(a)
-}
-
-// Box implements Store: the cache, or a read. An address the read finds
-// nothing of is remembered as missing for a while (missCache), so naming it
-// again costs no read. The read fills the cache, so it is strongly
-// consistent, as a box's load is: a write made before it is in it, and one
-// made after reaches the cache by the stream, or, where it was counted
-// after the read's token, keeps the fill out (recCache.fill, missed).
-func (s *DynamoStore) Box(ctx context.Context, a protocol.Address) (*Box, error) {
-	if b, ok := s.cache.get(a); ok {
-		return b, nil
-	}
-	if s.cache.missingAt(a, s.now()) {
-		return nil, ErrNotFound
-	}
-	tok := s.cache.begin(a)
-	rec, rv, err := s.readAddress(ctx, a, true)
-	if err != nil {
-		return nil, err
-	}
-	b := view(a, rec, rv)
-	if b == nil {
-		s.cache.missed(a, tok, s.now())
-		return nil, ErrNotFound
-	}
-	s.cache.fill(b, tok)
-	return b, nil
-}
-
-// Known implements Store: the record cache, or the memory of a box a read did
-// not find.
-func (s *DynamoStore) Known(a protocol.Address) (*Box, bool) {
-	if b, ok := s.cache.get(a); ok {
-		return b, true
-	}
-	return nil, s.cache.missingAt(a, s.now())
-}
-
-// Begin implements Store: a's token in the record cache (recCache.begin).
-func (s *DynamoStore) Begin(a protocol.Address) uint64 { return uint64(s.cache.begin(a)) }
-
-// CreateBox implements Store.
-func (s *DynamoStore) CreateBox(ctx context.Context, b *Box) error {
-	if err := b.writable(); err != nil {
-		return err
-	}
-	b.Rev = 1
-	ctx, cancel := bounded(ctx)
-	defer cancel()
-	seen := new(atomic.Bool)
+// CreateBox implements Backend.
+func (s *dynamoBackend) CreateBox(ctx context.Context, b *Box) error {
+	n := new(note)
 	_, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                &s.boxes,
 		Item:                     boxItem(b),
 		ConditionExpression:      aws.String("attribute_not_exists(#a)"),
 		ExpressionAttributeNames: map[string]string{"#a": "addr"},
-	}, notingRetries(seen))
-	if err != nil && seen.Load() {
-		return s.unsettled(b.Addr, retriedAfter{err})
-	}
-	if _, ok := isConditionFailed(err); ok {
-		// It has a record, whoever wrote it, and what is cached of it is the
-		// stale view.
-		s.cache.write(b.Addr, evicted[*Box])
-		return ErrExists
-	}
-	if err != nil {
-		return s.unsettled(b.Addr, err)
-	}
-	s.applyBox(b)
-	return nil
+	}, n.option())
+	return written(err, n, ErrExists) // it has a record, whoever wrote it
 }
 
-// UpdateBox implements Store: every attribute that can change, if the record
-// is still at b.Rev. Attributes it does not name are left alone.
-func (s *DynamoStore) UpdateBox(ctx context.Context, b *Box) error {
-	if err := b.writable(); err != nil {
-		return err
-	}
+// UpdateBox implements Backend: every attribute that can change, if the
+// record is still at b.Rev. Attributes it does not name are left alone.
+func (s *dynamoBackend) UpdateBox(ctx context.Context, b *Box) error {
 	next := cloneBox(b)
 	next.Rev = b.Rev + 1
 	names := map[string]string{}
@@ -955,9 +807,7 @@ func (s *DynamoStore) UpdateBox(ctx context.Context, b *Box) error {
 		sets = append(sets, "#"+k+" = :"+k)
 	}
 	slices.Sort(sets)
-	ctx, cancel := bounded(ctx)
-	defer cancel()
-	seen := new(atomic.Bool)
+	n := new(note)
 	_, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.boxes,
 		Key:                       boxKey(b.Addr),
@@ -965,42 +815,22 @@ func (s *DynamoStore) UpdateBox(ctx context.Context, b *Box) error {
 		ConditionExpression:       aws.String("#rev = :old"),
 		ExpressionAttributeNames:  names,
 		ExpressionAttributeValues: values,
-	}, notingRetries(seen))
-	if err != nil && seen.Load() {
-		return s.unsettled(b.Addr, retriedAfter{err})
-	}
-	if _, ok := isConditionFailed(err); ok || isTransactionConflict(err) {
-		s.cache.evict(b.Addr) // the cached record may be the stale one
-		return ErrStale
-	}
-	if err != nil {
-		return s.unsettled(b.Addr, err)
-	}
-	b.Rev = next.Rev
-	s.applyBox(b)
-	return nil
+	}, n.option())
+	return written(err, n, ErrStale)
 }
 
-// DeleteBox implements Store.
-func (s *DynamoStore) DeleteBox(ctx context.Context, a protocol.Address) error {
-	ctx, cancel := bounded(ctx)
-	defer cancel()
-	seen := new(atomic.Bool)
-	if _, err := s.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &s.boxes, Key: boxKey(a)}, notingRetries(seen)); err != nil {
-		if seen.Load() {
-			err = retriedAfter{err}
-		}
-		return s.unsettled(a, err)
-	}
-	s.forget(a)
-	return nil
+// DeleteBox implements Backend.
+func (s *dynamoBackend) DeleteBox(ctx context.Context, a protocol.Address) error {
+	n := new(note)
+	_, err := s.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &s.boxes, Key: boxKey(a)}, n.option())
+	return written(err, n, nil)
 }
 
-// Revoke implements Store: one UpdateItem of the address's revocations
+// Revoke implements Backend: one UpdateItem of the address's revocations
 // item, which keeps the revocation of the address once and takes a
 // revocation of certificates only through a higher serial than the one it
 // holds.
-func (s *DynamoStore) Revoke(ctx context.Context, a protocol.Address, rv *Revocations) error {
+func (s *dynamoBackend) Revoke(ctx context.Context, a protocol.Address, rv *Revocations) (*Revocations, error) {
 	names := map[string]string{"#i": "identity"}
 	values := map[string]types.AttributeValue{":i": bin(rv.Identity)}
 	sets := []string{"#i = if_not_exists(#i, :i)"}
@@ -1015,9 +845,7 @@ func (s *DynamoStore) Revoke(ctx context.Context, a protocol.Address, rv *Revoca
 		sets = append(sets, "#c = :c", "#s = :s", "#t = :t")
 		cond = aws.String("attribute_not_exists(#t) OR #t < :t")
 	}
-	ctx, cancel := bounded(ctx)
-	defer cancel()
-	seen := new(atomic.Bool)
+	n := new(note)
 	out, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.boxes,
 		Key:                       revocationsKey(a),
@@ -1026,30 +854,20 @@ func (s *DynamoStore) Revoke(ctx context.Context, a protocol.Address, rv *Revoca
 		ExpressionAttributeNames:  names,
 		ExpressionAttributeValues: values,
 		ReturnValues:              types.ReturnValueAllNew,
-	}, notingRetries(seen))
-	if err != nil && seen.Load() {
-		return s.unsettled(a, retriedAfter{err})
-	}
-	if _, ok := isConditionFailed(err); ok {
-		s.cache.evict(a) // what it holds may be the stale one
-		return ErrStale
-	}
-	if err != nil {
-		return s.unsettled(a, err)
+	}, n.option())
+	if err := written(err, n, ErrStale); err != nil { // one through as high a serial is held
+		return nil, err
 	}
 	held, err := decodeRevocations(out.Attributes)
 	if err != nil {
-		return err
+		return nil, unknown(fmt.Errorf("applied, and its answer does not read: %w", err))
 	}
-	s.applyRevocations(a, held)
-	return nil
+	return held, nil
 }
 
 // getMsg reads a message's item, acked or not; ErrNotFound if there is none
 // or it has expired.
-func (s *DynamoStore) getMsg(ctx context.Context, box protocol.Address, id [32]byte) (*Header, bool, error) {
-	ctx, cancel := bounded(ctx)
-	defer cancel()
+func (s *dynamoBackend) getMsg(ctx context.Context, box protocol.Address, id [32]byte) (*Header, bool, error) {
 	out, err := s.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &s.msgs, Key: msgKey(box, id), ConsistentRead: aws.Bool(s.consistent)})
 	if err != nil {
 		return nil, false, err
@@ -1067,37 +885,43 @@ func (s *DynamoStore) getMsg(ctx context.Context, box protocol.Address, id [32]b
 	return h, live, nil
 }
 
-// Dedupe implements Store: the message's item, acked or not. A stale miss is
-// caught by PutMessage's conditional write.
-func (s *DynamoStore) Dedupe(ctx context.Context, box protocol.Address, id [32]byte) (*Header, error) {
+// Dedupe implements Backend: the message's item, acked or not. A stale miss
+// is caught by PutMessage's conditional write.
+func (s *dynamoBackend) Dedupe(ctx context.Context, box protocol.Address, id [32]byte) (*Header, error) {
 	h, _, err := s.getMsg(ctx, box, id)
 	return h, err
 }
 
-// PutMessage implements Store (PROTOCOL-SERVER.md §7): the body, then the item, if
-// no live one has this id. A crash after the body leaves an orphan the
-// lifecycle rule reaps, and the retry writes both again. A body that fails
-// stores nothing, whatever S3 answered (errNotStored); an item whose
-// condition fails on the item this write made, which an attempt the SDK
-// retried applied, is stored.
-func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *Header, body []byte) (*Header, error) {
-	put, cancel := bounded(ctx)
-	defer cancel()
-	if _, err := s.s3.PutObject(put, &s3.PutObjectInput{
+// crashed is a step of a two-step write failing as a crash there would.
+func (s *dynamoBackend) crashed(step string) error {
+	if s.crash == nil {
+		return nil
+	}
+	return s.crash(step)
+}
+
+// PutMessage implements Backend (PROTOCOL-SERVER.md §7): the body, then the
+// item, if no live one has this id. A crash after the body leaves an orphan
+// the lifecycle rule reaps, and the retry writes both again. A body that
+// fails stores nothing, whatever S3 answered (errNotStored). A failed
+// condition that hands back the item it met tells, whatever came before it:
+// this write's own item (its sender, its time), which an attempt the SDK
+// retried applied, is the write, applied (IronGall-dev/irongall-server#89);
+// another's is a duplicate.
+func (s *dynamoBackend) PutMessage(ctx context.Context, box protocol.Address, h *Header, body []byte) error {
+	if _, err := s.s3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: &s.bucket,
 		Key:    aws.String(bodyKey(box, h.ID)),
 		Body:   bytes.NewReader(body),
 	}); err != nil {
-		return nil, fmt.Errorf("%w: %w", errNotStored, err)
+		return fmt.Errorf("%w: %w", errNotStored, err)
 	}
-	if err := s.failAt("put: after the body"); err != nil {
-		return nil, err
+	if err := s.crashed("put: after the body"); err != nil {
+		return err
 	}
 	now := s.nowMs()
-	item, cancelItem := bounded(ctx)
-	defer cancelItem()
-	seen := new(atomic.Bool)
-	out, err := s.db.PutItem(item, &dynamodb.PutItemInput{
+	n := new(note)
+	out, err := s.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                           &s.msgs,
 		Item:                                msgItem(box, h),
 		ConditionExpression:                 aws.String("attribute_not_exists(#id) OR #r <= :cutoff"),
@@ -1105,16 +929,15 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 		ExpressionAttributeValues:           map[string]types.AttributeValue{":cutoff": num(now - ttlMs)},
 		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 		ReturnItemCollectionMetrics:         types.ReturnItemCollectionMetricsSize,
-	}, notingRetries(seen))
+	}, n.option())
 	if ccf, ok := isConditionFailed(err); ok {
 		orig, live, err := decodeMsg(ccf.Item) // a send of the same ciphertext got there first
-		if err == nil && live && orig.From == h.From && orig.ReceivedAt.Equal(h.ReceivedAt) {
-			// This send's own item, from an attempt the SDK retried
-			// (IronGall-dev/irongall-server#89): it is stored.
-			s.idx.insert(box, s.idx.newMark(h.ID, h.From, ms(h.ReceivedAt)+ttlMs), now)
-			return nil, nil
-		}
-		if err == nil && !live {
+		switch {
+		case err != nil:
+			return unknown(fmt.Errorf("the item its condition met does not read: %w", err))
+		case live && orig.From == h.From && orig.ReceivedAt.Equal(h.ReceivedAt):
+			return nil // this send's own item, from an attempt the SDK retried: it is stored
+		case !live:
 			// Acked since this send's dedupe read missed it: the PUT above
 			// made its body again, which nothing would serve, and only the
 			// lifecycle rule would take (IronGall-dev/irongall-server#16).
@@ -1123,28 +946,22 @@ func (s *DynamoStore) PutMessage(ctx context.Context, box protocol.Address, h *H
 				s.logf("msgs: deleting a body put again after its message's ack: %v", err)
 			}
 		}
-		return orig, err
+		return duplicate{orig}
 	}
-	if err != nil && seen.Load() {
-		return nil, retriedAfter{err}
-	}
-	if err != nil {
-		return nil, err
+	if err := written(err, n, nil); err != nil {
+		return err
 	}
 	if c := out.ItemCollectionMetrics; c != nil && len(c.SizeEstimateRangeGB) == 2 {
 		s.metrics.collection(c.SizeEstimateRangeGB[1])
 	}
-	s.idx.insert(box, s.idx.newMark(h.ID, h.From, ms(h.ReceivedAt)+ttlMs), now)
-	return nil, nil
+	return nil
 }
 
-// retire takes a live message out of the list, and out of memory: its item
-// stays as the dedupe record until it expires. ErrNotFound if it is not live.
-func (s *DynamoStore) retire(ctx context.Context, box protocol.Address, id [32]byte) error {
+// Retire implements Backend: the item leaves the live index; it stays as
+// the dedupe record until it expires.
+func (s *dynamoBackend) Retire(ctx context.Context, box protocol.Address, id [32]byte) (time.Time, error) {
 	now := s.nowMs()
-	ctx, cancel := bounded(ctx)
-	defer cancel()
-	seen := new(atomic.Bool)
+	n := new(note)
 	out, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 &s.msgs,
 		Key:                       msgKey(box, id),
@@ -1153,31 +970,21 @@ func (s *DynamoStore) retire(ctx context.Context, box protocol.Address, id [32]b
 		ExpressionAttributeNames:  map[string]string{"#l": "live", "#r": "received_at"},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":cutoff": num(now - ttlMs)},
 		ReturnValues:              types.ReturnValueUpdatedOld,
-	}, notingRetries(seen))
-	if err != nil && seen.Load() {
-		return retriedAfter{err}
-	}
-	if _, ok := isConditionFailed(err); ok {
-		return ErrNotFound
-	}
-	if err != nil {
-		return err
+	}, n.option())
+	if err := written(err, n, ErrNotFound); err != nil {
+		return time.Time{}, err
 	}
 	k, err := item(out.Attributes).bytes("live")
-	if err != nil {
-		return err
+	if err == nil {
+		var recv uint64
+		if recv, _, err = fromLiveKey(k); err == nil {
+			return fromMs(recv), nil
+		}
 	}
-	recv, _, err := fromLiveKey(k)
-	if err != nil {
-		return err
-	}
-	s.idx.remove(box, s.idx.tagOf(id), recv+ttlMs, now, false)
-	return nil
+	return time.Time{}, unknown(fmt.Errorf("applied, and its answer does not read: %w", err))
 }
 
-func (s *DynamoStore) deleteBody(ctx context.Context, box protocol.Address, id [32]byte) error {
-	ctx, cancel := bounded(ctx)
-	defer cancel()
+func (s *dynamoBackend) deleteBody(ctx context.Context, box protocol.Address, id [32]byte) error {
 	_, err := s.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.bucket, Key: aws.String(bodyKey(box, id))})
 	if err != nil && !isNoSuchKey(err) {
 		return err
@@ -1185,12 +992,11 @@ func (s *DynamoStore) deleteBody(ctx context.Context, box protocol.Address, id [
 	return nil
 }
 
-// Message implements Store. A live message whose body is gone (a
-// half-finished ack, or a body the lifecycle rule took early) is retired and
-// answered as gone. The body's bytes from byte from on are read with the
-// same range (GetObject's Range, RFC 9110 §14.2), so a fetch that resumes
-// moves only the rest out of S3.
-func (s *DynamoStore) Message(ctx context.Context, box protocol.Address, id [32]byte, from int64) (*Header, []byte, error) {
+// Message implements Backend. A live message whose body is gone is
+// errNoBody. The body's bytes from byte from on are read with the same
+// range (GetObject's Range, RFC 9110 §14.2), so a fetch that resumes moves
+// only the rest out of S3.
+func (s *dynamoBackend) Message(ctx context.Context, box protocol.Address, id [32]byte, from int64) (*Header, []byte, error) {
 	h, live, err := s.getMsg(ctx, box, id)
 	if err != nil {
 		return nil, nil, err
@@ -1202,14 +1008,9 @@ func (s *DynamoStore) Message(ctx context.Context, box protocol.Address, id [32]
 	if from > 0 && from < int64(h.Size) {
 		in.Range = aws.String(protocol.RangeAsk(from))
 	}
-	get, cancel := bounded(ctx) // the call, and the read of its body below
-	defer cancel()
-	out, err := s.s3.GetObject(get, in)
+	out, err := s.s3.GetObject(ctx, in)
 	if isNoSuchKey(err) {
-		if err := s.retire(ctx, box, id); err != nil && !errors.Is(err, ErrNotFound) {
-			return nil, nil, err
-		}
-		return nil, nil, ErrNotFound
+		return nil, nil, errNoBody
 	}
 	if err != nil {
 		return nil, nil, err
@@ -1222,55 +1023,48 @@ func (s *DynamoStore) Message(ctx context.Context, box protocol.Address, id [32]
 	return h, body, nil
 }
 
-// DeleteMessage implements Store (ack): the body, then the item leaves the
-// list. Both steps are safe to repeat, so a crash between them is finished by
-// the client's next ack, and a fetch in between finds no body and retires it.
-func (s *DynamoStore) DeleteMessage(ctx context.Context, box protocol.Address, id [32]byte) error {
+// DeleteMessage implements Backend (ack): the body, then the item leaves the
+// list. A body that was not deleted leaves the list as it was: a refusal.
+func (s *dynamoBackend) DeleteMessage(ctx context.Context, box protocol.Address, id [32]byte) (time.Time, error) {
 	if err := s.deleteBody(ctx, box, id); err != nil {
-		return err
+		return time.Time{}, refused(fmt.Errorf("the body was not deleted, and the message is listed as it was: %w", err))
 	}
-	if err := s.failAt("ack: after the body"); err != nil {
-		return err
+	if err := s.crashed("ack: after the body"); err != nil {
+		return time.Time{}, err
 	}
-	return s.retire(ctx, box, id)
+	return s.Retire(ctx, box, id)
 }
 
-// DeleteMessages implements Store (a revocation): every live message in the
-// box, as acks: bodies first, then each item leaves the list.
-func (s *DynamoStore) DeleteMessages(ctx context.Context, box protocol.Address) error {
-	return s.DeleteFrom(ctx, box, func(protocol.Address) bool { return true })
-}
-
-// DeleteFrom implements Store: the live messages in the box whose sender
-// matches, as DeleteMessages deletes them all. The live index carries each
-// message's sender, so one Query of it finds them. The Query is strongly
-// consistent, which a local secondary index allows: a message stored just
-// before it is in it (IronGall-dev/irongall-server#15).
-func (s *DynamoStore) DeleteFrom(ctx context.Context, box protocol.Address, from func(protocol.Address) bool) error {
+// DeleteFrom implements Backend: the live messages in the box whose sender
+// matches, as acks: bodies first, then each item leaves the list. The live
+// index carries each message's sender, so one Query of it finds them. The
+// Query is strongly consistent, which a local secondary index allows: a
+// message stored just before it is in it (IronGall-dev/irongall-server#15).
+// Until a retire is made, nothing a reader of the list sees has changed: a
+// failure there is a refusal.
+func (s *dynamoBackend) DeleteFrom(ctx context.Context, box protocol.Address, from func(protocol.Address) bool, retired func([32]byte, time.Time)) error {
 	var ids [][32]byte
 	p := dynamodb.NewQueryPaginator(s.db, s.liveQuery(box, s.liveFrom(), true))
 	for p.HasMorePages() {
-		page, cancel := bounded(ctx)
-		out, err := p.NextPage(page)
-		cancel()
+		out, err := p.NextPage(ctx)
 		if err != nil {
-			return err
+			return refused(err)
 		}
 		for _, it := range out.Items {
 			sender, err := item(it).hash("from")
 			if err != nil {
-				return err
+				return refused(err)
 			}
 			if !from(protocol.Address(sender)) {
 				continue
 			}
 			k, err := item(it).bytes("live")
 			if err != nil {
-				return err
+				return refused(err)
 			}
 			_, id, err := fromLiveKey(k)
 			if err != nil {
-				return err
+				return refused(err)
 			}
 			ids = append(ids, id)
 		}
@@ -1280,28 +1074,29 @@ func (s *DynamoStore) DeleteFrom(ctx context.Context, box protocol.Address, from
 		for _, id := range chunk {
 			objs = append(objs, s3types.ObjectIdentifier{Key: aws.String(bodyKey(box, id))})
 		}
-		del, cancel := bounded(ctx)
-		out, err := s.s3.DeleteObjects(del, &s3.DeleteObjectsInput{Bucket: &s.bucket, Delete: &s3types.Delete{Objects: objs, Quiet: aws.Bool(true)}})
-		cancel()
+		out, err := s.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: &s.bucket, Delete: &s3types.Delete{Objects: objs, Quiet: aws.Bool(true)}})
 		if err != nil {
-			return err
+			return refused(err)
 		}
 		if len(out.Errors) > 0 {
-			return fmt.Errorf("deleting bodies: %s", aws.ToString(out.Errors[0].Message))
+			return refused(fmt.Errorf("deleting bodies: %s", aws.ToString(out.Errors[0].Message)))
 		}
 	}
 	for _, id := range ids {
-		if err := s.retire(ctx, box, id); err != nil && !errors.Is(err, ErrNotFound) {
+		switch received, err := s.Retire(ctx, box, id); {
+		case err == nil:
+			retired(id, received)
+		case !errors.Is(err, ErrNotFound):
 			return err
 		}
 	}
 	return nil
 }
 
-// List implements Store: a Query of the live index over its live key range.
+// List implements Backend: a Query of the live index over its live key range.
 // A page read just after a write may miss it while memory's count has it;
 // a client lists at every poll, so the next one has it.
-func (s *DynamoStore) List(ctx context.Context, box protocol.Address, after *Cursor, limit int) ([]Header, error) {
+func (s *dynamoBackend) List(ctx context.Context, box protocol.Address, after *Cursor, limit int) ([]Header, error) {
 	lo := s.liveFrom()
 	in := s.liveQuery(box, lo, s.consistent)
 	if after != nil {
@@ -1314,9 +1109,7 @@ func (s *DynamoStore) List(ctx context.Context, box protocol.Address, after *Cur
 	var hs []Header
 	for len(hs) < limit {
 		in.Limit = aws.Int32(int32(limit - len(hs))) //nolint:gosec // a page is small
-		page, cancel := bounded(ctx)
-		out, err := s.db.Query(page, in)
-		cancel()
+		out, err := s.db.Query(ctx, in)
 		if err != nil {
 			return nil, err
 		}
@@ -1333,125 +1126,4 @@ func (s *DynamoStore) List(ctx context.Context, box protocol.Address, after *Cur
 		in.ExclusiveStartKey = out.LastEvaluatedKey
 	}
 	return hs, nil
-}
-
-// Count implements Store: from memory, after the box's load on its first
-// use.
-func (s *DynamoStore) Count(ctx context.Context, box protocol.Address) (int, error) {
-	if err := s.ensure(ctx, box); err != nil {
-		return 0, err
-	}
-	return s.idx.count(box, s.nowMs()), nil
-}
-
-// PairCount implements Store: from memory, after the box's load on its
-// first use.
-func (s *DynamoStore) PairCount(ctx context.Context, box, from protocol.Address) (int, time.Time, error) {
-	if err := s.ensure(ctx, box); err != nil {
-		return 0, time.Time{}, err
-	}
-	n, oldest := s.idx.pair(box, prefix8(from[:]), s.nowMs())
-	if n == 0 {
-		return 0, time.Time{}, nil
-	}
-	return n, fromMs(oldest), nil
-}
-
-// After implements Store: from memory, after the box's load on its first use.
-func (s *DynamoStore) After(ctx context.Context, box protocol.Address, c *Cursor) (int, error) {
-	if err := s.ensure(ctx, box); err != nil {
-		return 0, err
-	}
-	return s.idx.after(box, ms(c.ReceivedAt)+ttlMs, prefix8(c.ID[:]), s.nowMs()), nil
-}
-
-// Holds implements Store: from memory, after the box's load on its first use.
-// A message another process stored is held once the stream has brought it.
-func (s *DynamoStore) Holds(ctx context.Context, box protocol.Address, id [32]byte) (bool, error) {
-	if err := s.ensure(ctx, box); err != nil {
-		return false, err
-	}
-	return s.idx.holds(box, s.idx.tagOf(id), s.nowMs()), nil
-}
-
-// Fetched implements Store, from memory as Holds does.
-func (s *DynamoStore) Fetched(ctx context.Context, box protocol.Address, id [32]byte) (held, again bool, err error) {
-	if err := s.ensure(ctx, box); err != nil {
-		return false, false, err
-	}
-	held, again = s.idx.fetched(box, s.idx.tagOf(id), s.nowMs())
-	return held, again, nil
-}
-
-// applyBoxImage applies an item of the -boxes-table table as it now is,
-// from the stream: a box's record, or an address's revocations. A record is
-// read whole, once, and its standing taken from the box it reads as. One
-// this build cannot read, such as one in a state it never writes or one
-// whose ACL does not read, is forgotten, not skipped: memory then answers
-// for none of it, the index, the record cache and a miss alike, and the
-// address's next use reads the record, which fails, so nothing is served or
-// taken for it on what memory held before (IronGall-dev/irongall-server#87).
-func (s *DynamoStore) applyBoxImage(it item) {
-	a, sk, err := boxItemKey(it)
-	if err != nil {
-		s.logf("boxes: skipping an item: %v", err)
-		return
-	}
-	switch {
-	case bytes.Equal(sk, []byte{skBox}):
-		b, err := decodeBox(it)
-		var st Standing
-		if err == nil {
-			st, _, err = b.standing()
-		}
-		if err != nil {
-			s.logf("boxes: forgetting a box record that does not read: %v", err)
-			s.forget(a)
-			return
-		}
-		s.cache.write(a, s.cache.image(b.Rev, func() (*Box, error) { return b, nil }))
-		s.idx.setStanding(a, st, b.Rev)
-	case bytes.Equal(sk, []byte{skRevocations}):
-		rv, err := decodeRevocations(it)
-		if err != nil {
-			s.logf("boxes: skipping an address's revocations: %v", err)
-			return
-		}
-		s.applyRevocations(a, rv)
-	}
-}
-
-// applyBoxRemoval applies a deleted item's key, from the stream: a record
-// the TTL took, or one a revocation of its address deleted. Revocations are
-// never deleted.
-func (s *DynamoStore) applyBoxRemoval(key item) {
-	a, sk, err := boxItemKey(key)
-	if err != nil {
-		s.logf("boxes: skipping a removal: %v", err)
-		return
-	}
-	if bytes.Equal(sk, []byte{skBox}) {
-		s.forget(a)
-	}
-}
-
-// applyMsgImage applies a message item as it now is, from the stream: in the
-// list, a mark; out of it (acked, or its body gone), none.
-func (s *DynamoStore) applyMsgImage(it item) {
-	box, err := it.hash("box")
-	if err != nil {
-		s.logf("msgs: skipping an item: %v", err)
-		return
-	}
-	h, live, err := decodeMsg(it)
-	if err != nil {
-		s.logf("msgs: skipping an item: %v", err)
-		return
-	}
-	exp := ms(h.ReceivedAt) + ttlMs
-	if live {
-		s.idx.insert(box, s.idx.newMark(h.ID, h.From, exp), s.nowMs())
-		return
-	}
-	s.idx.remove(box, s.idx.tagOf(h.ID), exp, s.nowMs(), true)
 }
