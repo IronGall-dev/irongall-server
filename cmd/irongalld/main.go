@@ -8,7 +8,7 @@
 //	irongalld limits clear -socket PATH -ip ADDR
 //
 // The first keeps state in three DynamoDB tables, boxes, messages and
-// accounts, and an S3 Express One Zone directory bucket (PROTOCOL-SERVER.md §7),
+// accounts, and an S3 Express One Zone directory bucket (ARCHITECTURE.md § Storage),
 // with AWS credentials from the usual chain; it answers 503 until its stream
 // followers are positioned, loads each box into memory on its first use, and
 // exits if a stream follower loses its place, since a restart rebuilds

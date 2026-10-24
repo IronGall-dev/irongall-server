@@ -59,7 +59,7 @@ func (s deadS3) PutMessage(ctx context.Context, box protocol.Address, h *Header,
 }
 
 // No line the server logs carries an address or a message id
-// (IronGall-dev/irongall-server#9, PROTOCOL-SERVER.md §13): not a store's
+// (IronGall-dev/irongall-server#9, SECURITY.md): not a store's
 // error, whose text holds a request's URL, not a real S3 client's, and not
 // a path that holds one inside a longer segment or in capitals. A line
 // about the box names it by the name redact gives it, so the store's error

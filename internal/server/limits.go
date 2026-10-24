@@ -114,7 +114,7 @@ func (l Limits) ceiling() int { return max(l.MaxSize, l.AccountMaxSize) }
 // lifts, and irongalld serve does not start with flags that would (decided
 // 2026-10-23). A box's messages are one item collection of the messages
 // table, which its LSI holds to 10 GB on one partition, and every message
-// leaves an item there until it expires (PROTOCOL-SERVER.md §7).
+// leaves an item there until it expires (ARCHITECTURE.md § Storage).
 const ReceiveCeiling = time.Second / 10
 
 // liftedReceives is the refill of new mail an account lifts a box's to.

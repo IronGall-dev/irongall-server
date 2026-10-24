@@ -251,8 +251,8 @@ func (o *onRead) Read(p []byte) (int, error) {
 	return o.ReadCloser.Read(p)
 }
 
-// A PUT's If-Match is held to the ACL its write replaces (PROTOCOL-SERVER.md
-// § 6.2): another writer's ACL that lands while the PUT reads its body, after
+// A PUT's If-Match is held to the ACL its write replaces (PROTOCOL.md
+// §13): another writer's ACL that lands while the PUT reads its body, after
 // its If-Match was evaluated, makes the PUT 409 box_changed, and the other
 // writer's ACL stays; the same PUT sent again meets an If-Match that is
 // false (412), and one with the tag now held is taken

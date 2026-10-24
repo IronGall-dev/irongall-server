@@ -23,7 +23,7 @@ type targetState struct {
 // precondition is every route's one step for its If-Match and
 // If-None-Match: taken once the route has read its target, after the call's
 // own budget, and before any of its work, the work's budgets, a cursor
-// taken or put, a mark, a write (PROTOCOL-SERVER.md §13; the client repo's
+// taken or put, a mark, a write (PROTOCOL.md §13; the client repo's
 // #412). It evaluates them as conditions does, against t. A false one does
 // nothing but count as a call (LIMITS.md, rule 1): where the route has spent
 // none of the call's budget, t.spend spends it, and a refusal of that is
@@ -62,7 +62,7 @@ func expected(r *http.Request) Expect {
 // precondition, the one step every route takes for them: so whatever the
 // route answers before that point, a refusal of the pass, a box that does
 // not exist, a body it reads first that is refused, is answered as without
-// them (§13.2.1). PROTOCOL-SERVER.md §13 has the rule.
+// them (§13.2.1). PROTOCOL.md §13 has the rule.
 //
 // exists is whether the target has a current representation, and tag its
 // entity-tag, "" where it carries none. If-Match is false for a target that

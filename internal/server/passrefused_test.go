@@ -246,7 +246,7 @@ func TestASendNamesTheSendersCurrentCertificate(t *testing.T) {
 // under an older one (revoked too), one under a later one never on record,
 // and one that is no pass. A send can only know whose pass it is by reading
 // it, so a send with no pass, or one that is no pass, is unauthorized
-// (PROTOCOL-SERVER.md § 6.1b). The way back is an upload under a later
+// (PROTOCOL.md §6.1b). The way back is an upload under a later
 // certificate, whose pass is read under that one (PROTOCOL.md §6.1b, §6.4).
 func TestARevokedCurrentCertificateIsAnsweredBeforeThePass(t *testing.T) {
 	e := newEnv(t, relaxed())

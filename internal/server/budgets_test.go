@@ -25,7 +25,7 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
-// The budgets of LIMITS.md, and the order of checks they come in: every call
+// The budgets of LIMITS.md, and the rules they are taken by: every call
 // spends from one, a count is taken before the work it guards, and what
 // would change nothing is answered before what costs.
 

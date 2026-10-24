@@ -29,7 +29,7 @@ import (
 	"github.com/aws/smithy-go/middleware"
 )
 
-// dynamoBackend is the production backend (PROTOCOL-SERVER.md §7): box
+// dynamoBackend is the production backend (ARCHITECTURE.md § Storage): box
 // records in one DynamoDB table, messages in another (each item its header
 // and its dedupe record), accounts in a third, bodies in an S3 Express One
 // Zone directory bucket, and each table's stream for the feed (feed). It is
@@ -915,7 +915,7 @@ func (s *dynamoBackend) crashed(step string) error {
 	return s.crash(step)
 }
 
-// PutMessage implements Backend (PROTOCOL-SERVER.md §7): the body, then the
+// PutMessage implements Backend (ARCHITECTURE.md § Storage): the body, then the
 // item, if no live one has this id. A crash after the body leaves an orphan
 // the lifecycle rule reaps, and the retry writes both again. A body that
 // fails stores nothing, whatever S3 answered (errNotStored). A failed

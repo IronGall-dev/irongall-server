@@ -469,7 +469,7 @@ func unknown(err error) error {
 
 // duplicate is a send's refusal, stated by the store: the message item of
 // another send of the same ciphertext was there first, live or acked, and
-// h is its header. A send answers from it (PROTOCOL-SERVER.md §7).
+// h is its header. A send answers from it (ARCHITECTURE.md § Storage).
 type duplicate struct{ h *Header }
 
 func (d duplicate) Error() string { return "a message of the same ciphertext is held" }
