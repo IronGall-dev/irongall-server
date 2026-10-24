@@ -745,3 +745,49 @@ func TestAnItemThatDoesNotReadIsGoneWhateverItsKind(t *testing.T) {
 		})
 	}
 }
+
+// The in-memory backend hands each change to memory after the write that
+// made it has applied its own outcome, as DynamoDB's stream brings a write
+// back a second or two after it, and in the order the writes were made: at
+// the start of the backend's next write. So a registration of an address a
+// read found missing is cached by its own write, which its echo, applied
+// first, would keep out by ending the miss; and two writes' changes go in
+// the order they were made.
+func TestTheInMemoryFeedComesAfterItsWritersApply(t *testing.T) {
+	_, _, rec := heldRecord(t)
+	ctx := t.Context()
+	s := NewMemStore(time.Now)
+	b := s.backend.(*memBackend)
+	var handed []uint64 // the revs of the records' changes handed to memory, in order
+	b.apply = func(c Change) {
+		if c.Box != nil {
+			handed = append(handed, c.Box.Rev)
+		}
+		s.apply(c)
+	}
+	if _, err := s.Box(ctx, rec.Addr); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("control: an address with no box: %v", err)
+	}
+	if err := s.CreateBox(ctx, cloneBox(rec)); err != nil {
+		t.Fatal(err)
+	}
+	if len(handed) != 0 {
+		t.Errorf("a write's change was handed to memory before the write returned: %v", handed)
+	}
+	if got, ok := s.Known(rec.Addr); !ok || got == nil || got.Rev != 1 {
+		t.Errorf("a registration of an address read missing is not cached by its own write: %v", got)
+	}
+	for rev := uint64(1); rev <= 2; rev++ {
+		next := cloneBox(rec)
+		next.Rev = rev
+		if err := s.UpdateBox(ctx, next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.PutAdoptKey(ctx, &AdoptKey{Account: "acct", Hash: [32]byte{1}, Uses: 1, Expires: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(handed, []uint64{1, 2, 3}) {
+		t.Errorf("the records' changes were handed to memory as revs %v; want 1, 2, 3, each at the next write", handed)
+	}
+}

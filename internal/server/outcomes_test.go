@@ -808,13 +808,20 @@ func TestALeaveTheStoreMayHaveAppliedIsNot409(t *testing.T) {
 // at all, may have been applied whatever came after it: throttles, a
 // TransactionInProgressException, which DynamoDB answers to an attempt with
 // the same token while the first is still in progress and the SDK retries as
-// a throttle, or the SDK's retry quota drained. Its transaction's calls share
-// one note of such an attempt, so the store states no refusal: the count is
-// kept, and memory forgets the box, the record cache and the index
-// (IronGall-dev/irongall-server#101). The control: a fault at every attempt.
+// a throttle, or the SDK's retry quota drained, or a failed condition met
+// by a later call of its transaction, which carries another client token.
+// Its transaction's calls share one note of such an attempt, so the store
+// states no refusal: the count is kept, and memory forgets the box, the
+// record cache and the index (IronGall-dev/irongall-server#101). The
+// control: a fault at every attempt.
 func TestAnAdoptAfterAnAmbiguousAttemptMayHaveBeenApplied(t *testing.T) {
 	_, _, box := heldRecord(t)
 	inProgress := answer{status: http.StatusBadRequest, body: dynErr("TransactionInProgressException", "")}
+	// A cancellation the SDK does not retry: for a conflict on the key's
+	// item, which the store sends again by a new call, under a new token;
+	// then for the box's condition, which that call's token does not cover.
+	conflict := answer{status: http.StatusBadRequest, body: dynErr("TransactionCanceledException", `,"CancellationReasons":[{"Code":"None"},{"Code":"TransactionConflict"}]`)}
+	condition := answer{status: http.StatusBadRequest, body: dynErr("TransactionCanceledException", `,"CancellationReasons":[{"Code":"ConditionalCheckFailed"},{"Code":"None"}]`)}
 	cases := []struct {
 		name    string
 		answers []answer
@@ -823,6 +830,7 @@ func TestAnAdoptAfterAnAmbiguousAttemptMayHaveBeenApplied(t *testing.T) {
 		{"applied and answered 500, then throttled twice", []answer{applied(answer500), answerPTEE, answerPTEE}, false},
 		{"applied and its answer lost, then in progress twice", []answer{applied(answer{drop: true}), inProgress, inProgress}, false},
 		{"applied and answered 500 on a drained retry quota", nil, true},
+		{"applied and answered 500, then cancelled for a conflict, then a new call's failed condition", []answer{applied(answer500), conflict, condition}, false},
 		{"control: applied and answered 500 every attempt", []answer{applied(answer500), answer500, answer500}, false},
 	}
 	for _, c := range cases {
@@ -903,5 +911,55 @@ func TestARegistrationWhoseOutcomeIsUnknownIsAnsweredFromTheRecord(t *testing.T)
 	t.Logf("%d PutItem calls; the registration %d %s; its retry %d %s", puts.Load(), first.status, first.code(), again.status, again.code())
 	if first.status != http.StatusOK || again.status != http.StatusOK {
 		t.Errorf("a registration the store applied, its outcome unknown: %d %s, then its retry %d %s; want each answered from the record, 200", first.status, first.code(), again.status, again.code())
+	}
+}
+
+// An ack whose body's DELETE failed has changed nothing a reader of the list
+// sees: it is one write of the store with a send's two steps, whose outcome
+// is its item's (ARCHITECTURE.md § The store), so it is a refusal, its
+// retire is never sent, and memory keeps the box loaded with the message,
+// and its record cached. The control: the DELETE answered, then the
+// retire's answer lost at every attempt, which may have been applied: the
+// box is forgotten.
+func TestAnAckWhoseBodyWasNotDeletedChangesNothing(t *testing.T) {
+	_, _, box := heldRecord(t)
+	id := [32]byte{7}
+	for _, c := range []struct {
+		name    string
+		s3      answer
+		dynamo  []answer
+		refused bool
+	}{
+		{"the body's DELETE answered 500", answer{status: http.StatusInternalServerError, body: s3Err("InternalError")}, nil, true},
+		{"control: the DELETE answered, the retire's answer lost", answer{status: http.StatusNoContent}, []answer{applied(answer{drop: true}), {drop: true}, {drop: true}}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFakeAWS()
+			f.s3 = func(string, int) answer { return c.s3 }
+			f.dynamo = scripted("UpdateItem", c.dynamo...)
+			s := fakeStore(t, f)
+			s.cache.fill(cloneBox(box), s.cache.begin(box.Addr))
+			st, _, err := box.standing()
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := s.nowMs()
+			if err := s.idx.ensure(t.Context(), box.Addr, func() (boxRead, error) {
+				return boxRead{exists: true, st: st, rev: box.Rev, marks: []mark{s.idx.newMark(id, box.Addr, now+ttlMs)}}, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			err = s.DeleteMessage(context.WithoutCancel(t.Context()), box.Addr, id)
+			retires, _ := f.count("UpdateItem")
+			_, cached := s.cache.get(box.Addr)
+			held := s.idx.holdsBox(box.Addr) && s.idx.count(box.Addr, now) == 1
+			t.Logf("err %v; refused %v, mayHaveApplied %v; %d retires sent; the box held with its message %v, its record cached %v", err, isRefusal(err), mayHaveApplied(err), retires, held, cached)
+			switch {
+			case c.refused && (!isRefusal(err) || mayHaveApplied(err) || retires != 0 || !held || !cached):
+				t.Errorf("an ack whose body was not deleted: refused %v, %d retires sent, the box held with its message %v, its record cached %v; want a refusal, none, true, true", isRefusal(err), retires, held, cached)
+			case !c.refused && (!mayHaveApplied(err) || held || cached):
+				t.Errorf("an ack whose retire may have been applied: mayHaveApplied %v, the box held %v, its record cached %v; want true, false, false", mayHaveApplied(err), held, cached)
+			}
+		})
 	}
 }
