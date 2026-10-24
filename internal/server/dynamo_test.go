@@ -540,9 +540,9 @@ func (c *countingStore) DeleteBox(ctx context.Context, a protocol.Address) error
 	return c.s.DeleteBox(ctx, a)
 }
 
-func (c *countingStore) Revoke(ctx context.Context, a protocol.Address, rv *Revocations) error {
+func (c *countingStore) Revoke(ctx context.Context, a protocol.Address, rv *Revocations, want Expect) error {
 	c.count()
-	return c.s.Revoke(ctx, a, rv)
+	return c.s.Revoke(ctx, a, rv, want)
 }
 
 func (c *countingStore) Dedupe(ctx context.Context, box protocol.Address, id [32]byte) (*Header, error) {
@@ -654,7 +654,7 @@ func TestPollStaysInMemory(t *testing.T) {
 	}
 	before := cs.calls.Load()
 	rv := record(t, b)
-	if err := e.store.Revoke(ctx, b.Address(), &Revocations{Identity: rv.Identity, Address: rv.Revocation}); err != nil {
+	if err := e.store.Revoke(ctx, b.Address(), &Revocations{Identity: rv.Identity, Address: rv.Revocation}, ExpectAnything); err != nil {
 		t.Fatal(err)
 	}
 	if cs.calls.Load() != before {
@@ -1031,7 +1031,7 @@ func TestTheBoxsStateAnswersBeforeItsPass(t *testing.T) {
 	}
 	pass = e.pass(d)
 	rv := record(t, d)
-	if err := e.store.Revoke(ctx, d.Address(), &Revocations{Identity: rv.Identity, Address: rv.Revocation}); err != nil {
+	if err := e.store.Revoke(ctx, d.Address(), &Revocations{Identity: rv.Identity, Address: rv.Revocation}, ExpectAnything); err != nil {
 		t.Fatal(err)
 	}
 	for _, p := range []string{"", pass} {

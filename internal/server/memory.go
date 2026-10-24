@@ -365,10 +365,10 @@ func (s *Memory) DeleteBox(ctx context.Context, a protocol.Address) error {
 }
 
 // Revoke implements Store.
-func (s *Memory) Revoke(ctx context.Context, a protocol.Address, rv *Revocations) error {
+func (s *Memory) Revoke(ctx context.Context, a protocol.Address, rv *Revocations, want Expect) error {
 	var held *Revocations
 	return s.write(ofAddress(a), func() (err error) {
-		held, err = s.backend.Revoke(ctx, a, rv)
+		held, err = s.backend.Revoke(ctx, a, rv, want)
 		return err
 	}, func() { s.applyRevocations(a, held) })
 }

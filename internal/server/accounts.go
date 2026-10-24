@@ -68,15 +68,6 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
 	if !ok {
 		return keyRefused()
 	}
-	// The key is read before anything is written, so one that is not ours
-	// costs a read of the accounts table and no write of the box's record.
-	k, err := s.store.AdoptKey(r.Context(), account, hash)
-	if errors.Is(err, ErrNotFound) {
-		return keyRefused()
-	}
-	if err != nil {
-		return err
-	}
 	b, err := s.box(r.Context(), a)
 	if err != nil {
 		return err
@@ -85,8 +76,18 @@ func (s *Server) adopt(w http.ResponseWriter, r *http.Request) error {
 		return noSuchMailbox
 	}
 	// The target is the box's place in an account: there is one once it is
-	// in any (conditions).
-	if err := conditions(r, b.Account != "", "", hintConditions); err != nil {
+	// in any (precondition). The write holds what they held, the record at
+	// the rev read.
+	if err := precondition(r, targetState{exists: b.Account != "", hint: hintConditions}); err != nil {
+		return err
+	}
+	// The key is read before anything is written, so one that is not ours
+	// costs a read of the accounts table and no write of the box's record.
+	k, err := s.store.AdoptKey(r.Context(), account, hash)
+	if errors.Is(err, ErrNotFound) {
+		return keyRefused()
+	}
+	if err != nil {
 		return err
 	}
 	if b.Account != account {
@@ -124,7 +125,7 @@ func (s *Server) leave(w http.ResponseWriter, r *http.Request) error {
 	if b == nil {
 		return noSuchMailbox
 	}
-	if err := conditions(r, b.Account != "", "", hintConditions); err != nil {
+	if err := precondition(r, targetState{exists: b.Account != "", hint: hintConditions}); err != nil {
 		return err
 	}
 	if b.Account != "" {

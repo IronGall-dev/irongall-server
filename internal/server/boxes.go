@@ -99,9 +99,10 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	// No box is registered here: an If-Match is false, and If-None-Match: *
-	// holds (conditions). One registered meanwhile answers from its record,
-	// below, where If-None-Match: * is false.
-	if err := conditions(r, false, "", hintConditions); err != nil {
+	// holds (precondition). The write holds it, a record created only where
+	// the address has none: one registered meanwhile answers from its
+	// record, below, where If-None-Match: * is false.
+	if err := precondition(r, targetState{hint: hintConditions}); err != nil {
 		return err
 	}
 	now := s.now()
@@ -196,7 +197,7 @@ func (s *Server) registered(w http.ResponseWriter, r *http.Request, id *protocol
 			return err
 		}
 	}
-	if err := conditions(r, true, "", hintConditions); err != nil {
+	if err := precondition(r, targetState{exists: true, hint: hintConditions}); err != nil {
 		return err
 	}
 	writeJSON(w, http.StatusOK, struct{}{}) // an identical retry
@@ -336,7 +337,7 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 		if err := s.spendOwner(r.Context(), h); err != nil {
 			return err
 		}
-		if err := conditions(r, true, "", hintConditions); err != nil {
+		if err := precondition(r, targetState{exists: true, hint: hintConditions}); err != nil {
 			return err
 		}
 		writeJSON(w, http.StatusOK, struct{}{})
@@ -412,7 +413,8 @@ func (s *Server) prekey(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 	}
-	if err := conditions(r, true, "", hintConditions); err != nil {
+	// The write holds what an If-Match held, the record at the rev read.
+	if err := precondition(r, targetState{exists: true, hint: hintConditions}); err != nil {
 		return err
 	}
 	now := s.now()
@@ -472,7 +474,7 @@ func (s *Server) getBox(w http.ResponseWriter, r *http.Request) error {
 	case !b.open():
 		return noSuchMailbox
 	}
-	if err := conditions(r, true, "", hintConditions, "Vary", "Accept-Encoding"); err != nil {
+	if err := precondition(r, targetState{exists: true, hint: hintConditions, also: []string{"Vary", "Accept-Encoding"}}); err != nil {
 		return err
 	}
 	writeJSONCompressed(w, r, protocol.BoxResponse{
@@ -499,7 +501,7 @@ func (s *Server) getRevocations(w http.ResponseWriter, r *http.Request) error {
 	case !b.holdsRevocations():
 		return fail(protocol.CodeNotRevoked, "nothing to do: this server holds no revocation of that address. That is its word, and the box's owner may hold a record of one", "no revocation of this address is held here")
 	}
-	if err := conditions(r, true, "", hintConditions); err != nil {
+	if err := precondition(r, targetState{exists: true, hint: hintConditions}); err != nil {
 		return err
 	}
 	writeJSON(w, http.StatusOK, b.record())
@@ -601,7 +603,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 			case req.Revocation != nil:
 				hasCerts = false // the revocation of the address is the body's one change
 			case f.Through == held.Through:
-				if err := conditions(r, true, "", hintConditions); err != nil {
+				if err := precondition(r, targetState{exists: true, hint: hintConditions}); err != nil {
 					return err
 				}
 				writeJSON(w, http.StatusOK, struct{}{})
@@ -613,7 +615,8 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	}
 	// What is held of the address is known here, before the counts and the
 	// signatures: the revocations GET …/revocations would answer, or none.
-	if err := conditions(r, b.holdsRevocations(), "", hintConditions); err != nil {
+	// The write holds what they held of it (expected).
+	if err := precondition(r, targetState{exists: b.holdsRevocations(), hint: hintConditions}); err != nil {
 		return err
 	}
 	if b == nil {
@@ -657,7 +660,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) error {
 	}
 	defer func() { raise.release(s.now()) }() // settled below, but for a panic
 	if raised || req.Revocation != nil {
-		if err := s.store.Revoke(detached(r.Context()), h, rv); err != nil {
+		if err := s.store.Revoke(detached(r.Context()), h, rv, expected(r)); err != nil {
 			if mayHaveApplied(err) {
 				raise.keep()
 			} else {

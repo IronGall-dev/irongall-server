@@ -212,6 +212,68 @@ UpdateItem {
  "TableName": "boxes",
  "UpdateExpression": "SET #i = if_not_exists(#i, :i), #r = if_not_exists(#r, :r)"
 }
+## Revoke, certificates through 9, where none is held (If-None-Match: *)
+UpdateItem {
+ "ConditionExpression": "(attribute_not_exists(#t) OR #t \u003c :t) AND (attribute_not_exists(#i))",
+ "ExpressionAttributeNames": {
+  "#c": "revoked_certs",
+  "#i": "identity",
+  "#s": "revoked_certs_sig",
+  "#t": "through"
+ },
+ "ExpressionAttributeValues": {
+  ":c": {
+   "B": "Y2VydGlmaWNhdGVz"
+  },
+  ":i": {
+   "B": "YW4gaWRlbnRpdHkgZG9jdW1lbnQ="
+  },
+  ":s": {
+   "B": "dGhlaXIgc2lnbmF0dXJl"
+  },
+  ":t": {
+   "N": "9"
+  }
+ },
+ "Key": {
+  "addr": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "sk": {
+   "B": "AQ=="
+  }
+ },
+ "ReturnValues": "ALL_NEW",
+ "TableName": "boxes",
+ "UpdateExpression": "SET #i = if_not_exists(#i, :i), #c = :c, #s = :s, #t = :t"
+}
+## Revoke, the address, where some are held (If-Match: *)
+UpdateItem {
+ "ConditionExpression": "attribute_exists(#i)",
+ "ExpressionAttributeNames": {
+  "#i": "identity",
+  "#r": "revocation"
+ },
+ "ExpressionAttributeValues": {
+  ":i": {
+   "B": "YW4gaWRlbnRpdHkgZG9jdW1lbnQ="
+  },
+  ":r": {
+   "B": "YSByZXZvY2F0aW9u"
+  }
+ },
+ "Key": {
+  "addr": {
+   "B": "sAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "sk": {
+   "B": "AQ=="
+  }
+ },
+ "ReturnValues": "ALL_NEW",
+ "TableName": "boxes",
+ "UpdateExpression": "SET #i = if_not_exists(#i, :i), #r = if_not_exists(#r, :r)"
+}
 ## Box
 Query {
  "ConsistentRead": true,

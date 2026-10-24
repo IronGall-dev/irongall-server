@@ -38,7 +38,7 @@ func (s *Server) aclTooLarge() *problem {
 // replaced whole (PROTOCOL.md §6.2). Its preconditions are evaluated against
 // the ACL held, a box with none included, after the call's other checks and
 // before its body is read, as RFC 9110 §13.2.1 has an origin server evaluate
-// them (conditions): a false If-Match is 412, and so is an If-None-Match
+// them (precondition): a false If-Match is 412, and so is an If-None-Match
 // that is "*" or names the held ACL's tag, and nothing changes. The write is
 // conditional on the record's revision, so the ACL the If-Match was held to
 // is the one replaced. Then the box's unacked mail from every sender its deny
@@ -65,7 +65,7 @@ func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := conditions(r, true, held.tag, "GET the same path for the ACL held and its ETag, or PUT without If-Match: "+hintACL); err != nil {
+	if err := precondition(r, targetState{exists: true, tag: held.tag, hint: "GET the same path for the ACL held and its ETag, or PUT without If-Match: " + hintACL}); err != nil {
 		return err
 	}
 	var doc protocol.ACLDocument
@@ -118,7 +118,7 @@ func (s *Server) putACL(w http.ResponseWriter, r *http.Request) error {
 
 // getACL is GET /v1/<address>/acl (with the pass): the box's ACL as it was
 // put, or, for a box that has put none, the one allowing everyone, with its
-// ETag. Its preconditions are evaluated as every route's are (conditions),
+// ETag. Its preconditions are evaluated as every route's are (precondition),
 // once the answer without them would be 200 (RFC 9110 §13.2.1), and in
 // §13.2.2's order: an If-Match, compared strongly, that is false is 412; then
 // an If-None-Match that names the tag, compared weakly, is 304 with the ETag
@@ -142,7 +142,7 @@ func (s *Server) getACL(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := conditions(r, true, got.tag, "GET the same path without If-Match: "+hintACL); err != nil {
+	if err := precondition(r, targetState{exists: true, tag: got.tag, hint: "GET the same path without If-Match: " + hintACL}); err != nil {
 		return err
 	}
 	h := w.Header()

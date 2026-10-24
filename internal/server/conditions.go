@@ -7,14 +7,62 @@ import (
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
+// targetState is what a route knows of its target when it evaluates its
+// preconditions (precondition).
+type targetState struct {
+	exists bool     // the target has a current representation
+	tag    string   // its entity-tag, "" where it carries none
+	hint   string   // a 412's hint
+	also   []string // the fields of the 200 a 304 carries too, name and value pairs
+	// spend is the call's own budget, where its route has spent none of it
+	// before reading its target: what a false precondition spends, as any
+	// call does. Nil where the call has paid already.
+	spend func() error
+}
+
+// precondition is every route's one step for its If-Match and
+// If-None-Match: taken once the route has read its target, after the call's
+// own budget, and before any of its work, the work's budgets, a cursor
+// taken or put, a mark, a write (PROTOCOL-SERVER.md §13; the client repo's
+// #412). It evaluates them as conditions does, against t. A false one does
+// nothing but count as a call (LIMITS.md, rule 1): where the route has spent
+// none of the call's budget, t.spend spends it, and a refusal of that is
+// the answer; otherwise the 412, or the 304.
+func precondition(r *http.Request, t targetState) error {
+	err := conditions(r, t.exists, t.tag, t.hint, t.also...)
+	if err == nil || t.spend == nil {
+		return err
+	}
+	if serr := t.spend(); serr != nil {
+		return serr
+	}
+	return err
+}
+
+// expected is what a write must still find of a target that carries no tag,
+// once its request's preconditions held at its read (precondition;
+// PROTOCOL.md §13): an If-Match held, so the target exists (a list of tags
+// is never true of one with none); an If-None-Match of "*" held, so it does
+// not (one of tags is true of it whatever it holds, so it asks nothing);
+// and neither asks nothing. A target with a tag, an ACL, is written under
+// its record's rev, which asks more.
+func expected(r *http.Request) Expect {
+	switch {
+	case len(r.Header.Values("If-Match")) > 0:
+		return ExpectHeld
+	case protocol.IfNoneMatch(r.Header.Values("If-None-Match"), ""): // true of no tag but "*"
+		return ExpectNone
+	}
+	return ExpectAnything
+}
+
 // conditions evaluates a request's If-Match and If-None-Match for its target,
 // as RFC 9110 §13.1.1 and §13.1.2 have an origin server evaluate each it
-// receives, in §13.2.2's order (IronGall-dev/irongall-server#86). Every route
-// calls it once it knows its target's state, after the route, the method,
-// the pass, the box's calls and the read of the target, and before it acts:
-// so whatever the route answers before that point, a refusal of the pass, a
-// box that does not exist, a body it reads first that is refused, is
-// answered as without them (§13.2.1). PROTOCOL-SERVER.md §13 has the rule.
+// receives, in §13.2.2's order (IronGall-dev/irongall-server#86), for
+// precondition, the one step every route takes for them: so whatever the
+// route answers before that point, a refusal of the pass, a box that does
+// not exist, a body it reads first that is refused, is answered as without
+// them (§13.2.1). PROTOCOL-SERVER.md §13 has the rule.
 //
 // exists is whether the target has a current representation, and tag its
 // entity-tag, "" where it carries none. If-Match is false for a target that

@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -126,6 +127,9 @@ type faults struct {
 	refuse map[string]error // the refusal a write states, if not its own
 	// read, if set, runs at each read's answer, with the method's name.
 	read func(method string)
+	// wrote counts the writes that reached the injector, whatever their
+	// outcome: every write the store makes of its backend.
+	wrote atomic.Int64
 }
 
 // injectFaults puts an injector between s and its backend.
@@ -160,6 +164,7 @@ var ownRefusal = map[string]error{
 
 // write runs do as method's fault says.
 func (f *faults) write(method string, do func() error) error {
+	f.wrote.Add(1)
 	f.mu.Lock()
 	x, ref := f.writes[method], f.refuse[method]
 	f.mu.Unlock()
@@ -244,10 +249,10 @@ func (f *faults) DeleteBox(ctx context.Context, a protocol.Address) error {
 	return f.write("DeleteBox", func() error { return f.Backend.DeleteBox(ctx, a) })
 }
 
-func (f *faults) Revoke(ctx context.Context, a protocol.Address, rv *Revocations) (*Revocations, error) {
+func (f *faults) Revoke(ctx context.Context, a protocol.Address, rv *Revocations, want Expect) (*Revocations, error) {
 	var held *Revocations
 	err := f.write("Revoke", func() (err error) {
-		held, err = f.Backend.Revoke(ctx, a, rv)
+		held, err = f.Backend.Revoke(ctx, a, rv, want)
 		return err
 	})
 	return held, err
@@ -453,7 +458,7 @@ func backendWrites() map[string]backendWrite {
 			return ""
 		}},
 		"Revoke": {on: onBox, run: func(ctx context.Context, w *heldWorld) (*Header, error) {
-			return nil, w.s.Revoke(ctx, w.a, &Revocations{Identity: w.rec.Identity, Address: []byte("the identity's revocation")})
+			return nil, w.s.Revoke(ctx, w.a, &Revocations{Identity: w.rec.Identity, Address: []byte("the identity's revocation")}, ExpectAnything)
 		}, refusals: []error{ErrStale}, applied: func(w *heldWorld) string {
 			if b := cached(w); b == nil || b.State != Revoked {
 				return "the cache does not hold the revocation"

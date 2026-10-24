@@ -1092,7 +1092,7 @@ func TestSendPipeline(t *testing.T) {
 	f := e.box(protocol.Classic)
 	for _, box := range []*client.Box{a, f} {
 		rv := record(t, box)
-		if err := e.store.Revoke(ctx, box.Address(), &Revocations{Identity: rv.Identity, Address: rv.Revocation}); err != nil {
+		if err := e.store.Revoke(ctx, box.Address(), &Revocations{Identity: rv.Identity, Address: rv.Revocation}, ExpectAnything); err != nil {
 			t.Fatal(err)
 		}
 	}

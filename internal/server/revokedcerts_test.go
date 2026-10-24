@@ -63,7 +63,7 @@ func TestAStoredListThatDoesNotParseIsAnError(t *testing.T) {
 	e := newEnv(t, relaxed())
 	r, other := e.raw().register(protocol.MaxPrekeyLifetime), e.raw().register(protocol.MaxPrekeyLifetime)
 	bad := []byte("not a revocation of certificates\n")
-	if err := e.store.Revoke(ctx, r.id.Address(), &Revocations{Identity: r.id.Document(), Certs: bad, CertsSig: []byte("x"), Through: 1}); err != nil {
+	if err := e.store.Revoke(ctx, r.id.Address(), &Revocations{Identity: r.id.Document(), Certs: bad, CertsSig: []byte("x"), Through: 1}, ExpectAnything); err != nil {
 		t.Fatal(err)
 	}
 	for name, got := range map[string]reply{

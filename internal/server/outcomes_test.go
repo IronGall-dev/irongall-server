@@ -116,7 +116,7 @@ func TestARaiseRetriedAfterAnAmbiguousAttemptMayHaveBeenApplied(t *testing.T) {
 	f := newFakeAWS()
 	f.dynamo = scripted("UpdateItem", applied(answer500), answerCCF)
 	s := fakeStore(t, f)
-	err := s.Revoke(context.WithoutCancel(t.Context()), r.id.Address(), &Revocations{Identity: r.id.Document(), Certs: []byte("c"), CertsSig: []byte("s"), Through: 7})
+	err := s.Revoke(context.WithoutCancel(t.Context()), r.id.Address(), &Revocations{Identity: r.id.Document(), Certs: []byte("c"), CertsSig: []byte("s"), Through: 7}, ExpectAnything)
 	calls, applied := f.count("UpdateItem")
 	t.Logf("%d UpdateItem calls, %d applied; err %v (ErrStale %v); mayHaveApplied %v", calls, applied, err, errors.Is(err, ErrStale), mayHaveApplied(err))
 	if !mayHaveApplied(err) {
@@ -313,7 +313,7 @@ func TestAWriteThatMayHaveBeenAppliedForgetsItsAddress(t *testing.T) {
 	notFound := answer{status: http.StatusBadRequest, body: dynErr("ResourceNotFoundException", "")}
 	validation := answer{status: http.StatusBadRequest, body: dynErr("ValidationException", "")}
 	raise := func(ctx context.Context, s *Memory) error {
-		return s.Revoke(ctx, box.Addr, &Revocations{Identity: r.id.Document(), Certs: []byte("c"), CertsSig: []byte("s"), Through: 7})
+		return s.Revoke(ctx, box.Addr, &Revocations{Identity: r.id.Document(), Certs: []byte("c"), CertsSig: []byte("s"), Through: 7}, ExpectAnything)
 	}
 	update := func(ctx context.Context, s *Memory) error { return s.UpdateBox(ctx, cloneBox(box)) }
 	cases := []struct {
@@ -660,7 +660,7 @@ func TestARevocationWhoseAnswerWasLostIsInTheNextPassCheck(t *testing.T) {
 				}
 				return answerCCF
 			}
-			err = s.Revoke(context.WithoutCancel(t.Context()), a, &Revocations{Identity: rv.Identity, Certs: rv.RevokedCertificates, CertsSig: rv.RevokedCertificatesSignature, Through: list.Through})
+			err = s.Revoke(context.WithoutCancel(t.Context()), a, &Revocations{Identity: rv.Identity, Certs: rv.RevokedCertificates, CertsSig: rv.RevokedCertificatesSignature, Through: list.Through}, ExpectAnything)
 			_, held := s.Held(a)
 			got := e.do("GET", r.path("/messages"), nil, r.pass(1))
 			t.Logf("the raise: %v (mayHaveApplied %v); the index holds the box %v; then a pass under certificate 1: %d %s", err, mayHaveApplied(err), held, got.status, got.code())

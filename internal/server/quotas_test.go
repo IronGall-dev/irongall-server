@@ -268,7 +268,7 @@ func TestWhatNoRouteAnswersIsCounted(t *testing.T) {
 	e := newEnv(t, l)
 	b := e.raw().register(protocol.MaxPrekeyLifetime)
 	call := e.caller()
-	direct := e.callerOf(e.server.Handler()) // the router's redirects, which no description holds, and a HEAD
+	direct := e.callerOf(e.server.Handler()) // the router's redirects, which no description holds
 	for i, c := range []struct {
 		method, path string
 		status       int
@@ -278,7 +278,7 @@ func TestWhatNoRouteAnswersIsCounted(t *testing.T) {
 		{"DELETE", b.path("/revocations"), http.StatusMethodNotAllowed, call},
 		{"GET", "/v1", http.StatusTemporaryRedirect, direct},
 		{"GET", b.path("/messages/../acl"), http.StatusTemporaryRedirect, direct},
-		{"HEAD", b.path(""), http.StatusOK, direct}, // the read of a box with no pass, which spends it as a route; a recorder keeps the body a server drops
+		{"HEAD", b.path(""), http.StatusOK, call}, // the read of a box with no pass, which spends it as a route
 	} {
 		ip := "198.51.100." + strconv.Itoa(i+1)
 		if got := c.call(ip, c.method, c.path, nil, ""); got.status != c.status {

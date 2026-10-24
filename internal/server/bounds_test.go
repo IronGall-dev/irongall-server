@@ -110,7 +110,7 @@ func TestEveryCallToAWSEndsAtItsBound(t *testing.T) {
 		{name: "UpdateBox", call: func(ctx context.Context, s *Memory) error { return s.UpdateBox(ctx, cloneBox(box)) }},
 		{name: "DeleteBox", call: func(ctx context.Context, s *Memory) error { return s.DeleteBox(ctx, box.Addr) }},
 		{name: "Revoke", call: func(ctx context.Context, s *Memory) error {
-			return s.Revoke(ctx, box.Addr, &Revocations{Identity: box.Identity, Address: []byte("r")})
+			return s.Revoke(ctx, box.Addr, &Revocations{Identity: box.Identity, Address: []byte("r")}, ExpectAnything)
 		}},
 		{name: "PutMessage's body", call: func(ctx context.Context, s *Memory) error {
 			_, err := s.PutMessage(ctx, box.Addr, msg, []byte("abc"))

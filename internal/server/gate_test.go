@@ -105,7 +105,8 @@ func respelled(t *testing.T, pass string) string {
 // call about a box only its own, and the read of a box none:
 // IronGall-dev/irongall-client#352). Its answer moves a count of its box's,
 // whatever it is. A new route is held to this by being one of routes(), and
-// a new state by being one of these.
+// a new state by being one of these; and each route that answers GET is
+// held to it for HEAD too.
 func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 	l := relaxed()
 	l.RequestBurst, l.RequestRefill = 1, time.Hour
@@ -190,10 +191,14 @@ func TestEveryRequestIsCountedBeforeAnythingIsDone(t *testing.T) {
 		for _, st := range states {
 			p := strings.NewReplacer("{addr}", st.addr, "{id}", strings.Repeat("0", 64)).Replace(path)
 			targets = append(targets, target{method, p, r.pass, st.addr, st.pass, false})
+			if method == http.MethodGet { // a pattern of GET matches HEAD too (http.ServeMux)
+				targets = append(targets, target{http.MethodHead, p, r.pass, st.addr, st.pass, false})
+			}
 		}
 	}
 	targets = append(targets,
 		target{"GET", protocol.LinkPath + nobody, passNone, nobody, "", false},
+		target{"HEAD", protocol.LinkPath + nobody, passNone, nobody, "", false},
 		target{"GET", "/llms.txt", passNone, "", "", true},
 		target{"GET", "/v1/" + nobody + "/nothing/here", passNone, nobody, "", true},
 		target{"POST", protocol.LinkPath + nobody, passNone, nobody, "", true},

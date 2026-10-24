@@ -102,7 +102,7 @@ type revokedBetween struct {
 
 func (s *revokedBetween) Box(ctx context.Context, a protocol.Address) (*Box, error) {
 	if a == s.a && s.done.CompareAndSwap(false, true) {
-		if err := s.Store.Revoke(ctx, a, s.rv); err != nil {
+		if err := s.Store.Revoke(ctx, a, s.rv, ExpectAnything); err != nil {
 			return nil, err
 		}
 	}
@@ -536,7 +536,7 @@ func TestAPanicInEachSingleFlightEndsOnlyItsCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec, _ := json.Marshal(protocol.Revocations{Identity: box.id.Document(), Revocation: sig})
-	if err := p.Store.Revoke(context.Background(), box.id.Address(), &Revocations{Identity: box.id.Document(), Address: sig}); err != nil {
+	if err := p.Store.Revoke(context.Background(), box.id.Address(), &Revocations{Identity: box.id.Document(), Address: sig}, ExpectAnything); err != nil {
 		t.Fatal(err)
 	}
 	run("purges", &p.del, func() rawAnswer {
@@ -581,13 +581,13 @@ func TestASenderChangedBetweenItsPassAndItsRecordIsRefused(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				return s.Store.Revoke(ctx, from.id.Address(), &Revocations{Identity: from.id.Document(), Address: sig})
+				return s.Store.Revoke(ctx, from.id.Address(), &Revocations{Identity: from.id.Document(), Address: sig}, ExpectAnything)
 			}
 		}},
 		{"its current certificate revoked", http.StatusUnauthorized, protocol.CodeCertificateRevoked, func(s *changedBetween, from *raw) func(context.Context) error {
 			return func(ctx context.Context) error {
 				rc := from.certs(1)
-				return s.Store.Revoke(ctx, from.id.Address(), &Revocations{Identity: from.id.Document(), Certs: rc.RevokedCertificates, CertsSig: rc.RevokedCertificatesSignature, Through: 1})
+				return s.Store.Revoke(ctx, from.id.Address(), &Revocations{Identity: from.id.Document(), Certs: rc.RevokedCertificates, CertsSig: rc.RevokedCertificatesSignature, Through: 1}, ExpectAnything)
 			}
 		}},
 		{"forgotten", http.StatusForbidden, protocol.CodeUnknownSender, func(s *changedBetween, from *raw) func(context.Context) error {

@@ -111,7 +111,7 @@ func (b *Box) hasRecord() bool { return b != nil && b.Rev > 0 }
 
 // holdsRevocations reports whether what is held of an address carries a
 // revocation of it or of its certificates: what GET …/revocations answers,
-// and the target a PUT there changes (conditions).
+// and the target a PUT there changes (precondition).
 func (b *Box) holdsRevocations() bool {
 	return b != nil && (len(b.Revocation) > 0 || len(b.RevokedCerts) > 0)
 }
@@ -124,6 +124,23 @@ func (b *Box) listed(serial uint64) (bool, error) {
 	}
 	return listNames(b.RevokedCerts, serial)
 }
+
+// Expect is what a conditional write asks of its target as it writes: what a
+// request's If-Match or If-None-Match held of the target at its read
+// (expected; PROTOCOL.md §13), so that a change between the two refuses the
+// write, ErrStale, and the request is answered 409 box_changed. It is the
+// write's own condition, beside any other it has, and asks nothing of a
+// request that carried neither.
+type Expect int
+
+const (
+	// ExpectAnything asks nothing.
+	ExpectAnything Expect = iota
+	// ExpectHeld asks that the target exist: an If-Match held.
+	ExpectHeld
+	// ExpectNone asks that it not: an If-None-Match of "*" held.
+	ExpectNone
+)
 
 // Revocations is what an address's identity has revoked, as kept in an item
 // of its own beside the box's record, box or none (PROTOCOL.md §6.3, §6.3a):
@@ -586,8 +603,9 @@ type Store interface {
 	// the address's revocations item: rv's revocation of the address, kept
 	// once, and its revocation of certificates, which only one through a
 	// higher serial replaces: ErrStale if one through as high a serial was
-	// stored first.
-	Revoke(ctx context.Context, a protocol.Address, rv *Revocations) error
+	// stored first, or if the address's revocations are not what want asks
+	// of them, some held or none.
+	Revoke(ctx context.Context, a protocol.Address, rv *Revocations, want Expect) error
 
 	// Dedupe returns the header of the message box already holds with this
 	// id, acked or not, until it expires; or ErrNotFound.

@@ -829,12 +829,13 @@ func (s *dynamoBackend) DeleteBox(ctx context.Context, a protocol.Address) error
 // Revoke implements Backend: one UpdateItem of the address's revocations
 // item, which keeps the revocation of the address once and takes a
 // revocation of certificates only through a higher serial than the one it
-// holds.
-func (s *dynamoBackend) Revoke(ctx context.Context, a protocol.Address, rv *Revocations) (*Revocations, error) {
+// holds, and, where want asks it, only where the item exists, or only where
+// it does not: its identity, which every write of it sets, is there or not.
+func (s *dynamoBackend) Revoke(ctx context.Context, a protocol.Address, rv *Revocations, want Expect) (*Revocations, error) {
 	names := map[string]string{"#i": "identity"}
 	values := map[string]types.AttributeValue{":i": bin(rv.Identity)}
 	sets := []string{"#i = if_not_exists(#i, :i)"}
-	var cond *string
+	var conds []string
 	if len(rv.Address) > 0 {
 		names["#r"], values[":r"] = "revocation", bin(rv.Address)
 		sets = append(sets, "#r = if_not_exists(#r, :r)")
@@ -843,7 +844,21 @@ func (s *dynamoBackend) Revoke(ctx context.Context, a protocol.Address, rv *Revo
 		names["#c"], names["#s"], names["#t"] = "revoked_certs", "revoked_certs_sig", "through"
 		values[":c"], values[":s"], values[":t"] = bin(rv.Certs), bin(rv.CertsSig), num(rv.Through)
 		sets = append(sets, "#c = :c", "#s = :s", "#t = :t")
-		cond = aws.String("attribute_not_exists(#t) OR #t < :t")
+		conds = append(conds, "attribute_not_exists(#t) OR #t < :t")
+	}
+	switch want {
+	case ExpectHeld:
+		conds = append(conds, "attribute_exists(#i)")
+	case ExpectNone:
+		conds = append(conds, "attribute_not_exists(#i)")
+	}
+	var cond *string
+	switch len(conds) {
+	case 0:
+	case 1:
+		cond = aws.String(conds[0])
+	default:
+		cond = aws.String("(" + strings.Join(conds, ") AND (") + ")")
 	}
 	n := new(note)
 	out, err := s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{

@@ -140,12 +140,12 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 		return noSuchMailbox
 	}
 	// The target is the box's mailbox, which exists, and carries no tag
-	// (conditions): here, before the dedupe, since steps 6 to 9 are shared by
+	// (precondition): here, before the dedupe, since steps 6 to 9 are shared by
 	// the posts of the same bytes in flight at once, whatever conditions each
 	// carries. So a retry whose If-Match is false is 412, not the receipt
 	// step 6 would give it: RFC 9110 §13.1.1 lets a server answer 2xx there,
 	// and this one does not.
-	if err := conditions(r, true, "", hintConditions); err != nil {
+	if err := precondition(r, targetState{exists: true, hint: hintConditions}); err != nil {
 		return err
 	}
 

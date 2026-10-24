@@ -66,8 +66,11 @@ type Backend interface {
 	DeleteBox(ctx context.Context, a protocol.Address) error
 	// Revoke keeps what the identity of address a revoked (Store.Revoke),
 	// and returns the address's revocations as they now are; ErrStale if a
-	// revocation of certificates through as high a serial was stored first.
-	Revoke(ctx context.Context, a protocol.Address, rv *Revocations) (*Revocations, error)
+	// revocation of certificates through as high a serial was stored first,
+	// or if the address's revocations item is not what want asks: there, or
+	// not. The item exists only holding a revocation, since none is written
+	// that holds neither, so that is whether any is held.
+	Revoke(ctx context.Context, a protocol.Address, rv *Revocations, want Expect) (*Revocations, error)
 	// Adopt moves box b, at b.Rev, into account, spending a use of the
 	// account's adopt key whose hash is key, in one write: ErrStale,
 	// ErrKeyRefused.

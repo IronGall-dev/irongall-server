@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/IronGall-dev/irongall-client/api/apitest"
@@ -20,6 +21,13 @@ func TestTheRoutesAreTheDescriptions(t *testing.T) {
 	got := []string{linkRoute}
 	for _, r := range (&Server{}).routes() {
 		got = append(got, r.pattern)
+	}
+	// A pattern of GET matches HEAD too (http.ServeMux), so each is a route
+	// of both.
+	for _, p := range got {
+		if path, ok := strings.CutPrefix(p, http.MethodGet+" "); ok {
+			got = append(got, http.MethodHead+" "+path)
+		}
 	}
 	slices.Sort(got)
 	if !slices.Equal(got, want) {

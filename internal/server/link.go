@@ -36,9 +36,10 @@ func (s *Server) linkPage() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		// The page exists for every address and carries no tag (conditions);
-		// a 304 carries how long a cache may keep it (RFC 9110 §15.4.5).
-		if err := conditions(r, true, "", hintConditions, "Cache-Control", pageMaxAge); err != nil {
+		// The page exists for every address and carries no tag
+		// (precondition); a 304 carries how long a cache may keep it (RFC
+		// 9110 §15.4.5). Its call was counted at the gate.
+		if err := precondition(r, targetState{exists: true, hint: hintConditions, also: []string{"Cache-Control", pageMaxAge}}); err != nil {
 			writeConditions(w, err)
 			return
 		}

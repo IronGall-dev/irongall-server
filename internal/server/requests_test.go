@@ -107,9 +107,17 @@ func TestEveryStoreCallSendsAWSWhatItSentBefore(t *testing.T) {
 		{"CreateBox", func() { c := cloneBox(rec); _ = s.CreateBox(ctx, c) }},
 		{"UpdateBox", func() { c := cloneBox(rec); _ = s.UpdateBox(ctx, c) }},
 		{"Revoke, the address and certificates through 9", func() {
-			_ = s.Revoke(ctx, box, &Revocations{Identity: rec.Identity, Address: []byte("a revocation"), Certs: []byte("certificates"), CertsSig: []byte("their signature"), Through: 9})
+			_ = s.Revoke(ctx, box, &Revocations{Identity: rec.Identity, Address: []byte("a revocation"), Certs: []byte("certificates"), CertsSig: []byte("their signature"), Through: 9}, ExpectAnything)
 		}},
-		{"Revoke, the address alone", func() { _ = s.Revoke(ctx, box, &Revocations{Identity: rec.Identity, Address: []byte("a revocation")}) }},
+		{"Revoke, the address alone", func() {
+			_ = s.Revoke(ctx, box, &Revocations{Identity: rec.Identity, Address: []byte("a revocation")}, ExpectAnything)
+		}},
+		{"Revoke, certificates through 9, where none is held (If-None-Match: *)", func() {
+			_ = s.Revoke(ctx, box, &Revocations{Identity: rec.Identity, Certs: []byte("certificates"), CertsSig: []byte("their signature"), Through: 9}, ExpectNone)
+		}},
+		{"Revoke, the address, where some are held (If-Match: *)", func() {
+			_ = s.Revoke(ctx, box, &Revocations{Identity: rec.Identity, Address: []byte("a revocation")}, ExpectHeld)
+		}},
 		{"Box", func() { _, _ = s.Box(ctx, other) }},
 		{"Count, the box's load", func() { _, _ = s.Count(ctx, other) }},
 		{"Dedupe", func() { _, _ = s.Dedupe(ctx, box, id) }},

@@ -197,11 +197,14 @@ func (s *memBackend) DeleteBox(_ context.Context, a protocol.Address) error {
 }
 
 // Revoke implements Backend.
-func (s *memBackend) Revoke(_ context.Context, a protocol.Address, rv *Revocations) (*Revocations, error) {
+func (s *memBackend) Revoke(_ context.Context, a protocol.Address, rv *Revocations, want Expect) (*Revocations, error) {
 	s.deliver()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, ok := s.revocations[a]
+	if want == ExpectHeld && !ok || want == ExpectNone && ok {
+		return nil, ErrStale
+	}
 	if !ok {
 		cur = &Revocations{}
 	}

@@ -684,7 +684,7 @@ func (s panicStore) Fetched(context.Context, protocol.Address, [32]byte) (bool, 
 	panic("a panic in a fetch's count")
 }
 
-func (s panicStore) Revoke(context.Context, protocol.Address, *Revocations) error {
+func (s panicStore) Revoke(context.Context, protocol.Address, *Revocations, Expect) error {
 	panic("a panic in a revocation's write")
 }
 
