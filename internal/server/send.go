@@ -1,17 +1,14 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"io"
 	"net/http"
-	"regexp"
 	"sync"
 	"time"
 
-	"filippo.io/age"
 	"github.com/IronGall-dev/irongall-client/protocol"
 )
 
@@ -125,8 +122,8 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) error {
 	}
 	ciphertext := data
 
-	// 4. It is an age file.
-	stanzas, err := stanzasOf(ciphertext)
+	// 4. It is an age file: its stanzas read as a reader reads them.
+	stanzas, err := protocol.ReadStanzas(ciphertext)
 	if err != nil {
 		return fail(protocol.CodeNotAge, "encrypt with age to the box's prekey", "the ciphertext is not an age file")
 	}
@@ -184,7 +181,7 @@ type post struct {
 	from, to     protocol.Address
 	id           [32]byte
 	ciphertext   []byte
-	stanzas      []*age.Stanza
+	stanzas      protocol.Stanzas
 	q            protocol.SendQuery
 	sender, rcpt *Box
 	lim          Limits
@@ -439,56 +436,25 @@ func (s *Server) duplicate(w http.ResponseWriter, orig *Header, from protocol.Ad
 	return nil
 }
 
-// stanzaRecorder is an age identity that records the header's stanzas and
-// matches none: age parses the header, and nothing here parses it again.
-type stanzaRecorder struct{ stanzas []*age.Stanza }
-
-func (s *stanzaRecorder) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
-	s.stanzas = stanzas
-	return nil, age.ErrIncorrectIdentity
-}
-
-// stanzasOf returns the stanzas of an age file's header, parsed by age.
-func stanzasOf(ciphertext []byte) ([]*age.Stanza, error) {
-	hdr, err := age.ExtractHeader(bytes.NewReader(ciphertext))
-	if err != nil {
-		return nil, err
-	}
-	rec := &stanzaRecorder{}
-	_, err = age.DecryptHeader(hdr, rec)
-	var noMatch *age.NoIdentityMatchError
-	if !errors.As(err, &noMatch) {
-		return nil, errors.New("the header did not parse")
-	}
-	return rec.stanzas, nil
-}
-
-// grease is a stanza type rage, the Rust age crate and pyrage add to every
-// file; the age spec says to ignore stanzas it does not recognise.
-var grease = regexp.MustCompile(`\A[!-~]{1,8}-grease\z`)
-
 // checkStanzas requires exactly one native stanza, of the current prekey's
-// type: a send names the current serial, so no retired prekey is live.
-// Grease stanzas are ignored. Which KEY it is encrypted to cannot be checked,
-// by design of native age.
-func checkStanzas(stanzas []*age.Stanza, b *Box) *problem {
-	var native []protocol.KeyType
-	for _, st := range stanzas {
-		switch {
-		case st.Type == string(protocol.PostQuantum) || st.Type == string(protocol.Classic):
-			native = append(native, protocol.KeyType(st.Type))
-		case grease.MatchString(st.Type) && len(st.Args) <= 4:
-		default:
-			return fail(protocol.CodeWrongRecipientType, "encrypt to the box's prekey", "the file has a stanza of a type no prekey has")
-		}
-	}
-	if len(native) != 1 {
+// type, beside grease, the stanzas sorted by protocol.ReadStanzas, the one
+// reading of them a reader shares, which refuses before any key agreement
+// a file a server takes no send of (PROTOCOL.md §4.5 step 7, §5 check 1). A
+// send names the current serial, so no retired prekey is live. Which KEY it
+// is encrypted to cannot be checked, by design of native age. Each case has
+// its own hint, in this order: a stanza of another type, none native, more
+// than one, then the type.
+func checkStanzas(st protocol.Stanzas, b *Box) *problem {
+	switch {
+	case st.Other:
+		return fail(protocol.CodeWrongRecipientType, "encrypt to the box's prekey", "the file has a stanza of a type no prekey has")
+	case len(st.Native) == 0:
+		return fail(protocol.CodeWrongRecipientType, "the file has no recipient: encrypt to the box's prekey", "the file has no native stanza, only grease")
+	case len(st.Native) > 1:
 		return fail(protocol.CodeWrongRecipientType, "encrypt to one recipient only", "the file has more than one native stanza")
-	}
-	if native[0] == b.Prekey.Type() {
+	case st.Native[0] == b.Prekey.Type():
 		return nil
-	}
-	if b.Prekey.Type() == protocol.PostQuantum {
+	case b.Prekey.Type() == protocol.PostQuantum:
 		return fail(protocol.CodeWrongRecipientType, "this box needs age >= 1.3 or age-plugin-pq", "this box is post-quantum and the file is X25519 only")
 	}
 	return fail(protocol.CodeWrongRecipientType, "this box is --no-pq (X25519 only): re-fetch its prekey", "this box is --no-pq (X25519 only) and the file is post-quantum")

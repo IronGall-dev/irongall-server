@@ -1130,6 +1130,81 @@ func TestGreaseIsIgnored(t *testing.T) {
 	e.want(e.do("POST", "/v1/"+b.Address().String()+"/messages", sealedTo(serial, under, ct.Bytes()), e.pass(a)), 201, "")
 }
 
+// A file whose one stanza is grease has no native stanza: it is not said to
+// have more than one (IronGall-dev/irongall-client#417 item 4), and is told
+// it has no recipient, as PROTOCOL.md §4.5 step 7 has it. Its stanzas are
+// read as a reader reads them (protocol.ReadStanzas).
+func TestAFileWithNoNativeStanzaIsNotSaidToHaveTwo(t *testing.T) {
+	var ct bytes.Buffer
+	w, _ := age.Encrypt(&ct, greaseRecipient{})
+	_ = w.Close()
+	st, err := protocol.ReadStanzas(ct.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := checkStanzas(st, nil)
+	if p == nil || strings.Contains(p.detail, "more than one") || p.hint == "encrypt to one recipient only" || p.hint != "the file has no recipient: encrypt to the box's prekey" {
+		t.Fatalf("%d native stanza(s): %+v", len(st.Native), p)
+	}
+}
+
+// otherRecipient adds a stanza of a type that is neither native nor grease.
+type otherRecipient struct{}
+
+func (otherRecipient) Wrap([]byte) ([]*age.Stanza, error) {
+	return []*age.Stanza{{Type: "x-other", Body: []byte("junk")}}, nil
+}
+
+// A send whose stanzas a box does not take is refused wrong_recipient_type
+// with the hint of its case, in PROTOCOL.md §4.5 step 7's order: a stanza
+// of another type first, whatever else the file holds; then no native
+// stanza; then more than one; then a native stanza of the other type.
+func TestEachWrongRecipientTypeIsToldItsOwnCase(t *testing.T) {
+	e := newEnv(t, relaxed())
+	ctx := context.Background()
+	a, classic, pq := e.box(protocol.Classic), e.box(protocol.Classic), e.box(protocol.PostQuantum)
+	own := func(b *client.Box) age.Recipient {
+		box, _ := e.store.Box(ctx, b.Address())
+		r, err := box.Prekey.Recipient()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	stranger, _ := age.GenerateX25519Identity()
+	hybrid, _ := age.GenerateHybridIdentity()
+	const another, none, two = "encrypt to the box's prekey", "the file has no recipient: encrypt to the box's prekey", "encrypt to one recipient only"
+	for _, c := range []struct {
+		name string
+		to   *client.Box
+		rs   []age.Recipient
+		hint string
+	}{
+		{"a stanza of another type beside the box's own", classic, []age.Recipient{own(classic), otherRecipient{}}, another},
+		{"a stanza of another type alone", classic, []age.Recipient{otherRecipient{}}, another},
+		{"a stanza of another type and two native", classic, []age.Recipient{own(classic), stranger.Recipient(), otherRecipient{}}, another},
+		{"a stanza of another type and grease", classic, []age.Recipient{greaseRecipient{}, otherRecipient{}}, another},
+		{"grease alone", classic, []age.Recipient{greaseRecipient{}}, none},
+		{"two native", classic, []age.Recipient{own(classic), stranger.Recipient()}, two},
+		{"two native beside grease", classic, []age.Recipient{greaseRecipient{}, stranger.Recipient(), own(classic)}, two},
+		{"a post-quantum stanza to a --no-pq box", classic, []age.Recipient{hybrid.Recipient()}, "this box is --no-pq (X25519 only): re-fetch its prekey"},
+		{"an X25519 stanza to a post-quantum box", pq, []age.Recipient{stranger.Recipient()}, "this box needs age >= 1.3 or age-plugin-pq"},
+	} {
+		var ct bytes.Buffer
+		w, err := age.Encrypt(&ct, c.rs...)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		_, _ = io.WriteString(w, "x")
+		_ = w.Close()
+		serial, under := e.numbers(c.to.Address())
+		got := e.do("POST", "/v1/"+c.to.Address().String()+"/messages", sealedTo(serial, under, ct.Bytes()), e.pass(a))
+		if p := got.problem(); got.status != 400 || p.Code != protocol.CodeWrongRecipientType || p.Hint != c.hint {
+			t.Errorf("%s: %d %s, hint %q; want 400 %s, hint %q", c.name, got.status, p.Code, p.Hint, protocol.CodeWrongRecipientType, c.hint)
+		}
+	}
+}
+
 func TestPerIPLimits(t *testing.T) {
 	l := relaxed()
 	l.SendsPerMinutePerIP = 1
