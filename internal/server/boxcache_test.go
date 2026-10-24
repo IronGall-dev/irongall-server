@@ -837,7 +837,9 @@ func TestARegistrationAfterTheTTLsRemovalIsNewerThanTheRemovedRecord(t *testing.
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.idx.ensure(t.Context(), a, func() (boxRead, error) { return boxRead{exists: true, st: st, rev: old.Rev}, nil }); err != nil {
+		if err := s.idx.ensure(t.Context(), a, func() (boxRead, error) {
+			return boxRead{exists: true, st: st, created: ms(old.Created), rev: old.Rev}, nil
+		}); err != nil {
 			t.Fatal(err)
 		}
 		s.applyBox(fresh) // the registration, before the stream's removal of old arrives
